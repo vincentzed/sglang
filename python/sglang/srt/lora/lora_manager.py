@@ -136,6 +136,10 @@ class LoRAManager:
         assert len(cur_uids) <= self.max_loras_per_batch
         self.memory_pool.prepare_lora_batch(cur_uids, self.loras)
 
+        # Log if None is present alongside other UIDs
+        if None in cur_uids and len(cur_uids) > 1:
+            logger.warning(f"LoRA batch contains None mixed with other UIDs: {cur_uids=}, {forward_batch.lora_paths=}")
+
         # FIXME: Handle lora uid with None more safely
         if cur_uids == set([None]):
             return
