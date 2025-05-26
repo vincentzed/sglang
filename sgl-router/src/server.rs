@@ -1,7 +1,6 @@
 use crate::logging::{self, LoggingConfig};
 use crate::prometheus::{self, PrometheusConfig};
-use crate::router::PolicyConfig;
-use crate::router::Router;
+use crate::router::{AbortReq, PolicyConfig, Router};
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
 use actix_web::{
     error, get, post, web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
@@ -153,6 +152,17 @@ async fn remove_worker(
     HttpResponse::Ok().body(format!("Successfully removed worker: {}", worker_url))
 }
 
+#[post("/abort_request")]
+async fn abort_request(
+    req: HttpRequest, 
+    body: web::Json<AbortReq>,
+    data: web::Data<AppState>
+) -> impl Responder {
+    data.router
+        .route_abort_request(&data.client, &req, body.into_inner())
+        .await
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -274,6 +284,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
             .service(add_worker)
             .service(remove_worker)
             .service(list_workers)
+            .service(abort_request)
             // Default handler for unmatched routes.
             .default_service(web::route().to(sink_handler))
     })

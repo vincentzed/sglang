@@ -3,7 +3,8 @@ use ::metrics::{counter, gauge, histogram};
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use bytes::Bytes;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::{future, StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -14,6 +15,11 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio;
 use tracing::{debug, error, info, warn};
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AbortReq {
+    pub rid: String,
+}
 
 fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
     req.headers()
@@ -873,6 +879,86 @@ impl Router {
                 "Removed worker from tree and cleaned up queues: {}",
                 worker_url
             );
+        }
+    }
+
+    pub async fn route_abort_request(
+        &self,
+        client: &reqwest::Client,
+        req: &HttpRequest,
+        abort_req: AbortReq,
+    ) -> HttpResponse {
+        // For abort requests, we need to broadcast to all workers since we don't know
+        // which worker is handling the request ID
+        let worker_urls = match self {
+            Router::RoundRobin { worker_urls, .. }
+            | Router::Random { worker_urls, .. }
+            | Router::CacheAware { worker_urls, .. } => worker_urls.read().unwrap().clone(),
+        };
+
+        if worker_urls.is_empty() {
+            return HttpResponse::InternalServerError().body("No workers available");
+        }
+
+        // Convert AbortReq to JSON for the request body
+        let body = match serde_json::to_vec(&abort_req) {
+            Ok(body) => body,
+            Err(e) => {
+                error!("Failed to serialize abort request: {}", e);
+                return HttpResponse::InternalServerError().body("Failed to serialize request");
+            }
+        };
+
+        // Try to send abort request to all workers concurrently
+        let mut tasks = Vec::new();
+        for worker_url in &worker_urls {
+            let client = client.clone();
+            let worker_url = worker_url.clone();
+            let body = body.clone();
+            let headers = copy_request_headers(req);
+            
+            let task = tokio::spawn(async move {
+                let mut request_builder = client
+                    .post(format!("{}/abort_request", worker_url))
+                    .body(body);
+
+                // Copy headers from original request
+                for (name, value) in headers {
+                    request_builder = request_builder.header(name, value);
+                }
+
+                match request_builder.send().await {
+                    Ok(res) => {
+                        if res.status().is_success() {
+                            info!("Successfully sent abort request to worker: {}", worker_url);
+                            Some(())
+                        } else {
+                            warn!("Abort request failed for worker {}: {}", worker_url, res.status());
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to send abort request to worker {}: {}", worker_url, e);
+                        None
+                    }
+                }
+            });
+            tasks.push(task);
+        }
+
+        // Wait for all tasks to complete
+        let results = future::join_all(tasks).await;
+        let successful_count = results
+            .into_iter()
+            .filter_map(|r| r.ok().flatten())
+            .count();
+
+        if successful_count > 0 {
+            info!("Abort request succeeded on {} workers", successful_count);
+            HttpResponse::Ok().body("Request aborted")
+        } else {
+            warn!("Abort request failed on all workers");
+            HttpResponse::InternalServerError().body("Failed to abort request on any worker")
         }
     }
 }

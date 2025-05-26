@@ -549,9 +549,11 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 @app.post("/abort_request")
 async def abort_request(obj: AbortReq, request: Request):
     """Abort a request."""
+    # this now has router impl as well in rust
     try:
         _global_state.tokenizer_manager.abort_request(rid=obj.rid)
         return Response(status_code=200)
+    # this now has router impl as well in rust
     except Exception as e:
         return _create_error_response(e)
 
