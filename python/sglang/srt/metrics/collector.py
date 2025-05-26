@@ -145,6 +145,7 @@ class SchedulerStats:
     num_prefill_infight_queue_reqs: int = 0
     num_decode_prealloc_queue_reqs: int = 0
     num_decode_transfer_queue_reqs: int = 0
+    gpu_cache_usage_perc: float = 0.0
 
 
 class SchedulerMetricsCollector:
@@ -301,7 +302,9 @@ class SchedulerMetricsCollector:
         self._log_gauge(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
-
+        self._log_gauge(
+            self.gpu_cache_usage_perc, stats.gpu_cache_usage_perc
+        )
         self.last_log_time = time.perf_counter()
 
 
