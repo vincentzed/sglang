@@ -1342,6 +1342,7 @@ class TokenizerManager:
             if getattr(recv_obj, "completion_tokens", None)
             else 0
         )
+        #TODO: something about kvcache here 
 
         if state.first_token_time == 0.0:
             state.first_token_time = state.last_time = time.time()

@@ -260,6 +260,14 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        # –––––– BEGIN KVCache Metrics ––––––
+        self.gpu_cache_usage_perc = Gauge(
+            name="sglang:gpu_cache_usage_perc",
+            documentation="The GPU cache usage percentage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -533,3 +541,4 @@ class TokenizerMetricsCollector:
             if adjusted_interval <= bound:
                 his._buckets[i].inc(num_new_tokens)
                 break
+    
