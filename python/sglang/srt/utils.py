@@ -75,6 +75,9 @@ import torch.distributed as dist
 import triton
 import zmq
 from fastapi.responses import ORJSONResponse
+from collections.abc import Awaitable
+from starlette.datastructures import URL, Headers, MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
@@ -1022,18 +1025,39 @@ def set_ulimit(target_soft_limit=65535):
             logger.warning(f"Fail to set RLIMIT_STACK: {e}")
 
 
-def add_api_key_middleware(app, api_key: str):
-    @app.middleware("http")
-    async def authentication(request, call_next):
-        if request.method == "OPTIONS":
-            return await call_next(request)
-        if request.url.path.startswith("/health"):
-            return await call_next(request)
-        if request.url.path.startswith("/metrics"):
-            return await call_next(request)
-        if request.headers.get("Authorization") != "Bearer " + api_key:
-            return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
-        return await call_next(request)
+class AuthenticationMiddleware:
+    """
+    Pure ASGI middleware that authenticates each request by checking
+    if the Authorization header exists and equals "Bearer {api_key}".
+
+    Notes
+    -----
+    Authentication is skipped for:
+    HTTP method OPTIONS
+    Paths starting with /health
+    Paths starting with /metrics
+    """
+
+    def __init__(self, app: ASGIApp, api_token: str) -> None:
+        self.app = app
+        self.api_token = api_token
+
+    def __call__(self, scope: Scope, receive: Receive, send: Send) -> Awaitable[None]:
+        if scope["type"] not in ("http", "websocket") or scope["method"] == "OPTIONS":
+            return self.app(scope, receive, send)
+
+        url = URL(scope=scope).path
+        headers = Headers(scope=scope)
+
+        # Skip auth for health and metrics endpoints
+        if url.startswith("/health") or url.startswith("/metrics"):
+            return self.app(scope, receive, send)
+
+        if headers.get("Authorization") != f"Bearer {self.api_token}":
+            response = ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
+            return response(scope, receive, send)
+
+        return self.app(scope, receive, send)
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):

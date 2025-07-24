@@ -93,7 +93,7 @@ from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    add_api_key_middleware,
+    AuthenticationMiddleware,
     add_prometheus_middleware,
     delete_directory,
     get_bool_env_var,
@@ -909,7 +909,7 @@ def launch_server(
 
     # Add api key authorization
     if server_args.api_key:
-        add_api_key_middleware(app, server_args.api_key)
+        app.add_middleware(AuthenticationMiddleware, api_token=server_args.api_key)
 
     # Add prometheus middleware
     if server_args.enable_metrics:
