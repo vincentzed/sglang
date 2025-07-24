@@ -198,5 +198,237 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(params["stop"], ["</s>"])
 
 
+class APIKeyAuthenticationTestCase(unittest.TestCase):
+    """Tests for API key authentication middleware functionality."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        self.tm = _MockTokenizerManager()
+        self.template_manager = _MockTemplateManager()
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.api_key = "test-api-key-12345"
+
+    # ------------- Authentication Tests -------------
+    def test_api_key_authentication_success(self):
+        """Test successful authentication with valid API key."""
+        from sglang.srt.utils import AuthenticationMiddleware
+        from starlette.applications import Starlette
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+        import asyncio
+
+        async def endpoint(request):
+            return PlainTextResponse("Success")
+
+        app = Starlette(routes=[Route("/test", endpoint)])
+        app.add_middleware(AuthenticationMiddleware, api_token=self.api_key)
+
+        # Test with valid Bearer token
+        async def test_valid_token():
+            from starlette.testclient import TestClient
+            with TestClient(app) as client:
+                response = client.get(
+                    "/test",
+                    headers={"Authorization": f"Bearer {self.api_key}"}
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.text, "Success")
+
+        asyncio.run(test_valid_token())
+
+    def test_api_key_authentication_failure(self):
+        """Test authentication failure without API key."""
+        from sglang.srt.utils import AuthenticationMiddleware
+        from starlette.applications import Starlette
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+        import asyncio
+
+        async def endpoint(request):
+            return PlainTextResponse("Success")
+
+        app = Starlette(routes=[Route("/test", endpoint)])
+        app.add_middleware(AuthenticationMiddleware, api_token=self.api_key)
+
+        # Test without token
+        async def test_no_token():
+            from starlette.testclient import TestClient
+            with TestClient(app) as client:
+                response = client.get("/test")
+                self.assertEqual(response.status_code, 401)
+                self.assertIn("Unauthorized", response.json()["detail"])
+
+        # Test with invalid token
+        async def test_invalid_token():
+            from starlette.testclient import TestClient
+            with TestClient(app) as client:
+                response = client.get(
+                    "/test",
+                    headers={"Authorization": "Bearer wrong-token"}
+                )
+                self.assertEqual(response.status_code, 401)
+                self.assertIn("Unauthorized", response.json()["detail"])
+
+        asyncio.run(test_no_token())
+        asyncio.run(test_invalid_token())
+
+    def test_skip_conditions(self):
+        """Test that OPTIONS requests and health/metrics endpoints bypass auth."""
+        from sglang.srt.utils import AuthenticationMiddleware
+        from starlette.applications import Starlette
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+        import asyncio
+
+        async def endpoint(request):
+            return PlainTextResponse("Success")
+
+        app = Starlette(routes=[
+            Route("/test", endpoint, methods=["GET", "OPTIONS"]),
+            Route("/health", endpoint),
+            Route("/v1/health", endpoint),
+            Route("/metrics", endpoint),
+            Route("/v1/metrics", endpoint),
+        ])
+        app.add_middleware(AuthenticationMiddleware, api_token=self.api_key)
+
+        async def test_skip_auth():
+            from starlette.testclient import TestClient
+            with TestClient(app) as client:
+                # OPTIONS request should bypass auth
+                response = client.options("/test")
+                self.assertEqual(response.status_code, 200)
+
+                # Health endpoints should bypass auth
+                response = client.get("/health")
+                self.assertEqual(response.status_code, 200)
+                
+                response = client.get("/v1/health")
+                self.assertEqual(response.status_code, 200)
+
+                # Metrics endpoints should bypass auth
+                response = client.get("/metrics")
+                self.assertEqual(response.status_code, 200)
+                
+                response = client.get("/v1/metrics")
+                self.assertEqual(response.status_code, 200)
+
+        asyncio.run(test_skip_auth())
+
+    def test_concurrent_authenticated_requests(self):
+        """Test concurrent requests with API key authentication."""
+        from sglang.srt.utils import AuthenticationMiddleware
+        from starlette.applications import Starlette
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+        import asyncio
+        import time
+
+        request_count = 0
+        request_times = []
+
+        async def endpoint(request):
+            nonlocal request_count
+            request_count += 1
+            request_times.append(time.time())
+            await asyncio.sleep(0.01)  # Simulate some processing time
+            return PlainTextResponse(f"Request {request_count}")
+
+        app = Starlette(routes=[Route("/test", endpoint)])
+        app.add_middleware(AuthenticationMiddleware, api_token=self.api_key)
+
+        async def make_request(client, request_id):
+            """Make a single authenticated request."""
+            response = await client.get(
+                "/test",
+                headers={"Authorization": f"Bearer {self.api_key}"}
+            )
+            return response
+
+        async def test_concurrent():
+            from httpx import AsyncClient
+            
+            async with AsyncClient(app=app, base_url="http://test") as client:
+                # Create 10 concurrent requests
+                tasks = [make_request(client, i) for i in range(10)]
+                responses = await asyncio.gather(*tasks)
+                
+                # All requests should succeed
+                for response in responses:
+                    self.assertEqual(response.status_code, 200)
+                    self.assertIn("Request", response.text)
+                
+                # Verify all requests were processed
+                self.assertEqual(request_count, 10)
+                
+                # Verify requests were processed concurrently (not sequentially)
+                # If processed sequentially, total time would be ~0.1s (10 * 0.01s)
+                # If concurrent, should be much less
+                total_time = max(request_times) - min(request_times)
+                self.assertLess(total_time, 0.05)  # Should be much less than 0.1s
+
+        asyncio.run(test_concurrent())
+
+    def test_mixed_concurrent_requests(self):
+        """Test concurrent requests with mixed authentication status."""
+        from sglang.srt.utils import AuthenticationMiddleware
+        from starlette.applications import Starlette
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+        import asyncio
+
+        async def endpoint(request):
+            return PlainTextResponse("Success")
+
+        async def health_endpoint(request):
+            return PlainTextResponse("Healthy")
+
+        app = Starlette(routes=[
+            Route("/test", endpoint),
+            Route("/health", health_endpoint),
+        ])
+        app.add_middleware(AuthenticationMiddleware, api_token=self.api_key)
+
+        async def test_mixed():
+            from httpx import AsyncClient
+            
+            async with AsyncClient(app=app, base_url="http://test") as client:
+                # Mix of authenticated, unauthenticated, and health check requests
+                tasks = []
+                
+                # 5 authenticated requests (should succeed)
+                for i in range(5):
+                    tasks.append(client.get(
+                        "/test",
+                        headers={"Authorization": f"Bearer {self.api_key}"}
+                    ))
+                
+                # 5 unauthenticated requests (should fail)
+                for i in range(5):
+                    tasks.append(client.get("/test"))
+                
+                # 5 health check requests (should succeed without auth)
+                for i in range(5):
+                    tasks.append(client.get("/health"))
+                
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Check authenticated requests succeeded
+                for i in range(5):
+                    self.assertEqual(responses[i].status_code, 200)
+                    self.assertEqual(responses[i].text, "Success")
+                
+                # Check unauthenticated requests failed
+                for i in range(5, 10):
+                    self.assertEqual(responses[i].status_code, 401)
+                
+                # Check health requests succeeded
+                for i in range(10, 15):
+                    self.assertEqual(responses[i].status_code, 200)
+                    self.assertEqual(responses[i].text, "Healthy")
+
+        asyncio.run(test_mixed())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1774,6 +1774,145 @@ def run_benchmark(args_: argparse.Namespace):
     )
 
 
+async def benchmark_api_key_auth(
+    base_url: str,
+    api_key: str,
+    num_requests: int = 100,
+    concurrency: int = 10,
+) -> Dict[str, float]:
+    """Benchmark API key authentication middleware performance.
+    
+    Args:
+        base_url: Base URL of the server
+        api_key: API key for authentication
+        num_requests: Total number of requests to make
+        concurrency: Number of concurrent requests
+        
+    Returns:
+        Dictionary with benchmark results
+    """
+    import time
+    import statistics
+    from httpx import AsyncClient
+    
+    # Test endpoints
+    endpoints = [
+        "/v1/models",  # Requires auth
+        "/health",     # Bypasses auth
+        "/metrics",    # Bypasses auth
+    ]
+    
+    results = {
+        "total_requests": num_requests,
+        "concurrency": concurrency,
+        "endpoints": {}
+    }
+    
+    for endpoint in endpoints:
+        latencies = []
+        errors = 0
+        
+        async def make_request(client: AsyncClient) -> float:
+            """Make a single request and return latency."""
+            headers = {}
+            if endpoint not in ["/health", "/metrics"]:
+                headers["Authorization"] = f"Bearer {api_key}"
+            
+            start = time.perf_counter()
+            try:
+                response = await client.get(f"{base_url}{endpoint}", headers=headers)
+                if response.status_code == 401:
+                    return -1  # Auth failure
+                latency = time.perf_counter() - start
+                return latency
+            except Exception:
+                return -2  # Network error
+        
+        async with AsyncClient() as client:
+            # Warmup
+            for _ in range(min(10, num_requests // 10)):
+                await make_request(client)
+            
+            # Benchmark
+            start_time = time.perf_counter()
+            
+            # Create batches of concurrent requests
+            for i in range(0, num_requests, concurrency):
+                batch_size = min(concurrency, num_requests - i)
+                tasks = [make_request(client) for _ in range(batch_size)]
+                batch_results = await asyncio.gather(*tasks)
+                
+                for latency in batch_results:
+                    if latency == -1:
+                        errors += 1
+                    elif latency == -2:
+                        errors += 1
+                    else:
+                        latencies.append(latency * 1000)  # Convert to ms
+            
+            total_time = time.perf_counter() - start_time
+        
+        if latencies:
+            results["endpoints"][endpoint] = {
+                "mean_latency_ms": statistics.mean(latencies),
+                "median_latency_ms": statistics.median(latencies),
+                "p95_latency_ms": statistics.quantiles(latencies, n=20)[18],  # 95th percentile
+                "p99_latency_ms": statistics.quantiles(latencies, n=100)[98],  # 99th percentile
+                "min_latency_ms": min(latencies),
+                "max_latency_ms": max(latencies),
+                "throughput_rps": len(latencies) / total_time,
+                "success_rate": len(latencies) / num_requests,
+                "errors": errors,
+            }
+        else:
+            results["endpoints"][endpoint] = {
+                "errors": errors,
+                "success_rate": 0.0,
+            }
+    
+    return results
+
+
+def run_auth_benchmark(args_: argparse.Namespace):
+    """Run authentication middleware benchmark."""
+    print("\n{s:{c}^{n}}".format(s=" API Key Authentication Benchmark ", n=60, c="="))
+    
+    base_url = (
+        f"http://{args_.host}:{args_.port}" if args_.base_url is None else args_.base_url
+    )
+    
+    api_key = os.environ.get("OPENAI_API_KEY", "test-api-key")
+    
+    # Run benchmark with different concurrency levels
+    concurrency_levels = [1, 10, 50, 100]
+    
+    for concurrency in concurrency_levels:
+        print(f"\nTesting with concurrency level: {concurrency}")
+        results = asyncio.run(
+            benchmark_api_key_auth(
+                base_url=base_url,
+                api_key=api_key,
+                num_requests=1000,
+                concurrency=concurrency,
+            )
+        )
+        
+        print(f"\nResults for concurrency={concurrency}:")
+        for endpoint, metrics in results["endpoints"].items():
+            print(f"\n  Endpoint: {endpoint}")
+            if "mean_latency_ms" in metrics:
+                print(f"    Mean latency: {metrics['mean_latency_ms']:.2f} ms")
+                print(f"    Median latency: {metrics['median_latency_ms']:.2f} ms")
+                print(f"    P95 latency: {metrics['p95_latency_ms']:.2f} ms")
+                print(f"    P99 latency: {metrics['p99_latency_ms']:.2f} ms")
+                print(f"    Throughput: {metrics['throughput_rps']:.2f} req/s")
+                print(f"    Success rate: {metrics['success_rate']*100:.1f}%")
+            else:
+                print(f"    All requests failed (errors: {metrics['errors']})")
+    
+    print("\n" + "="*60)
+
+
 def set_ulimit(target_soft_limit=65535):
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
