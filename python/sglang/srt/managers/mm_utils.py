@@ -3,13 +3,15 @@ Multi-modality utils
 """
 
 import hashlib
+import operator
 import pickle
 from abc import abstractmethod
+from functools import reduce
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
-from torch import nn
+from torch import T, Value, nn
 
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
@@ -737,30 +739,32 @@ def data_hash(data) -> int:
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
-def tensor_hash(tensor_list) -> int:
-    """
-    hash a tensor or a tensor list
-    """
-    tensor = tensor_list
-    if isinstance(tensor_list, list):
-        tensor_list = flatten_nested_list(tensor_list)
-        tensor_list = [
-            x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
-        ]
-        tensor = torch.concat(tensor_list)
-    if tensor.is_cuda:
-        return gpu_tensor_hash(tensor.cuda())
+def _hash_one_tensor_cpu(tensor: torch.Tensor) -> int:
     tensor = tensor.detach().contiguous()
 
     if tensor.dtype == torch.bfloat16:
-        # memoryview() doesn't support PyTorch's BFloat16 dtype
         tensor = tensor.float()
 
-    assert isinstance(tensor, torch.Tensor)
     tensor_cpu = tensor.cpu()
 
-    mv = memoryview(tensor_cpu.numpy())
-    return data_hash(mv.tobytes())
+    return data_hash(tensor_cpu.numpy().data)
+
+
+def tensor_hash(tensors) -> int:
+    if not isinstance(tensors, list):
+        tensors = [tensors]
+
+    tensors = flatten_nested_list(tensors)
+
+    if not tensors:
+        return 0
+
+    if all(t.is_cuda for t in tensors):
+        hashes = (gpu_tensor_hash(t) for t in tensors)
+        return reduce(operator.xor, hashes)
+
+    hashes = (_hash_one_tensor_cpu(t) for t in tensors)
+    return reduce(operator.xor, hashes)
 
 
 def hash_feature(f):
@@ -773,7 +777,7 @@ def hash_feature(f):
     if isinstance(f, list):
         try:
             return data_hash(np.array(f).tobytes())
-        except:
+        except (TypeError, ValueError):
             return data_hash(str(f).encode())
     if isinstance(f, str):
         return data_hash(f.encode())
