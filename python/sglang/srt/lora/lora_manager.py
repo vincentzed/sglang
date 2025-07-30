@@ -193,11 +193,11 @@ class LoRAManager:
         # Load active loras into lora memory pool
         # TODO (lifuhuang): The naming of `forward_batch.lora_paths` is confusing. It actually contains a set of unique
         # LoRA IDs, not LoRA paths. While unfortunately we cannot change the name in API for backward compatibility, we
-        # should consider (1) renaming the incorrect usage within the system, and (2) deprecating the parameter name in
+        # should consider deprecating the parameter name in
         # the current API schema and introducing a better request schema in the future (e.g., use `model_name`).
-        cur_uids = set(forward_batch.lora_paths)
-        assert len(cur_uids) <= self.max_loras_per_batch
-        self.memory_pool.prepare_lora_batch(cur_uids, self.loras, self.lora_modules)
+        lora_path_set = set(forward_batch.lora_paths)
+        assert len(lora_path_set) <= self.max_loras_per_batch
+        self.memory_pool.prepare_lora_batch(lora_path_set, self.loras, self.lora_modules)
 
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
@@ -214,10 +214,10 @@ class LoRAManager:
             weight_indices = [0] * len(forward_batch.lora_paths)
             lora_ranks = [0] * self.max_loras_per_batch
             scalings = [0] * self.max_loras_per_batch
-            for i, uid in enumerate(forward_batch.lora_paths):
-                weight_indices[i] = self.memory_pool.get_buffer_id(uid)
-                if uid is not None:
-                    lora = self.loras[uid]
+            for i, lora_path in enumerate(forward_batch.lora_paths):
+                weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
+                if lora_path is not None:
+                    lora = self.loras[lora_path]
                     lora_ranks[weight_indices[i]] = lora.config.r
                     scalings[weight_indices[i]] = lora.scaling
 
