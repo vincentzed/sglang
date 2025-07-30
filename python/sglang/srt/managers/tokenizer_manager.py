@@ -58,6 +58,8 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_kv_class,
 )
+from sglang.srt.disaggregation.metadata_generator import MetadataGenerator
+from sglang.srt.disaggregation.multimodal_metadata import MultimodalRequestMetadata
 from sglang.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -294,6 +296,21 @@ class TokenizerManager:
         self.disaggregation_transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
+        
+        # Initialize metadata generator for EPD disaggregation
+        self.metadata_generator = None
+        if self.disaggregation_mode == DisaggregationMode.ENCODE:
+            if self.mm_processor is not None:
+                self.metadata_generator = MetadataGenerator(
+                    model_config=self.model_config,
+                    processor=self.mm_processor,
+                    tokenizer=self.tokenizer
+                )
+            else:
+                logger.warning(
+                    "Metadata generator not initialized: model is not multimodal"
+                )
+        
         # Start kv boostrap server on prefill
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # only start bootstrap server on prefill tm
@@ -523,15 +540,53 @@ class TokenizerManager:
                 obj.image_data = [obj.image_data]
             if not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
-            mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
-                image_data=obj.image_data,
-                audio_data=obj.audio_data,
-                input_text=input_text or input_ids,
-                request_obj=obj,
-                max_req_input_len=self.max_req_input_len,
+            
+            # Check if we should use metadata mode for EPD disaggregation
+            use_metadata_mode = (
+                self.disaggregation_mode == DisaggregationMode.ENCODE and
+                self.metadata_generator is not None
             )
-            if mm_inputs and "input_ids" in mm_inputs:
-                input_ids = mm_inputs["input_ids"]
+            
+            if use_metadata_mode:
+                # Generate metadata instead of processing raw images
+                try:
+                    metadata = await self.metadata_generator.generate_metadata_async(
+                        image_data=obj.image_data,
+                        video_data=getattr(obj, 'video_data', None),
+                        audio_data=obj.audio_data,
+                        input_text=input_text or input_ids,
+                        request_id=obj.rid
+                    )
+                    
+                    # Create mm_inputs with metadata instead of processed tensors
+                    mm_inputs = {
+                        "input_ids": metadata.get("input_ids", input_ids),
+                        "metadata": metadata,
+                        "use_metadata_mode": True
+                    }
+                    
+                    # Update input_ids if provided in metadata
+                    if "input_ids" in metadata:
+                        input_ids = metadata["input_ids"]
+                        
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to generate metadata for request {obj.rid}: {e}. "
+                        "Falling back to raw image processing."
+                    )
+                    use_metadata_mode = False
+            
+            if not use_metadata_mode:
+                # Legacy mode: process raw images/videos
+                mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
+                    image_data=obj.image_data,
+                    audio_data=obj.audio_data,
+                    input_text=input_text or input_ids,
+                    request_obj=obj,
+                    max_req_input_len=self.max_req_input_len,
+                )
+                if mm_inputs and "input_ids" in mm_inputs:
+                    input_ids = mm_inputs["input_ids"]
         else:
             mm_inputs = None
 
