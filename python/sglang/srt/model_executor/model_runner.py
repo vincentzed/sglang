@@ -89,6 +89,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sglang.srt.mem_cache.mm_embedding_pool import MultimodalEmbeddingPool
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
@@ -196,6 +197,7 @@ class ModelRunner:
         self.is_hybrid = model_config.is_hybrid
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
+        self.mm_embedding_pool = None
 
         self.forward_pass_id = 0
 
@@ -633,6 +635,7 @@ class ModelRunner:
                 model_config=self.model_config,
                 load_config=self.load_config,
                 device_config=DeviceConfig(self.device),
+                mm_embedding_pool=self.mm_embedding_pool,
             )
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
@@ -1143,6 +1146,16 @@ class ModelRunner:
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
                 "Not enough memory. Please try to increase --mem-fraction-static."
+            )
+
+        if self.is_multimodal:
+            self.mm_embedding_pool = MultimodalEmbeddingPool(
+                # TODO: allow user to configure this
+                size=self.server_args.mm_embedding_pool_size,
+                embedding_dim=self.model_config.hidden_size,
+                dtype=self.dtype,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
             )
 
         if self.req_to_token_pool is None:

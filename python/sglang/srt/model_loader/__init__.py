@@ -17,11 +17,13 @@ def get_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
     device_config: DeviceConfig,
+    mm_embedding_pool: "MultimodalEmbeddingPool",
 ) -> nn.Module:
     loader = get_model_loader(load_config)
     return loader.load_model(
         model_config=model_config,
         device_config=device_config,
+        mm_embedding_pool=mm_embedding_pool,
     )
 
 

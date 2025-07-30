@@ -18,7 +18,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     global_server_args_dict,
 )
-from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
+from sglang.srt.mem_cache.mm_embedding_pool import MultimodalEmbeddingPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import flatten_nested_list, print_warning_once
 from sglang.utils import logger
@@ -282,14 +282,6 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         return ret_input_ids
 
 
-embedding_cache: Optional[MultiModalCache] = None
-
-
-def init_embedding_cache(max_size: int = 0):
-    global embedding_cache
-    embedding_cache = MultiModalCache(max_size)
-
-
 def get_embedding_hash(embedding_items: List[MultimodalDataItem]) -> int:
     hash_list = [item.hash for item in embedding_items]
     return hash(tuple(hash_list))
@@ -368,6 +360,7 @@ def _get_chunked_prefill_embedding(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    mm_embedding_pool: "MultimodalEmbeddingPool",
 ) -> Optional[torch.Tensor]:
     # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
     embedding_list = []
@@ -383,13 +376,13 @@ def _get_chunked_prefill_embedding(
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
             continue
-        embedding_per_req = embedding_cache.get(embedding_items_hash)
+        embedding_per_req = mm_embedding_pool.get(embedding_items_hash)
         if embedding_per_req is None:
             embedding_per_req = data_embedding_func(embedding_items_per_req)
-            if not embedding_cache.put(embedding_items_hash, embedding_per_req):
+            if not mm_embedding_pool.put(embedding_items_hash, embedding_per_req):
                 print_warning_once(
-                    "Multimodal embedding cache is full. Consider increasing the "
-                    "`SGLANG_VLM_CACHE_SIZE_MB` environment variable."
+                    "Multimodal embedding pool is full. "
+                    "Consider increasing --mm-embedding-pool-size."
                 )
 
         embedding_per_req_chunk, _, end_index = get_embedding_chunk(
@@ -405,7 +398,7 @@ def _get_chunked_prefill_embedding(
             else embedding_per_req.shape[0] * embedding_per_req.shape[1]
         )
         if end_index == embedding_per_req_length:
-            embedding_cache.free(embedding_items_hash)
+            mm_embedding_pool.free(embedding_items_hash)
         embedding_list.append(embedding_per_req_chunk)
     if len(embedding_list) == 0:
         return None
@@ -459,6 +452,7 @@ def get_embedding_and_mask(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    mm_embedding_pool: "MultimodalEmbeddingPool",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generate multimodal embeddings and create a mask for identifying their positions in the input sequence.
@@ -488,6 +482,7 @@ def get_embedding_and_mask(
             prefix_length,
             extend_length,
             items_offset_list,
+            mm_embedding_pool,
         )
         if embedding is None:
             return None, None
@@ -579,6 +574,7 @@ def embed_mm_inputs(
                 prefix_length=extend_prefix_lens,
                 extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
+                mm_embedding_pool=multimodal_model.mm_embedding_pool,
             )
             embeddings += [embedding]
             masks += [mask]

@@ -24,7 +24,7 @@
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
 from functools import lru_cache, partial
-from typing import Iterable, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple, Union, Type
 
 import torch
 import torch.nn as nn
@@ -57,6 +57,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.utils import add_prefix
+from sglang.srt.mem_cache.mm_embedding_pool import MultimodalEmbeddingPool
+
 
 logger = logging.getLogger(__name__)
 
@@ -457,6 +459,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self,
         config: Qwen2_5_VLConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        mm_embedding_pool: Optional[MultimodalEmbeddingPool] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -490,6 +493,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.mm_embedding_pool = mm_embedding_pool
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()

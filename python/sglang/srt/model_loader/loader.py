@@ -157,6 +157,7 @@ def _get_quantization_config(
 def _initialize_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
+    mm_embedding_pool: "MultimodalEmbeddingPool",
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
@@ -174,6 +175,7 @@ def _initialize_model(
     return model_class(
         config=model_config.hf_config,
         quant_config=quant_config,
+        mm_embedding_pool=mm_embedding_pool,
     )
 
 
@@ -194,6 +196,7 @@ class BaseModelLoader(ABC):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        mm_embedding_pool: "MultimodalEmbeddingPool",
     ) -> nn.Module:
         """Load a model with the given configurations."""
         raise NotImplementedError
@@ -425,6 +428,7 @@ class DefaultModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        mm_embedding_pool: "MultimodalEmbeddingPool",
     ) -> nn.Module:
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
@@ -432,6 +436,7 @@ class DefaultModelLoader(BaseModelLoader):
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    mm_embedding_pool,
                 )
 
         self.load_weights_and_postprocess(
@@ -470,6 +475,7 @@ class LayeredModelLoader(DefaultModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        mm_embedding_pool: "MultimodalEmbeddingPool",
     ) -> nn.Module:
         from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
         from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -483,6 +489,7 @@ class LayeredModelLoader(DefaultModelLoader):
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    mm_embedding_pool,
                 )
 
             # Check model's layered load support
@@ -547,6 +554,7 @@ class DummyModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        mm_embedding_pool: "MultimodalEmbeddingPool",
     ) -> nn.Module:
 
         if get_bool_env_var("SGL_CPU_QUANTIZATION"):
@@ -559,6 +567,7 @@ class DummyModelLoader(BaseModelLoader):
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    mm_embedding_pool,
                 )
 
             for _, module in model.named_modules():
@@ -668,6 +677,7 @@ class ShardedStateLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        mm_embedding_pool: "MultimodalEmbeddingPool",
     ) -> nn.Module:
         from safetensors.torch import safe_open
 
@@ -679,7 +689,9 @@ class ShardedStateLoader(BaseModelLoader):
 
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config)
+                model = _initialize_model(
+                    model_config, self.load_config, mm_embedding_pool
+                )
                 for _, module in model.named_modules():
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
@@ -1225,12 +1237,14 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        mm_embedding_pool: "MultimodalEmbeddingPool",
     ) -> nn.Module:
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    mm_embedding_pool,
                 )
 
                 self._load_weights(model_config, model)
@@ -1317,6 +1331,7 @@ class GGUFModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        mm_embedding_pool: "MultimodalEmbeddingPool",
     ) -> nn.Module:
 
         local_model_path = self._prepare_weights(model_config.model_path)
@@ -1330,7 +1345,9 @@ class GGUFModelLoader(BaseModelLoader):
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                model = _initialize_model(model_config, self.load_config)
+                model = _initialize_model(
+                    model_config, self.load_config, mm_embedding_pool
+                )
             model.load_weights(
                 self._get_weights_iterator(local_model_path, gguf_weights_map)
             )
@@ -1454,6 +1471,7 @@ class RemoteModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        mm_embedding_pool: "MultimodalEmbeddingPool",
     ) -> nn.Module:
         logger.info("Loading weights from remote storage ...")
         start = time.perf_counter()
@@ -1470,7 +1488,9 @@ class RemoteModelLoader(BaseModelLoader):
 
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config)
+                model = _initialize_model(
+                    model_config, self.load_config, mm_embedding_pool
+                )
                 for _, module in model.named_modules():
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:

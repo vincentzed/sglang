@@ -97,7 +97,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -621,9 +620,6 @@ class Scheduler(
             )
         )
 
-        embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
-        init_embedding_cache(embedding_cache_size * 1024 * 1024)
-
     def init_disaggregation(self):
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
@@ -894,8 +890,8 @@ class Scheduler(
                             recv_reqs,
                             self.pp_rank * self.tp_size + dp_offset,
                             self.world_group.device_group,
+                            (self.pp_rank - 1) * self.tp_size + dp_offset,
                             self.pp_rank * self.tp_size + dp_offset,
-                            (self.pp_rank + 1) * self.tp_size + dp_offset,
                         )
 
                     # send out proxy tensors to the next stage
@@ -1331,7 +1327,8 @@ class Scheduler(
                 num_used = max(full_num_used, swa_num_used)
                 token_usage = max(full_token_usage, swa_token_usage)
             else:
-                num_used, token_usage, _, _ = self._get_token_info()
+                num_used, token_usage, _,
+                _ = self._get_token_info()
             num_running_reqs = len(self.running_batch.reqs)
             self.stats.num_running_reqs = num_running_reqs
             self.stats.num_used_tokens = num_used
@@ -2001,10 +1998,8 @@ class Scheduler(
         logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
         print(file=sys.stderr, flush=True)
         print(file=sys.stdout, flush=True)
-
-        # Wait for some time so that the parent process can print the error.
-        time.sleep(5)
-        self.parent_process.send_signal(signal.SIGQUIT)
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        os.kill(os.getpid(), signal.SIGKILL)
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success = self.flush_cache()

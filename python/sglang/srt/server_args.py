@@ -86,6 +86,7 @@ class ServerArgs:
     hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
+    mm_embedding_pool_size: int = 256
 
     # Runtime options
     device: Optional[str] = None
@@ -880,6 +881,12 @@ class ServerArgs:
             "--disable-hybrid-swa-memory",
             action="store_true",
             help="Disable the hybrid SWA memory.",
+        )
+        parser.add_argument(
+            "--mm-embedding-pool-size",
+            type=int,
+            default=ServerArgs.mm_embedding_pool_size,
+            help="The size of the multimodal embedding pool.",
         )
 
         # Runtime options
