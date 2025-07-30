@@ -764,14 +764,18 @@ def tensor_hash(tensor_list) -> int:
 
 
 def hash_feature(f):
-    if isinstance(f, list):
-        if isinstance(f[0], torch.Tensor):
-            return tensor_hash(f)
-        return data_hash(tuple(flatten_nested_list(f)))
-    elif isinstance(f, np.ndarray):
-        arr = np.ascontiguousarray(f)
-        arr_bytes = arr.tobytes()
-        return data_hash(arr_bytes)
-    elif isinstance(f, torch.Tensor):
+    if isinstance(f, torch.Tensor):
         return tensor_hash([f])
+    if isinstance(f, list) and f and isinstance(f[0], torch.Tensor):
+        return tensor_hash(f)
+    if isinstance(f, np.ndarray):
+        return data_hash(f.data) if f.flags.c_contiguous else data_hash(f.tobytes())
+    if isinstance(f, list):
+        try:
+            return data_hash(np.array(f).tobytes())
+        except:
+            return data_hash(str(f).encode())
+    if isinstance(f, str):
+        return data_hash(f.encode())
     return data_hash(f)
+
