@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
-from torch import T, Value, nn
+from torch import Value, nn
 
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
