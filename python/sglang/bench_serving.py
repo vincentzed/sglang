@@ -113,75 +113,76 @@ def get_auth_headers() -> Dict[str, str]:
 # https://github.com/triton-inference-server/tensorrtllm_backend/issues/505
 async def async_request_trt_llm(
     request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     assert api_url.endswith("generate_stream")
 
-    async with _create_bench_client_session() as session:
-        payload = {
-            "accumulate_tokens": True,
-            "text_input": request_func_input.prompt,
-            "temperature": 0.000001,
-            "top_p": 1.0,
-            "max_tokens": request_func_input.output_len,
-            "stream": True,
-            "min_length": request_func_input.output_len,
-            "end_id": 1048576,
-            **request_func_input.extra_request_body,
-        }
-        if args.disable_ignore_eos:
-            del payload["min_length"]
-            del payload["end_id"]
-        output = RequestFuncOutput.init_new(request_func_input)
+    payload = {
+        "accumulate_tokens": True,
+        "text_input": request_func_input.prompt,
+        "temperature": 0.000001,
+        "top_p": 1.0,
+        "max_tokens": request_func_input.output_len,
+        "stream": True,
+        "min_length": request_func_input.output_len,
+        "end_id": 1048576,
+        **request_func_input.extra_request_body,
+    }
+    if args.disable_ignore_eos:
+        del payload["min_length"]
+        del payload["end_id"]
+    output = RequestFuncOutput.init_new(request_func_input)
 
-        ttft = 0.0
-        st = time.perf_counter()
-        most_recent_timestamp = st
-        try:
-            async with session.post(url=api_url, json=payload) as response:
-                if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
+    ttft = 0.0
+    st = time.perf_counter()
+    most_recent_timestamp = st
+    try:
+        async with session.post(url=api_url, json=payload) as response:
+            if response.status == 200:
+                async for chunk_bytes in response.content:
+                    chunk_bytes = chunk_bytes.strip()
+                    if not chunk_bytes:
+                        continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data:")
+                    chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data:")
 
-                        data = json.loads(chunk)
-                        output.generated_text += data["text_output"]
-                        timestamp = time.perf_counter()
-                        # First token
-                        if ttft == 0.0:
-                            ttft = timestamp - st
-                            output.ttft = ttft
+                    data = json.loads(chunk)
+                    output.generated_text += data["text_output"]
+                    timestamp = time.perf_counter()
+                    # First token
+                    if ttft == 0.0:
+                        ttft = timestamp - st
+                        output.ttft = ttft
 
-                        # Decoding phase
-                        else:
-                            output.itl.append(timestamp - most_recent_timestamp)
+                    # Decoding phase
+                    else:
+                        output.itl.append(timestamp - most_recent_timestamp)
 
-                        most_recent_timestamp = timestamp
+                    most_recent_timestamp = timestamp
 
-                    output.latency = most_recent_timestamp - st
-                    output.success = True
-                    output.output_len = request_func_input.output_len
+                output.latency = most_recent_timestamp - st
+                output.success = True
+                output.output_len = request_func_input.output_len
 
-                else:
-                    output.error = response.reason or ""
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
+            else:
+                output.error = response.reason or ""
+                output.success = False
+    except Exception:
+        output.success = False
+        exc_info = sys.exc_info()
+        output.error = "".join(traceback.format_exception(*exc_info))
 
-        if pbar:
-            pbar.update(1)
-        return output
+    if pbar:
+        pbar.update(1)
+    return output
 
 
 # set ignore_eos True by default
 async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
@@ -191,74 +192,73 @@ async def async_request_openai_completions(
 
     prompt = request_func_input.prompt
 
-    async with _create_bench_client_session() as session:
-        payload = {
-            "model": request_func_input.model,
-            "prompt": prompt,
-            "temperature": 0.0,
-            "best_of": 1,
-            "max_tokens": request_func_input.output_len,
-            "stream": not args.disable_stream,
-            "ignore_eos": not args.disable_ignore_eos,
-            **request_func_input.extra_request_body,
-        }
-        headers = get_auth_headers()
+    payload = {
+        "model": request_func_input.model,
+        "prompt": prompt,
+        "temperature": 0.0,
+        "best_of": 1,
+        "max_tokens": request_func_input.output_len,
+        "stream": not args.disable_stream,
+        "ignore_eos": not args.disable_ignore_eos,
+        **request_func_input.extra_request_body,
+    }
+    headers = get_auth_headers()
 
-        output = RequestFuncOutput.init_new(request_func_input)
+    output = RequestFuncOutput.init_new(request_func_input)
 
-        generated_text = ""
-        output_len = request_func_input.output_len
-        ttft = 0.0
-        st = time.perf_counter()
-        most_recent_timestamp = st
-        try:
-            async with session.post(
-                url=api_url, json=payload, headers=headers
-            ) as response:
-                if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
+    generated_text = ""
+    output_len = request_func_input.output_len
+    ttft = 0.0
+    st = time.perf_counter()
+    most_recent_timestamp = st
+    try:
+        async with session.post(
+            url=api_url, json=payload, headers=headers
+        ) as response:
+            if response.status == 200:
+                async for chunk_bytes in response.content:
+                    chunk_bytes = chunk_bytes.strip()
+                    if not chunk_bytes:
+                        continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                        latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
+                    chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                    latency = time.perf_counter() - st
+                    if chunk == "[DONE]":
+                        pass
+                    else:
+                        data = json.loads(chunk)
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["text"]:
-                                timestamp = time.perf_counter()
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
+                        # NOTE: Some completion API might have a last
+                        # usage summary response without a token so we
+                        # want to check a token was generated
+                        if data["choices"][0]["text"]:
+                            timestamp = time.perf_counter()
+                            # First token
+                            if ttft == 0.0:
+                                ttft = time.perf_counter() - st
+                                output.ttft = ttft
 
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
+                            # Decoding phase
+                            else:
+                                output.itl.append(timestamp - most_recent_timestamp)
 
-                                most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
+                            most_recent_timestamp = timestamp
+                            generated_text += data["choices"][0]["text"]
+                            output_len = (data.get("usage") or {}).get(
+                                "completion_tokens", output_len
+                            )
 
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = latency
-                    output.output_len = output_len
-                else:
-                    output.error = response.reason or ""
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
+                output.generated_text = generated_text
+                output.success = True
+                output.latency = latency
+                output.output_len = output_len
+            else:
+                output.error = response.reason or ""
+                output.success = False
+    except Exception:
+        output.success = False
+        exc_info = sys.exc_info()
+        output.error = "".join(traceback.format_exception(*exc_info))
 
     if pbar:
         pbar.update(1)
@@ -267,6 +267,7 @@ async def async_request_openai_completions(
 
 async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     """Makes a request to the OpenAI Chat Completions API.
@@ -277,6 +278,7 @@ async def async_request_openai_chat_completions(
 
     Args:
         request_func_input: Input parameters for the request.
+        session: The persistent aiohttp session to use for the request.
         pbar: Optional tqdm progress bar to update.
 
     Returns:
@@ -304,93 +306,92 @@ async def async_request_openai_chat_completions(
     else:
         messages = [{"role": "user", "content": request_func_input.prompt}]
 
-    async with _create_bench_client_session() as session:
-        payload = {
-            "model": request_func_input.model,
-            "messages": messages,
-            "temperature": 0.0,
-            "max_tokens": request_func_input.output_len,
-            "stream": not args.disable_stream,
-            **request_func_input.extra_request_body,
-        }
-        headers = get_auth_headers()
+    payload = {
+        "model": request_func_input.model,
+        "messages": messages,
+        "temperature": 0.0,
+        "max_tokens": request_func_input.output_len,
+        "stream": not args.disable_stream,
+        **request_func_input.extra_request_body,
+    }
+    headers = get_auth_headers()
 
-        output = RequestFuncOutput.init_new(request_func_input)
+    output = RequestFuncOutput.init_new(request_func_input)
 
-        generated_text = ""
-        output_len = request_func_input.output_len
-        ttft = 0.0
-        st = time.perf_counter()
-        most_recent_timestamp = st
-        try:
-            async with session.post(
-                url=api_url, json=payload, headers=headers
-            ) as response:
-                if response.status == 200:
-                    if args.disable_stream:
-                        # Non-streaming response
-                        response_json = await response.json()
-                        output.generated_text = response_json["choices"][0]["message"][
-                            "content"
-                        ]
-                        output.success = True
-                        output.latency = time.perf_counter() - st
-                        output.ttft = (
-                            output.latency
-                        )  # For non-streaming, TTFT = total latency
-                        output.output_len = response_json.get("usage", {}).get(
-                            "completion_tokens", output_len
-                        )
-                    else:
-                        # Streaming response
-                        async for chunk_bytes in response.content:
-                            chunk_bytes = chunk_bytes.strip()
-                            if not chunk_bytes:
-                                continue
-
-                            chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                            latency = time.perf_counter() - st
-                            if chunk == "[DONE]":
-                                pass
-                            else:
-                                data = json.loads(chunk)
-
-                                # Check if this chunk contains content
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
-
-                                if content:
-                                    timestamp = time.perf_counter()
-                                    # First token
-                                    if ttft == 0.0:
-                                        ttft = timestamp - st
-                                        output.ttft = ttft
-
-                                    # Decoding phase
-                                    else:
-                                        output.itl.append(
-                                            timestamp - most_recent_timestamp
-                                        )
-
-                                    most_recent_timestamp = timestamp
-                                    generated_text += content
-
-                                # Check for usage info in final chunk
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
-
-                        output.generated_text = generated_text
-                        output.success = True
-                        output.latency = latency
-                        output.output_len = output_len
+    generated_text = ""
+    output_len = request_func_input.output_len
+    ttft = 0.0
+    st = time.perf_counter()
+    most_recent_timestamp = st
+    try:
+        async with session.post(
+            url=api_url, json=payload, headers=headers
+        ) as response:
+            if response.status == 200:
+                if args.disable_stream:
+                    # Non-streaming response
+                    response_json = await response.json()
+                    output.generated_text = response_json["choices"][0]["message"][
+                        "content"
+                    ]
+                    output.success = True
+                    output.latency = time.perf_counter() - st
+                    output.ttft = (
+                        output.latency
+                    )  # For non-streaming, TTFT = total latency
+                    output.output_len = response_json.get("usage", {}).get(
+                        "completion_tokens", output_len
+                    )
                 else:
-                    output.error = response.reason or ""
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
+                    # Streaming response
+                    async for chunk_bytes in response.content:
+                        chunk_bytes = chunk_bytes.strip()
+                        if not chunk_bytes:
+                            continue
+
+                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        latency = time.perf_counter() - st
+                        if chunk == "[DONE]":
+                            pass
+                        else:
+                            data = json.loads(chunk)
+
+                            # Check if this chunk contains content
+                            delta = data.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+
+                            if content:
+                                timestamp = time.perf_counter()
+                                # First token
+                                if ttft == 0.0:
+                                    ttft = timestamp - st
+                                    output.ttft = ttft
+
+                                # Decoding phase
+                                else:
+                                    output.itl.append(
+                                        timestamp - most_recent_timestamp
+                                    )
+
+                                most_recent_timestamp = timestamp
+                                generated_text += content
+
+                            # Check for usage info in final chunk
+                            output_len = (data.get("usage") or {}).get(
+                                "completion_tokens", output_len
+                            )
+
+                    output.generated_text = generated_text
+                    output.success = True
+                    output.latency = latency
+                    output.output_len = output_len
+            else:
+                output.error = response.reason or ""
+                output.success = False
+    except Exception:
+        output.success = False
+        exc_info = sys.exc_info()
+        output.error = "".join(traceback.format_exception(*exc_info))
 
     if pbar:
         pbar.update(1)
@@ -399,76 +400,76 @@ async def async_request_openai_chat_completions(
 
 async def async_request_truss(
     request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
 
     prompt = request_func_input.prompt
 
-    async with _create_bench_client_session() as session:
-        payload = {
-            "model": request_func_input.model,
-            "prompt": prompt,
-            "temperature": 0.0,
-            "best_of": 1,
-            "max_tokens": request_func_input.output_len,
-            "stream": not args.disable_stream,
-            "ignore_eos": not args.disable_ignore_eos,
-            **request_func_input.extra_request_body,
-        }
-        headers = get_auth_headers()
+    payload = {
+        "model": request_func_input.model,
+        "prompt": prompt,
+        "temperature": 0.0,
+        "best_of": 1,
+        "max_tokens": request_func_input.output_len,
+        "stream": not args.disable_stream,
+        "ignore_eos": not args.disable_ignore_eos,
+        **request_func_input.extra_request_body,
+    }
+    headers = get_auth_headers()
 
-        output = RequestFuncOutput.init_new(request_func_input)
+    output = RequestFuncOutput.init_new(request_func_input)
 
-        generated_text = ""
-        ttft = 0.0
-        st = time.perf_counter()
-        most_recent_timestamp = st
-        try:
-            async with session.post(
-                url=api_url, json=payload, headers=headers
-            ) as response:
-                if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
+    generated_text = ""
+    ttft = 0.0
+    st = time.perf_counter()
+    most_recent_timestamp = st
+    try:
+        async with session.post(
+            url=api_url, json=payload, headers=headers
+        ) as response:
+            if response.status == 200:
+                async for chunk_bytes in response.content:
+                    chunk_bytes = chunk_bytes.strip()
+                    if not chunk_bytes:
+                        continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                        latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
+                    chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                    latency = time.perf_counter() - st
+                    if chunk == "[DONE]":
+                        pass
+                    else:
+                        data = json.loads(chunk)
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["text"]:
-                                timestamp = time.perf_counter()
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
+                        # NOTE: Some completion API might have a last
+                        # usage summary response without a token so we
+                        # want to check a token was generated
+                        if data["choices"][0]["text"]:
+                            timestamp = time.perf_counter()
+                            # First token
+                            if ttft == 0.0:
+                                ttft = time.perf_counter() - st
+                                output.ttft = ttft
 
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
+                            # Decoding phase
+                            else:
+                                output.itl.append(timestamp - most_recent_timestamp)
 
-                                most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
+                            most_recent_timestamp = timestamp
+                            generated_text += data["choices"][0]["text"]
 
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = latency
-                    output.output_len = request_func_input.output_len
-                else:
-                    output.error = response.reason or ""
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
+                output.generated_text = generated_text
+                output.success = True
+                output.latency = latency
+                output.output_len = request_func_input.output_len
+            else:
+                output.error = response.reason or ""
+                output.success = False
+    except Exception:
+        output.success = False
+        exc_info = sys.exc_info()
+        output.error = "".join(traceback.format_exception(*exc_info))
 
     if pbar:
         pbar.update(1)
@@ -477,95 +478,95 @@ async def async_request_truss(
 
 async def async_request_sglang_generate(
     request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
 
-    async with _create_bench_client_session() as session:
-        payload = {
-            ("text" if isinstance(prompt, str) else "input_ids"): prompt,
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": request_func_input.output_len,
-                "ignore_eos": not args.disable_ignore_eos,
-            },
-            "stream": not args.disable_stream,
-            "lora_path": request_func_input.lora_name,
-            "return_logprob": args.return_logprob,
-            "logprob_start_len": -1,
-            **request_func_input.extra_request_body,
-        }
+    payload = {
+        ("text" if isinstance(prompt, str) else "input_ids"): prompt,
+        "sampling_params": {
+            "temperature": 0.0,
+            "max_new_tokens": request_func_input.output_len,
+            "ignore_eos": not args.disable_ignore_eos,
+        },
+        "stream": not args.disable_stream,
+        "lora_path": request_func_input.lora_name,
+        "return_logprob": args.return_logprob,
+        "logprob_start_len": -1,
+        **request_func_input.extra_request_body,
+    }
 
-        # Add image data if available
-        if request_func_input.image_data:
-            payload["image_data"] = request_func_input.image_data
+    # Add image data if available
+    if request_func_input.image_data:
+        payload["image_data"] = request_func_input.image_data
 
-        headers = get_auth_headers()
+    headers = get_auth_headers()
 
-        output = RequestFuncOutput.init_new(request_func_input)
+    output = RequestFuncOutput.init_new(request_func_input)
 
-        generated_text = ""
-        output_len = request_func_input.output_len
-        ttft = 0.0
-        st = time.perf_counter()
-        most_recent_timestamp = st
-        last_output_len = 0
-        try:
-            async with session.post(
-                url=api_url, json=payload, headers=headers
-            ) as response:
-                if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
+    generated_text = ""
+    output_len = request_func_input.output_len
+    ttft = 0.0
+    st = time.perf_counter()
+    most_recent_timestamp = st
+    last_output_len = 0
+    try:
+        async with session.post(
+            url=api_url, json=payload, headers=headers
+        ) as response:
+            if response.status == 200:
+                async for chunk_bytes in response.content:
+                    chunk_bytes = chunk_bytes.strip()
+                    if not chunk_bytes:
+                        continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                        latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
+                    chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                    latency = time.perf_counter() - st
+                    if chunk == "[DONE]":
+                        pass
+                    else:
+                        data = json.loads(chunk)
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if "text" in data and data["text"]:
-                                timestamp = time.perf_counter()
-                                generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
+                        # NOTE: Some completion API might have a last
+                        # usage summary response without a token so we
+                        # want to check a token was generated
+                        if "text" in data and data["text"]:
+                            timestamp = time.perf_counter()
+                            generated_text = data["text"]
+                            output_len = data["meta_info"]["completion_tokens"]
 
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
+                            # First token
+                            if ttft == 0.0:
+                                ttft = time.perf_counter() - st
+                                output.ttft = ttft
 
-                                # Decoding phase
-                                else:
-                                    num_new_tokens = output_len - last_output_len
-                                    if num_new_tokens == 0:
-                                        continue
-                                    adjust_itl = (
-                                        timestamp - most_recent_timestamp
-                                    ) / num_new_tokens
-                                    output.itl.extend([adjust_itl] * num_new_tokens)
+                            # Decoding phase
+                            else:
+                                num_new_tokens = output_len - last_output_len
+                                if num_new_tokens == 0:
+                                    continue
+                                adjust_itl = (
+                                    timestamp - most_recent_timestamp
+                                ) / num_new_tokens
+                                output.itl.extend([adjust_itl] * num_new_tokens)
 
-                                most_recent_timestamp = timestamp
-                                last_output_len = output_len
+                            most_recent_timestamp = timestamp
+                            last_output_len = output_len
 
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = latency
-                    output.output_len = output_len
-                else:
-                    output.error = response.reason or ""
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
-            print(f"{output.error=}")
+                output.generated_text = generated_text
+                output.success = True
+                output.latency = latency
+                output.output_len = output_len
+            else:
+                output.error = response.reason or ""
+                output.success = False
+    except Exception:
+        output.success = False
+        exc_info = sys.exc_info()
+        output.error = "".join(traceback.format_exception(*exc_info))
+        print(f"{output.error=}")
 
     if pbar:
         pbar.update(1)
@@ -574,27 +575,29 @@ async def async_request_sglang_generate(
 
 async def async_request_gserver(
     request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     raise NotImplementedError()
 
 
-async def async_request_profile(api_url: str) -> RequestFuncOutput:
-    async with _create_bench_client_session() as session:
-        output = RequestFuncOutput()
-        try:
-            async with session.post(url=api_url) as response:
-                if response.status == 200:
-                    output.success = True
-                else:
-                    output.error = response.reason or ""
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
+async def async_request_profile(api_url: str, session: aiohttp.ClientSession) -> RequestFuncOutput:
+    output = RequestFuncOutput()
+    try:
+        async with session.post(url=api_url) as response:
+            if response.status == 200:
+                output.success = True
+            else:
+                output.error = response.reason or ""
+                output.success = False
+    except Exception:
+        output.success = False
+        exc_info = sys.exc_info()
+        output.error = "".join(traceback.format_exception(*exc_info))
 
     return output
+
+
 
 
 def get_model(pretrained_model_name_or_path: str) -> str:
@@ -1336,11 +1339,37 @@ async def benchmark(
     # From https://github.com/vllm-project/vllm/pull/9390
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
+    # Create persistent session with connection pooling to avoid per-request session overhead
+    # Extract timeout and buffer size configurations from original _create_bench_client_session
+    BENCH_AIOHTTP_TIMEOUT_SECONDS = 6 * 60 * 60  # 6 hours
+    BENCH_AIOHTTP_READ_BUFSIZE_BYTES = 10 * 1024**2  # 10 MB
+    
+    # Configure TCPConnector with connection pooling
+    connector = aiohttp.TCPConnector(
+        limit=max_concurrency or 100,           # Total connection pool limit
+        limit_per_host=max_concurrency or 100,  # Per-host connection limit
+        ttl_dns_cache=300,                      # DNS cache TTL (5 minutes)
+        use_dns_cache=True,                     # Enable DNS caching
+        keepalive_timeout=60,                   # Keep connections alive for 60s
+        enable_cleanup_closed=True,             # Clean up closed connections
+        force_close=False,                      # Allow connection reuse
+        ssl=("https://" in api_url),            # SSL context when needed
+    )
+    
+    # Create persistent session with original timeout and buffer size settings
+    aiohttp_timeout = aiohttp.ClientTimeout(total=BENCH_AIOHTTP_TIMEOUT_SECONDS)
+    session = aiohttp.ClientSession(
+        connector=connector,
+        timeout=aiohttp_timeout,
+        read_bufsize=BENCH_AIOHTTP_READ_BUFSIZE_BYTES,
+        trust_env=True,
+    )
+
     async def limited_request_func(request_func_input, pbar):
         if semaphore is None:
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
+            return await request_func(request_func_input, session, pbar)
         async with semaphore:
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
+            return await request_func(request_func_input, session, pbar)
 
     # Warmup
     print(f"Starting warmup with {warmup_requests} sequences...")
@@ -1369,7 +1398,7 @@ async def benchmark(
     warmup_tasks = []
     for _ in range(warmup_requests):
         warmup_tasks.append(
-            asyncio.create_task(request_func(request_func_input=test_input))
+            asyncio.create_task(request_func(request_func_input=test_input, session=session))
         )
 
     warmup_outputs = await asyncio.gather(*warmup_tasks)
@@ -1395,7 +1424,7 @@ async def benchmark(
     if profile:
         print("Starting profiler...")
         profile_output = await async_request_profile(
-            api_url=base_url + "/start_profile"
+            api_url=base_url + "/start_profile", session=session
         )
         if profile_output.success:
             print("Profiler started")
@@ -1433,7 +1462,7 @@ async def benchmark(
     # Stop profiler
     if profile:
         print("Stopping profiler...")
-        profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
+        profile_output = await async_request_profile(api_url=base_url + "/stop_profile", session=session)
         if profile_output.success:
             print("Profiler stopped")
 
@@ -1600,6 +1629,9 @@ async def benchmark(
         else:
             result_for_dump = result
         file.write(json.dumps(result_for_dump) + "\n")
+
+    # Clean up the persistent session
+    await session.close()
 
     return result | result_details
 
