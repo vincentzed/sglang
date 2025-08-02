@@ -33,6 +33,7 @@ from http import HTTPStatus
 from typing import (
     Any,
     Awaitable,
+    Callable,
     Deque,
     Dict,
     Generic,
@@ -43,12 +44,10 @@ from typing import (
     Union,
 )
 
-import fastapi
 import torch
 import uvloop
 import zmq
 import zmq.asyncio
-from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
@@ -452,7 +451,7 @@ class TokenizerManager:
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
+        is_disconnected_fn: Optional[Callable[[], Awaitable[bool]]] = None,
     ):
         created_time = time.time()
         self.auto_create_handle_loop()
@@ -471,11 +470,13 @@ class TokenizerManager:
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
                 state = self._send_one_request(obj, tokenized_obj, created_time)
-                async for response in self._wait_one_response(obj, state, request):
+                async for response in self._wait_one_response(
+                    obj, state, is_disconnected_fn
+                ):
                     yield response
             else:
                 async for response in self._handle_batch_request(
-                    obj, request, created_time
+                    obj, created_time, is_disconnected_fn
                 ):
                     yield response
 
@@ -725,14 +726,14 @@ class TokenizerManager:
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         state: ReqState,
-        request: Optional[fastapi.Request] = None,
+        is_disconnected_fn: Optional[Callable[[], Awaitable[bool]]] = None,
     ):
         """Wait for the response of one request."""
         while True:
             try:
                 await asyncio.wait_for(state.event.wait(), timeout=4)
             except asyncio.TimeoutError:
-                if request is not None and await request.is_disconnected():
+                if is_disconnected_fn is not None and await is_disconnected_fn():
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
                     self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
@@ -775,9 +776,9 @@ class TokenizerManager:
                         # Delete the key to prevent resending abort request to the scheduler and
                         # to ensure aborted request state is cleaned up.
                         del self.rid_to_state[state.obj.rid]
-                        raise fastapi.HTTPException(
-                            status_code=finish_reason["status_code"],
-                            detail=finish_reason["message"],
+                        # Raise a generic exception since we no longer depend on FastAPI
+                        raise RuntimeError(
+                            f"Request aborted by scheduler: {finish_reason['message']}"
                         )
                 yield out
                 break
@@ -787,7 +788,7 @@ class TokenizerManager:
             if obj.stream:
                 yield out
             else:
-                if request is not None and await request.is_disconnected():
+                if is_disconnected_fn is not None and await is_disconnected_fn():
                     # Abort the request for disconnected requests (non-streaming, running)
                     self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
@@ -798,8 +799,8 @@ class TokenizerManager:
     async def _handle_batch_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
         created_time: Optional[float] = None,
+        is_disconnected_fn: Optional[Callable[[], Awaitable[bool]]] = None,
     ):
         batch_size = obj.batch_size
 
@@ -815,7 +816,9 @@ class TokenizerManager:
                 for i, tokenized_obj in enumerate(tokenized_objs):
                     tmp_obj = obj[i]
                     state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, state, request))
+                    generators.append(
+                        self._wait_one_response(tmp_obj, state, is_disconnected_fn)
+                    )
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
@@ -831,7 +834,7 @@ class TokenizerManager:
                             tmp_obj, tokenized_obj, created_time
                         )
                         generators.append(
-                            self._wait_one_response(tmp_obj, state, request)
+                            self._wait_one_response(tmp_obj, state, is_disconnected_fn)
                         )
                         rids.append(tmp_obj.rid)
         else:
@@ -858,7 +861,9 @@ class TokenizerManager:
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                await self._wait_one_response(tmp_obj, state, request).__anext__()
+                await self._wait_one_response(
+                    tmp_obj, state, is_disconnected_fn
+                ).__anext__()
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
@@ -867,7 +872,9 @@ class TokenizerManager:
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, state, request))
+                    generators.append(
+                        self._wait_one_response(tmp_obj, state, is_disconnected_fn)
+                    )
                     rids.append(tmp_obj.rid)
 
         # Wait for all requests
@@ -968,7 +975,6 @@ class TokenizerManager:
     async def update_weights_from_disk(
         self,
         obj: UpdateWeightFromDiskReqInput,
-        request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
 
@@ -1016,7 +1022,6 @@ class TokenizerManager:
     async def init_weights_update_group(
         self,
         obj: InitWeightsUpdateGroupReqInput,
-        request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
@@ -1028,7 +1033,6 @@ class TokenizerManager:
     async def update_weights_from_distributed(
         self,
         obj: UpdateWeightsFromDistributedReqInput,
-        request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
@@ -1047,7 +1051,6 @@ class TokenizerManager:
     async def update_weights_from_tensor(
         self,
         obj: UpdateWeightsFromTensorReqInput,
-        request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
@@ -1066,7 +1069,6 @@ class TokenizerManager:
     async def load_lora_adapter(
         self,
         obj: LoadLoRAAdapterReqInput,
-        _: Optional[fastapi.Request] = None,
     ) -> LoadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
         if not self.server_args.enable_lora:
@@ -1105,7 +1107,6 @@ class TokenizerManager:
     async def unload_lora_adapter(
         self,
         obj: UnloadLoRAAdapterReqInput,
-        _: Optional[fastapi.Request] = None,
     ) -> UnloadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
         if not self.server_args.enable_lora:
@@ -1140,9 +1141,7 @@ class TokenizerManager:
 
             return result
 
-    async def get_weights_by_name(
-        self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
-    ):
+    async def get_weights_by_name(self, obj: GetWeightsByNameReqInput):
         self.auto_create_handle_loop()
         results = await self.get_weights_by_name_communicator(obj)
         all_parameters = [r.parameter for r in results]
@@ -1154,7 +1153,6 @@ class TokenizerManager:
     async def release_memory_occupation(
         self,
         obj: ReleaseMemoryOccupationReqInput,
-        request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
         await self.release_memory_occupation_communicator(obj)
@@ -1162,7 +1160,6 @@ class TokenizerManager:
     async def resume_memory_occupation(
         self,
         obj: ResumeMemoryOccupationReqInput,
-        request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
@@ -1170,14 +1167,11 @@ class TokenizerManager:
     async def slow_down(
         self,
         obj: SlowDownReqInput,
-        request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
 
-    async def open_session(
-        self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
-    ):
+    async def open_session(self, obj: OpenSessionReqInput):
         self.auto_create_handle_loop()
 
         if obj.session_id is None:
@@ -1192,9 +1186,7 @@ class TokenizerManager:
         del self.session_futures[obj.session_id]
         return session_id
 
-    async def close_session(
-        self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
-    ):
+    async def close_session(self, obj: CloseSessionReqInput):
         await self.send_to_scheduler.send_pyobj(obj)
 
     async def get_internal_state(self) -> List[Dict[Any, Any]]:
@@ -1299,9 +1291,8 @@ class TokenizerManager:
                 for rid in obj.rid:
                     self.abort_request(rid)
 
-        background_tasks = BackgroundTasks()
-        background_tasks.add_task(abort_request)
-        return background_tasks
+        # Return the coroutine function for the web framework to handle
+        return abort_request
 
     def auto_create_handle_loop(self):
         if self.no_create_loop:
@@ -1813,7 +1804,6 @@ class TokenizerManager:
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-        request: Optional[Any] = None,
     ) -> List[List[float]]:
         """
         See Engine.score() for more details.
