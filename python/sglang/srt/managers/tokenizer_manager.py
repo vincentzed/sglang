@@ -470,7 +470,9 @@ class TokenizerManager:
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
                 state = self._send_one_request(obj, tokenized_obj, created_time)
-                async for response in self._wait_one_response(obj, state, is_disconnected_fn):
+                async for response in self._wait_one_response(
+                    obj, state, is_disconnected_fn
+                ):
                     yield response
             else:
                 async for response in self._handle_batch_request(
@@ -814,7 +816,9 @@ class TokenizerManager:
                 for i, tokenized_obj in enumerate(tokenized_objs):
                     tmp_obj = obj[i]
                     state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, state, is_disconnected_fn))
+                    generators.append(
+                        self._wait_one_response(tmp_obj, state, is_disconnected_fn)
+                    )
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
@@ -857,7 +861,9 @@ class TokenizerManager:
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                await self._wait_one_response(tmp_obj, state, is_disconnected_fn).__anext__()
+                await self._wait_one_response(
+                    tmp_obj, state, is_disconnected_fn
+                ).__anext__()
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
@@ -866,7 +872,9 @@ class TokenizerManager:
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, state, is_disconnected_fn))
+                    generators.append(
+                        self._wait_one_response(tmp_obj, state, is_disconnected_fn)
+                    )
                     rids.append(tmp_obj.rid)
 
         # Wait for all requests
@@ -1133,9 +1141,7 @@ class TokenizerManager:
 
             return result
 
-    async def get_weights_by_name(
-        self, obj: GetWeightsByNameReqInput
-    ):
+    async def get_weights_by_name(self, obj: GetWeightsByNameReqInput):
         self.auto_create_handle_loop()
         results = await self.get_weights_by_name_communicator(obj)
         all_parameters = [r.parameter for r in results]
@@ -1165,9 +1171,7 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
 
-    async def open_session(
-        self, obj: OpenSessionReqInput
-    ):
+    async def open_session(self, obj: OpenSessionReqInput):
         self.auto_create_handle_loop()
 
         if obj.session_id is None:
@@ -1182,9 +1186,7 @@ class TokenizerManager:
         del self.session_futures[obj.session_id]
         return session_id
 
-    async def close_session(
-        self, obj: CloseSessionReqInput
-    ):
+    async def close_session(self, obj: CloseSessionReqInput):
         await self.send_to_scheduler.send_pyobj(obj)
 
     async def get_internal_state(self) -> List[Dict[Any, Any]]:
