@@ -110,7 +110,34 @@ def conv_window_dedup_enabled(
     )
 
 
-def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
+def gdn_replayssm_spec_enabled(
+    is_npu: bool,
+    is_cpu: bool,
+    speculative_eagle_topk: Optional[int],
+    enabled: bool,
+) -> bool:
+    """Whether the ReplaySSM spec-verify ring path is used (Part B of #28511).
+
+    Replaces the recurrent verify (which writes a full ``[V, K]`` state per draft
+    token to ``intermediate_ssm``) with a per-slot circular ``(d, k, g)`` cache +
+    periodic flush -- the bandwidth/concurrency win. The verify kernel uses a
+    strictly-lower causal mask, so it is valid only for a *linear* draft chain
+    (``speculative_eagle_topk <= 1``, i.e. NEXTN / MTP); EAGLE tree verify
+    (``topk > 1``), KDA, and NPU/CPU fall back to the recurrent ``target_verify``.
+    """
+    return (
+        enabled
+        and not is_npu
+        and not is_cpu
+        and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
+    )
+
+
+def get_tensor_size_bytes(t: Optional[Union[torch.Tensor, List[torch.Tensor]]]):
+    if t is None:
+        # Optional cache fields (e.g. the ReplaySSM spec ring when the flag is off)
+        # contribute no bytes.
+        return 0
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
@@ -308,8 +335,17 @@ class MambaPool:
             for f in fields(self):
                 name = f.name
                 v = getattr(self, name)
-                if name in ("conv", "intermediate_conv_window"):
+                if v is None:
+                    kwargs[name] = None
+                elif name in ("conv", "intermediate_conv_window"):
                     kwargs[name] = [conv[layer] for conv in v]
+                elif name in (
+                    "replayssm_write_pos",
+                    "replayssm_cache_base",
+                    "replayssm_is_flush",
+                ):
+                    # Per-slot cursors are shared across all layers of a step.
+                    kwargs[name] = v
                 else:
                     kwargs[name] = v[layer]
 
@@ -325,6 +361,17 @@ class MambaPool:
     class SpeculativeState(State):
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
+        # ReplaySSM spec-verify ring (Part B of #28511); None unless
+        # --enable-gdn-replayssm-spec (linear-chain GDN verify, topk <= 1).
+        # d/k/g are per-layer (sliced by at_layer_idx); the cursors are per-slot,
+        # shared by all GDN layers of one decode step (advanced once per step by
+        # the worker via commit_gdn_replayssm_spec).
+        replayssm_d: Optional[torch.Tensor] = None  # [layers, slots, HV, L, V]
+        replayssm_k: Optional[torch.Tensor] = None  # [layers, slots, H,  L, K]
+        replayssm_g: Optional[torch.Tensor] = None  # [layers, slots, HV, L]  fp32
+        replayssm_write_pos: Optional[torch.Tensor] = None  # [slots] int32
+        replayssm_cache_base: Optional[torch.Tensor] = None  # [slots] int32
+        replayssm_is_flush: Optional[torch.Tensor] = None  # [slots] int8
 
     def __init__(
         self,
@@ -337,6 +384,8 @@ class MambaPool:
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
+        enable_gdn_replayssm_spec: bool = False,
+        gdn_replayssm_spec_cache_len: int = 16,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -494,11 +543,73 @@ class MambaPool:
                         for conv_shape in conv_state_shape
                     ]
                     self._intermediate_conv_window_phys = intermediate_conv_window_cache
+                # ReplaySSM spec-verify ring (Part B of #28511): per-slot circular
+                # (d, k, g) cache + block-keyed cursors, indexed by the same
+                # physical mamba slot as the checkpoint (`temporal`). Replaces the
+                # recurrent verify's per-draft full-state writes with a small ring
+                # read + periodic flush. Linear-chain GDN only; see
+                # `gdn_replayssm_spec_enabled`. GDN has K == V (head_k_dim ==
+                # head_v_dim), so the [HV, K, V] checkpoint memory matches the
+                # kernel's [HV, V, K] view (same assumption as the recurrent verify).
+                replayssm_d = replayssm_k = replayssm_g = None
+                replayssm_write_pos = replayssm_cache_base = replayssm_is_flush = None
+                if gdn_replayssm_spec_enabled(
+                    _is_npu, _is_cpu, speculative_eagle_topk, enable_gdn_replayssm_spec
+                ):
+                    HV_, K_, V_ = temporal_state_shape  # [HV, K, V]
+                    # GDN conv runs over mixed_qkv = q|k|v -> conv_dim = 2*H*K + HV*V
+                    conv_dim = conv_state_shape[0][0]
+                    H_ = (conv_dim - HV_ * V_) // (2 * K_)
+                    assert H_ > 0 and (conv_dim - HV_ * V_) % (2 * K_) == 0, (
+                        f"cannot derive num_k_heads (conv_dim={conv_dim}, HV={HV_}, "
+                        f"K={K_}, V={V_})"
+                    )
+                    L_ = gdn_replayssm_spec_cache_len
+                    assert (
+                        L_ & (L_ - 1) == 0
+                    ), f"gdn_replayssm_spec_cache_len ({L_}) must be a power of two"
+                    assert L_ >= 2 * speculative_num_draft_tokens, (
+                        f"gdn_replayssm_spec_cache_len ({L_}) must be >= "
+                        f"2 * speculative_num_draft_tokens "
+                        f"({2 * speculative_num_draft_tokens}) for the early-flush "
+                        f"invariant"
+                    )
+                    nslots = size + 1
+                    replayssm_d = torch.zeros(
+                        (num_mamba_layers, nslots, HV_, L_, V_),
+                        dtype=conv_dtype,
+                        device="cuda",
+                    )
+                    replayssm_k = torch.zeros(
+                        (num_mamba_layers, nslots, H_, L_, K_),
+                        dtype=conv_dtype,
+                        device="cuda",
+                    )
+                    replayssm_g = torch.zeros(
+                        (num_mamba_layers, nslots, HV_, L_),
+                        dtype=torch.float32,
+                        device="cuda",
+                    )
+                    replayssm_write_pos = torch.zeros(
+                        nslots, dtype=torch.int32, device="cuda"
+                    )
+                    replayssm_cache_base = torch.zeros(
+                        nslots, dtype=torch.int32, device="cuda"
+                    )
+                    replayssm_is_flush = torch.zeros(
+                        nslots, dtype=torch.int8, device="cuda"
+                    )
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
+                    replayssm_d=replayssm_d,
+                    replayssm_k=replayssm_k,
+                    replayssm_g=replayssm_g,
+                    replayssm_write_pos=replayssm_write_pos,
+                    replayssm_cache_base=replayssm_cache_base,
+                    replayssm_is_flush=replayssm_is_flush,
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
@@ -563,6 +674,22 @@ class MambaPool:
         self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
             :, src_indices
         ]
+        # ReplaySSM spec ring: a forked slot must carry the full state
+        # representation = checkpoint (temporal) + pending ring + cursors, so the
+        # reconstruction stays exact. (At a post-prefill fork the ring is empty, so
+        # this is equivalent to resetting the destination cursors.)
+        spec = self.mamba_cache
+        if getattr(spec, "replayssm_d", None) is not None:
+            spec.replayssm_d[:, dst_indices] = spec.replayssm_d[:, src_indices]
+            spec.replayssm_k[:, dst_indices] = spec.replayssm_k[:, src_indices]
+            spec.replayssm_g[:, dst_indices] = spec.replayssm_g[:, src_indices]
+            spec.replayssm_write_pos[dst_indices] = spec.replayssm_write_pos[
+                src_indices
+            ]
+            spec.replayssm_cache_base[dst_indices] = spec.replayssm_cache_base[
+                src_indices
+            ]
+            spec.replayssm_is_flush[dst_indices] = spec.replayssm_is_flush[src_indices]
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -596,7 +723,16 @@ class MambaPool:
         for field in vars(self.mamba_cache):
             # Skip intermediate buffers used only for speculative decoding
             # These buffers have different size (spec_state_size + 1) and should not be transferred
-            if field in ("intermediate_ssm", "intermediate_conv_window"):
+            if field in (
+                "intermediate_ssm",
+                "intermediate_conv_window",
+                "replayssm_d",
+                "replayssm_k",
+                "replayssm_g",
+                "replayssm_write_pos",
+                "replayssm_cache_base",
+                "replayssm_is_flush",
+            ):
                 continue
             value = getattr(self.mamba_cache, field)
             if isinstance(value, list):
@@ -661,6 +797,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer_lazy: bool = False,
         speculative_num_draft_tokens: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        enable_gdn_replayssm_spec: bool = False,
+        gdn_replayssm_spec_cache_len: int = 16,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
     ):
@@ -686,6 +824,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
+            gdn_replayssm_spec_cache_len=gdn_replayssm_spec_cache_len,
         )
 
     def _init_mamba_pool(
@@ -698,6 +838,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        enable_gdn_replayssm_spec: bool = False,
+        gdn_replayssm_spec_cache_len: int = 16,
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -708,6 +850,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
+            gdn_replayssm_spec_cache_len=gdn_replayssm_spec_cache_len,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

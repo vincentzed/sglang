@@ -573,6 +573,63 @@ def commit_mamba_states_after_verify(
     model_runner = target_worker.model_runner
     if model_runner.mambaish_config is None:
         return
+
+    # ReplaySSM spec path (Part B of #28511): the accepted drafts already live in
+    # the per-slot circular ring (written during verify). Instead of copying an
+    # intermediate full SSM state into `temporal`, we advance the block-keyed
+    # cursors by the accepted count (the ring owns the SSM state; the kernel folds
+    # it into `temporal` on flush). The CONV state still needs its usual
+    # accept-rollback, so we keep the conv-window scatter and skip only the SSM one.
+    req_pool = model_runner.req_to_token_pool
+    if hasattr(req_pool, "get_speculative_mamba2_params_all_layers"):
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        if spec_state.replayssm_d is not None:
+            if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+                return
+            from sglang.srt.layers.attention.fla.gdn_replayssm_spec_decode import (
+                commit_gdn_replayssm_spec,
+            )
+            from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+                fused_conv_window_scatter_with_mask,
+            )
+
+            bs = accept_lens.shape[0]
+            state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+            commit_gdn_replayssm_spec(
+                write_pos=spec_state.replayssm_write_pos,
+                cache_base=spec_state.replayssm_cache_base,
+                is_flush=spec_state.replayssm_is_flush,
+                num_accepted=accept_lens,  # [bs], includes the bonus token
+                state_batch_indices=state_batch_indices,
+                max_cache_len=spec_state.replayssm_d.shape[-2],
+                max_spec_len=draft_token_num,
+                null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+            )
+            # Roll back / commit the conv state to the last accepted draft step.
+            accept_indices_offset = torch.arange(
+                0,
+                bs * draft_token_num,
+                step=draft_token_num,
+                dtype=accept_lens.dtype,
+                device=accept_lens.device,
+            )
+            req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+            last_correct_step_indices = (
+                accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+                - accept_indices_offset
+            )
+            fused_conv_window_scatter_with_mask(
+                spec_state.conv[0],
+                spec_state.intermediate_conv_window[0],
+                state_batch_indices,
+                last_correct_step_indices,
+            )
+            # NOTE: radix mamba prefix-caching (mamba_track / extra_buffer) needs a
+            # device-side force-flush so `temporal` reflects the ring before a
+            # snapshot; not wired for Part B -> requires --enable-mamba-extra-buffer
+            # off (the per-track scatters are intentionally skipped here).
+            return
+
     attn_backend = model_runner.attn_backend
     if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
         return

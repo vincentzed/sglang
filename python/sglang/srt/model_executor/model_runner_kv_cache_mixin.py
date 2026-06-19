@@ -387,6 +387,8 @@ class ModelRunnerKVCacheMixin:
                     enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
+                    enable_gdn_replayssm_spec=self.server_args.enable_gdn_replayssm_spec,
+                    gdn_replayssm_spec_cache_len=self.server_args.gdn_replayssm_spec_cache_len,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
                 )

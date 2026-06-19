@@ -616,6 +616,11 @@ class ServerArgs:
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
+    # ReplaySSM spec-verify (Part B of RFC #28511): GDN linear-chain target-verify
+    # via a per-slot circular (d, k, g) ring + periodic flush instead of per-draft
+    # full-state snapshots. GDN only; linear-chain (topk <= 1) only.
+    enable_gdn_replayssm_spec: bool = False
+    gdn_replayssm_spec_cache_len: int = 16
     speculative_dflash_block_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
@@ -2857,6 +2862,18 @@ class ServerArgs:
             self._validate_mamba_extra_buffer(model_arch)
         else:
             self._validate_mamba_no_buffer(model_arch)
+
+        # ReplaySSM spec-verify (Part B of #28511) does not yet implement the
+        # device-side force-flush needed to keep `temporal` consistent with the
+        # ring at radix mamba-track boundaries, so it is incompatible with
+        # extra_buffer. (extra_buffer can be auto-selected above, so this guard
+        # runs after the strategy is final.)
+        if self.enable_gdn_replayssm_spec and self.enable_mamba_extra_buffer():
+            raise ValueError(
+                "--enable-gdn-replayssm-spec is not yet compatible with mamba "
+                "extra_buffer (radix prefix caching); use --disable-radix-cache "
+                "or --mamba-radix-cache-strategy no_buffer."
+            )
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -6082,6 +6099,22 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--enable-gdn-replayssm-spec",
+            action="store_true",
+            help="Enable the ReplaySSM GDN spec-verify kernel (Part B of RFC "
+            "#28511): a per-slot circular (d, k, g) ring + periodic flush replacing "
+            "the recurrent verify's per-draft full-state snapshots. GDN only, "
+            "linear-chain (speculative-eagle-topk <= 1) only.",
+        )
+        parser.add_argument(
+            "--gdn-replayssm-spec-cache-len",
+            type=int,
+            default=ServerArgs.gdn_replayssm_spec_cache_len,
+            help="Circular cache length L for --enable-gdn-replayssm-spec. Must be a "
+            "power of two and >= 2*speculative-num-draft-tokens (early-flush "
+            "invariant).",
         )
         parser.add_argument(
             "--speculative-dflash-block-size",

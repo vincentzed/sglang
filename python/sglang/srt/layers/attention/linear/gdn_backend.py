@@ -474,22 +474,41 @@ class GDNAttnBackend(MambaAttnBackendBase):
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
-            core_attn_out = self.kernel_dispatcher.target_verify(
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=intermediate_state_indices,
-                cache_steps=forward_batch.spec_info.draft_token_num,
-                retrieve_parent_token=retrieve_parent_token,
-            )
+            # ReplaySSM spec-verify (Part B of #28511): if the per-slot ring is
+            # allocated (flag on + GDN + linear-chain topk<=1), use the circular
+            # (d,k,g) reconstruction kernel instead of the recurrent verify that
+            # snapshots a full state per draft token. The cursors are advanced once
+            # per decode step by the worker (commit_gdn_replayssm_spec).
+            if mamba_cache_params.replayssm_d is not None:
+                core_attn_out = self._replayssm_target_verify(
+                    layer=layer,
+                    query=query,
+                    key=key,
+                    value=value,
+                    a=a,
+                    b=b,
+                    spec_state=mamba_cache_params,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    draft_token_num=forward_batch.spec_info.draft_token_num,
+                )
+            else:
+                core_attn_out = self.kernel_dispatcher.target_verify(
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    q=query,
+                    k=key,
+                    v=value,
+                    a=a,
+                    b=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    intermediate_states_buffer=intermediate_state_cache,
+                    intermediate_state_indices=intermediate_state_indices,
+                    cache_steps=forward_batch.spec_info.draft_token_num,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
@@ -514,4 +533,86 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_batch, h, ssm_states, forward_metadata
                 )
 
+            # ReplaySSM spec: a freshly-prefilled slot has an empty ring (its
+            # checkpoint == `temporal`), so reset its cursors here. The first verify
+            # step then reconstructs from the prefill state alone. Chunked prefill
+            # resets each chunk -- harmless, the ring stays empty until decode. The
+            # config invariant L >= 2*max_spec_len makes INIT_FLUSH == 0.
+            if getattr(mamba_cache_params, "replayssm_write_pos", None) is not None:
+                slots = cache_indices[cache_indices >= 0]  # skip padding (-1)
+                mamba_cache_params.replayssm_write_pos[slots] = 0
+                mamba_cache_params.replayssm_cache_base[slots] = 0
+                mamba_cache_params.replayssm_is_flush[slots] = 0
+
         return core_attn_out
+
+    def _replayssm_target_verify(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        spec_state: "MambaPool.SpeculativeState",
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        draft_token_num: int,
+    ) -> torch.Tensor:
+        """ReplaySSM GDN spec-verify (Part B of #28511).
+
+        Reconstructs the verify output for the whole draft window from the frozen
+        checkpoint (``temporal``) + the per-slot circular ``(d, k, g)`` ring, and
+        appends this window's drafts to the ring. The ring cursors persist across
+        decode steps and are advanced once per step by the worker; here we only
+        read/write the ring for this (layer, step). GDN has K == V, so ``temporal``
+        ([slots, HV, K, V]) is consumed directly as the kernel's [slots, HV, V, K]
+        checkpoint.
+        """
+        from sglang.srt.layers.attention.fla.gdn_replayssm_spec_decode import (
+            gdn_replayssm_spec_decode,
+        )
+
+        H, K = layer.num_k_heads, layer.head_k_dim
+        HV, V = layer.num_v_heads, layer.head_v_dim
+        # q/k/v may be [1, seq, *] (fallback) or [B, T, *] (fused split); derive the
+        # packed token count from numel so both layouts flatten correctly.
+        seq_len = query.numel() // (H * K)
+        q = query.reshape(seq_len, H, K)
+        k = key.reshape(seq_len, H, K)
+        v = value.reshape(seq_len, HV, V)
+        a = a.reshape(seq_len, HV)
+        b = b.reshape(seq_len, HV)
+        d_cache = spec_state.replayssm_d  # [slots, HV, L, V]
+        max_cache_len = d_cache.shape[-2]  # ring length L
+        out = q.new_empty(seq_len, HV, V)
+        gdn_replayssm_spec_decode(
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            checkpoint_state=spec_state.temporal,
+            d_cache=d_cache,
+            k_cache=spec_state.replayssm_k,
+            g_cache=spec_state.replayssm_g,
+            out=out,
+            query_start_loc=query_start_loc,
+            ssm_state_indices=cache_indices,
+            write_pos=spec_state.replayssm_write_pos,
+            cache_base=spec_state.replayssm_cache_base,
+            is_flush=spec_state.replayssm_is_flush,
+            max_cache_len=max_cache_len,
+            max_spec_len=draft_token_num,
+            scale=K**-0.5,
+            use_qk_l2norm_in_kernel=True,
+            # SGLang marks invalid/padding requests with a negative mamba slot
+            # index (valid slots start at 0), so the kernel's "null block" sentinel
+            # is -1, not the vLLM default of 0.
+            null_block_id=-1,
+        )
+        # Match the recurrent target_verify output shape (== value.shape).
+        return out.reshape(value.shape)
