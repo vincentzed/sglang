@@ -177,7 +177,7 @@ def gdn_replayssm_spec_circular_kernel(
     b_d_all = tl.load(
         p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0.0
     ).to(tl.float32)
-    b_d_scaled = (b_d_all * b_replay_decay[None, :]).to(q.dtype.element_ty)
+    b_d_scaled = (b_d_all * b_replay_decay[None, :]).to(h0.dtype.element_ty)
 
     if USE_QK_L2NORM_IN_KERNEL:
         qnorm_acc = tl.zeros([BS], dtype=tl.float32)
@@ -239,8 +239,8 @@ def gdn_replayssm_spec_circular_kernel(
             mask=mask_kt[None, :],
             other=0.0,
         ).to(tl.float32)
-        q_tile = (q_tile * (q_rnorm * scale)[:, None]).to(q.dtype.element_ty)
-        k_tile = (k_tile * k_rnorm[:, None]).to(q.dtype.element_ty)
+        q_tile = (q_tile * (q_rnorm * scale)[:, None]).to(h0.dtype.element_ty)
+        k_tile = (k_tile * k_rnorm[:, None]).to(h0.dtype.element_ty)
 
         p_h0 = (
             h0
@@ -250,7 +250,7 @@ def gdn_replayssm_spec_circular_kernel(
             + o_kt[None, :]
         )
         sc_tile = tl.load(p_h0, mask=mask_v[:, None] & mask_kt[None, :], other=0.0).to(
-            q.dtype.element_ty
+            h0.dtype.element_ty
         )
         # cached-key history load -> phys_c
         p_k = k_cache + (
@@ -260,7 +260,7 @@ def gdn_replayssm_spec_circular_kernel(
         )
         khist_tile = tl.load(
             p_k, mask=cache_valid[:, None] & mask_kt[None, :], other=0.0
-        ).to(q.dtype.element_ty)
+        ).to(h0.dtype.element_ty)
 
         qT = tl.trans(q_tile)
         kT = tl.trans(k_tile)
@@ -271,7 +271,7 @@ def gdn_replayssm_spec_circular_kernel(
             sw_f = tl.dot(
                 b_d_scaled, khist_tile, acc=b_total_decay * sc_tile.to(tl.float32)
             )
-            sw_tile = sw_f.to(q.dtype.element_ty)
+            sw_tile = sw_f.to(h0.dtype.element_ty)
             hw_q += tl.dot(sw_tile, qT)
             hw_k += tl.dot(sw_tile, kT)
             p_ht = (
