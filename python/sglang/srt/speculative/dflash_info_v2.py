@@ -159,12 +159,19 @@ class DFlashDraftInputV2(SpecInput):
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
         cur_allocated_seq_lens_cpu = self.cur_allocated_seq_lens_cpu
 
-        # For DFLASH, each decode step needs a fixed-size verify block.
-        block_size = int(get_global_server_args().speculative_num_draft_tokens)
-        if block_size <= 0:
-            raise ValueError(
-                f"DFLASH invalid speculative_num_draft_tokens={block_size}."
-            )
+        # For DFLASH, each decode step needs a fixed-size verify block. Linear
+        # mode uses the draft block size; tree mode verifies the root-inclusive
+        # tree budget.
+        server_args = get_global_server_args()
+        block_size = int(server_args.speculative_num_draft_tokens)
+        tree_width = int(getattr(server_args, "speculative_dflash_tree_width", 1))
+        verify_token_num = (
+            int(server_args.speculative_dflash_tree_budget)
+            if tree_width > 1
+            else block_size
+        )
+        if verify_token_num <= 0:
+            raise ValueError(f"DFLASH invalid verify token count={verify_token_num}.")
         page_size = batch.token_to_kv_pool_allocator.page_size
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
         committed_seq_lens_sum = 0
@@ -182,8 +189,8 @@ class DFlashDraftInputV2(SpecInput):
                 cur_alloc_len = int(cur_allocated_seq_lens_cpu[i])
             else:
                 cur_alloc_len = int(req.kv_allocated_len)
-            planning_len = committed_len + block_size
-            reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
+            planning_len = committed_len + verify_token_num
+            reserved_len = max(cur_alloc_len, committed_len + 2 * verify_token_num)
             top_k = int(req.sampling_params.top_k)
 
             committed_kv_lens_cpu_t[i] = committed_len

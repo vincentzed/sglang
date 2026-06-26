@@ -220,6 +220,76 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
         server_args.speculative_num_draft_tokens = inferred_block_size
 
+    tree_width = int(server_args.speculative_dflash_tree_width)
+    if tree_width < 1:
+        raise ValueError(
+            "--speculative-dflash-tree-width must be >= 1, "
+            f"got {server_args.speculative_dflash_tree_width}."
+        )
+    server_args.speculative_dflash_tree_width = tree_width
+
+    if server_args.speculative_dflash_head_type not in (
+        "auto",
+        "causal",
+        "bidirectional",
+    ):
+        raise ValueError(
+            "--speculative-dflash-head-type must be one of "
+            "'auto', 'causal', or 'bidirectional', got "
+            f"{server_args.speculative_dflash_head_type!r}."
+        )
+
+    if server_args.speculative_dflash_tree_draft not in (
+        "accum_logp",
+        "entropy",
+        "hybrid",
+    ):
+        raise ValueError(
+            "--speculative-dflash-tree-draft must be one of "
+            "'accum_logp', 'entropy', or 'hybrid', got "
+            f"{server_args.speculative_dflash_tree_draft!r}."
+        )
+    if tree_width > 1 and server_args.speculative_dflash_tree_draft != "accum_logp":
+        raise NotImplementedError(
+            "DFLASH tree v1 only supports --speculative-dflash-tree-draft=accum_logp. "
+            "Entropy-guided drafting is a follow-up."
+        )
+
+    block_size = int(server_args.speculative_num_draft_tokens)
+    if server_args.speculative_dflash_tree_budget is None:
+        tree_budget = block_size
+    else:
+        tree_budget = int(server_args.speculative_dflash_tree_budget)
+        if tree_budget <= 0:
+            raise ValueError(
+                "--speculative-dflash-tree-budget must be positive when set, "
+                f"got {server_args.speculative_dflash_tree_budget}."
+            )
+
+    if tree_width <= 1:
+        if tree_budget != block_size:
+            logger.warning(
+                "Ignoring --speculative-dflash-tree-budget=%s because "
+                "--speculative-dflash-tree-width=1 selects the linear DFLASH path.",
+                tree_budget,
+            )
+        tree_budget = block_size
+    elif tree_budget < block_size:
+        raise ValueError(
+            "--speculative-dflash-tree-budget must be >= the DFLASH block size "
+            "so tree mode has at least the root-inclusive linear verify budget. "
+            f"tree_budget={tree_budget}, block_size={block_size}."
+        )
+    else:
+        from sglang.srt.speculative.dflash_tree_utils import compute_tree_budget
+
+        tree_budget = compute_tree_budget(
+            block_size=block_size,
+            tree_width=tree_width,
+            max_budget=tree_budget,
+        )
+    server_args.speculative_dflash_tree_budget = tree_budget
+
     if server_args.speculative_draft_window_size is not None:
         draft_tokens = int(server_args.speculative_num_draft_tokens)
         if server_args.speculative_draft_window_size < draft_tokens:

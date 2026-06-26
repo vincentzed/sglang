@@ -31,6 +31,15 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
+from sglang.srt.speculative.dflash_tree_utils import (
+    DraftTreeCPU,
+    build_retrieve_links_from_parents,
+    build_tree_custom_mask,
+    build_tree_from_topk_cpu,
+    compute_tree_budget,
+    sample_topk_from_logits,
+    tree_accept_greedy,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
@@ -181,6 +190,27 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+        self.tree_width = int(server_args.speculative_dflash_tree_width)
+        self.tree_budget = (
+            int(server_args.speculative_dflash_tree_budget)
+            if server_args.speculative_dflash_tree_budget is not None
+            else compute_tree_budget(self.block_size, self.tree_width)
+        )
+        self.tree_draft = str(server_args.speculative_dflash_tree_draft)
+        self.dflash_head_type = str(server_args.speculative_dflash_head_type)
+        self.use_tree_draft = self.tree_width > 1
+        self.dflash_causal_head = self._read_dflash_causal_head(
+            self.draft_model_runner.model_config.hf_config
+        )
+        if self.use_tree_draft:
+            if self.dflash_head_type == "bidirectional" or (
+                self.dflash_head_type == "auto" and self.dflash_causal_head is False
+            ):
+                raise NotImplementedError(
+                    "DFLASH tree mode requires a causal DFlash draft head. "
+                    f"head_type={self.dflash_head_type!r}, "
+                    f"config.causal_head={self.dflash_causal_head!r}."
+                )
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -196,6 +226,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self.block_size,
                 self.draft_window_size,
                 self.use_compact_draft_cache,
+            )
+            logger.info(
+                "DFLASH tree config. width=%s, budget=%s, draft=%s, head_type=%s, causal_head=%s",
+                self.tree_width,
+                self.tree_budget,
+                self.tree_draft,
+                self.dflash_head_type,
+                self.dflash_causal_head,
             )
             logger.info(
                 "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
@@ -524,6 +562,33 @@ class DFlashWorkerV2(BaseSpecWorker):
         aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
         return (seq_lens_i64 - aligned_start).to(torch.int32)
 
+    @staticmethod
+    def _read_dflash_causal_head(hf_config) -> Optional[bool]:
+        config_dict = None
+        if isinstance(hf_config, dict):
+            config_dict = hf_config
+        elif hasattr(hf_config, "to_dict"):
+            try:
+                config_dict = hf_config.to_dict()
+            except Exception:
+                config_dict = None
+
+        if isinstance(config_dict, dict):
+            dflash_cfg = config_dict.get("dflash_config", {})
+            if isinstance(dflash_cfg, dict) and "causal_head" in dflash_cfg:
+                return bool(dflash_cfg["causal_head"])
+            if "causal_head" in config_dict:
+                return bool(config_dict["causal_head"])
+
+        dflash_cfg = getattr(hf_config, "dflash_config", None)
+        if isinstance(dflash_cfg, dict) and "causal_head" in dflash_cfg:
+            return bool(dflash_cfg["causal_head"])
+        if hasattr(dflash_cfg, "causal_head"):
+            return bool(getattr(dflash_cfg, "causal_head"))
+        if hasattr(hf_config, "causal_head"):
+            return bool(getattr(hf_config, "causal_head"))
+        return None
+
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
     ) -> int:
@@ -817,6 +882,167 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens[start:end].copy_(selected_ids.view(-1))
 
         return out_tokens
+
+    def _topk_from_vocab_parallel_head(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        lm_head,
+        k: int,
+        chunk_size: int = 64,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Top-k over the target LM head with global token ids.
+
+        Returns `(topk_logprobs, topk_token_ids)`, both shaped `[num_tokens, k]`.
+        The implementation is intentionally simple because tree drafting v1
+        prioritizes correctness over a fused GPU draft-head kernel.
+        """
+        if hidden_states.numel() == 0:
+            return (
+                torch.empty(
+                    (0, int(k)), dtype=torch.float32, device=hidden_states.device
+                ),
+                torch.empty((0, int(k)), dtype=torch.long, device=hidden_states.device),
+            )
+        if int(k) <= 0:
+            raise ValueError(f"DFLASH tree top-k must be positive, got {k}.")
+
+        weight = lm_head.weight
+        weight_dtype = weight.dtype
+        num_tokens = int(hidden_states.shape[0])
+        topk_logprobs_out = torch.empty(
+            (num_tokens, int(k)), dtype=torch.float32, device=hidden_states.device
+        )
+        topk_ids_out = torch.empty(
+            (num_tokens, int(k)), dtype=torch.long, device=hidden_states.device
+        )
+
+        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
+            return x if x.dtype == weight_dtype else x.to(weight_dtype)
+
+        if not hasattr(lm_head, "shard_indices"):
+            if int(k) > int(weight.shape[0]):
+                raise ValueError(
+                    f"DFLASH tree_width={k} exceeds vocab size={int(weight.shape[0])}."
+                )
+            for start in range(0, num_tokens, int(chunk_size)):
+                end = min(num_tokens, start + int(chunk_size))
+                hs = _cast_hs(hidden_states[start:end])
+                logits = torch.matmul(hs, weight.T)
+                topk_logprobs, topk_ids = sample_topk_from_logits(logits, int(k))
+                topk_logprobs_out[start:end].copy_(topk_logprobs.to(torch.float32))
+                topk_ids_out[start:end].copy_(topk_ids.to(torch.long))
+            return topk_logprobs_out, topk_ids_out
+
+        shard = lm_head.shard_indices
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
+
+        num_org = int(shard.num_org_elements)
+        num_org_padded = int(shard.num_org_elements_padded)
+        num_added = int(shard.num_added_elements)
+        org_vocab_start = int(shard.org_vocab_start_index)
+        added_vocab_start = int(shard.added_vocab_start_index)
+        local_vocab_size = num_org + num_added
+        if int(k) > local_vocab_size * tp_size:
+            raise ValueError(
+                "DFLASH tree_width exceeds the tensor-parallel global vocab size. "
+                f"tree_width={k}, global_vocab={local_vocab_size * tp_size}."
+            )
+
+        for start in range(0, num_tokens, int(chunk_size)):
+            end = min(num_tokens, start + int(chunk_size))
+            hs = _cast_hs(hidden_states[start:end])
+            chunk_len = int(hs.shape[0])
+
+            logits_pieces = []
+            id_pieces = []
+            if num_org > 0:
+                logits_pieces.append(torch.matmul(hs, weight[:num_org].T))
+                id_pieces.append(
+                    torch.arange(
+                        org_vocab_start,
+                        org_vocab_start + num_org,
+                        dtype=torch.long,
+                        device=hs.device,
+                    )
+                )
+            if num_added > 0:
+                added_slice_start = num_org_padded
+                added_slice_end = num_org_padded + num_added
+                logits_pieces.append(
+                    torch.matmul(hs, weight[added_slice_start:added_slice_end].T)
+                )
+                id_pieces.append(
+                    torch.arange(
+                        added_vocab_start,
+                        added_vocab_start + num_added,
+                        dtype=torch.long,
+                        device=hs.device,
+                    )
+                )
+            if not logits_pieces:
+                raise RuntimeError(
+                    "DFLASH target LM head shard has no valid vocab rows."
+                )
+
+            local_logits = (
+                logits_pieces[0]
+                if len(logits_pieces) == 1
+                else torch.cat(logits_pieces, dim=-1)
+            )
+            local_ids = id_pieces[0] if len(id_pieces) == 1 else torch.cat(id_pieces)
+            local_lse = torch.logsumexp(local_logits, dim=-1)
+            local_top_logits, local_top_arg = torch.topk(local_logits, int(k), dim=-1)
+            local_top_ids = local_ids[local_top_arg]
+
+            if tp_size == 1:
+                topk_logprobs_out[start:end].copy_(
+                    (local_top_logits - local_lse[:, None]).to(torch.float32)
+                )
+                topk_ids_out[start:end].copy_(local_top_ids.to(torch.long))
+                continue
+
+            gathered_lse = torch.empty(
+                (tp_size * chunk_len,), dtype=local_lse.dtype, device=hs.device
+            )
+            gathered_logits = torch.empty(
+                (tp_size * chunk_len * int(k),),
+                dtype=local_top_logits.dtype,
+                device=hs.device,
+            )
+            gathered_ids = torch.empty(
+                (tp_size * chunk_len * int(k),),
+                dtype=local_top_ids.dtype,
+                device=hs.device,
+            )
+            tp_group.all_gather_into_tensor(gathered_lse, local_lse.contiguous())
+            tp_group.all_gather_into_tensor(
+                gathered_logits, local_top_logits.contiguous().view(-1)
+            )
+            tp_group.all_gather_into_tensor(
+                gathered_ids, local_top_ids.contiguous().view(-1)
+            )
+            global_lse = torch.logsumexp(gathered_lse.view(tp_size, chunk_len), dim=0)
+            candidate_logits = (
+                gathered_logits.view(tp_size, chunk_len, int(k))
+                .permute(1, 0, 2)
+                .reshape(chunk_len, tp_size * int(k))
+            )
+            candidate_ids = (
+                gathered_ids.view(tp_size, chunk_len, int(k))
+                .permute(1, 0, 2)
+                .reshape(chunk_len, tp_size * int(k))
+            )
+            selected_logits, selected_arg = torch.topk(candidate_logits, int(k), dim=-1)
+            topk_logprobs_out[start:end].copy_(
+                (selected_logits - global_lse[:, None]).to(torch.float32)
+            )
+            topk_ids_out[start:end].copy_(
+                torch.gather(candidate_ids, 1, selected_arg).to(torch.long)
+            )
+
+        return topk_logprobs_out, topk_ids_out
 
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
@@ -1195,6 +1421,358 @@ class DFlashWorkerV2(BaseSpecWorker):
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
         )
 
+    def _forward_batch_generation_tree(
+        self,
+        model_worker_batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        on_publish=None,
+    ) -> GenerationBatchResult:
+        sampling_info = model_worker_batch.sampling_info
+        if sampling_info is not None and not sampling_info.is_all_greedy:
+            raise NotImplementedError(
+                "DFLASH tree mode currently supports greedy verification only. "
+                "Lossless sampling tree acceptance is a follow-up."
+            )
+
+        bs = len(model_worker_batch.seq_lens)
+        device = self.device
+        block_size = int(self.block_size)
+        tree_budget = int(self.tree_budget)
+        tree_width = int(self.tree_width)
+
+        target_model = self.target_worker.model_runner.model
+        embed_module = target_model.get_input_embeddings()
+        lm_head = getattr(target_model, "lm_head", None)
+        if lm_head is None or not hasattr(lm_head, "weight"):
+            raise RuntimeError(
+                "DFLASH requires the target model to expose `lm_head` with `weight`."
+            )
+
+        self._ensure_draft_block_buffers(bs)
+        assert self._draft_block_ids_buf is not None
+        assert self._draft_block_positions_buf is not None
+        assert self._draft_verify_out_cache_loc_buf is not None
+        assert self._draft_block_end_buf is not None
+        assert self._draft_seq_lens_cpu_buf is not None
+
+        block_ids = self._draft_block_ids_buf[:bs]
+        prefix_lens = model_worker_batch.seq_lens
+        positions_2d = self._draft_block_positions_buf[:bs]
+        verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
+        if self._use_triton_prepare_block:
+            try:
+                _prepare_dflash_draft_block_unchecked(
+                    bonus_tokens=draft_input.bonus_tokens.view(-1),
+                    prefix_lens=prefix_lens.view(-1),
+                    req_pool_indices=model_worker_batch.req_pool_indices.view(-1),
+                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                    block_ids_out=block_ids,
+                    positions_out=positions_2d,
+                    cache_loc_out=verify_out_cache_loc_2d,
+                    mask_token_id=int(self._mask_token_id),
+                )
+            except Exception as e:
+                self._use_triton_prepare_block = False
+                logger.warning(
+                    "DFLASH Triton prepare_block failed; falling back to eager path: %s",
+                    e,
+                )
+        if not self._use_triton_prepare_block:
+            block_ids.fill_(int(self._mask_token_id))
+            block_ids[:, 0].copy_(draft_input.bonus_tokens)
+            torch.add(
+                prefix_lens.unsqueeze(1),
+                self._block_pos_offsets,
+                out=positions_2d,
+            )
+            verify_out_cache_loc = assign_extend_cache_locs_func(
+                req_pool_indices=model_worker_batch.req_pool_indices,
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                start_offset=prefix_lens,
+                end_offset=prefix_lens + block_size,
+                batch_size=bs,
+                draft_token_num=block_size,
+                device=device,
+            )
+            verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
+
+        noise_embedding = embed_module(block_ids)
+        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+        draft_positions = positions_2d.reshape(-1)
+        draft_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+
+        seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+        if self.use_compact_draft_cache:
+            draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
+            seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
+
+            suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
+                torch.int64
+            )
+            suffix_cache_loc = self._gather_req_to_token_segments(
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                req_pool_indices=model_worker_batch.req_pool_indices,
+                start=suffix_start,
+                lengths=draft_prefix_lens,
+            )
+            assign_req_to_token_pool_func(
+                model_worker_batch.req_pool_indices,
+                self.draft_model_runner.req_to_token_pool.req_to_token,
+                torch.zeros_like(draft_prefix_lens),
+                draft_prefix_lens,
+                suffix_cache_loc,
+                bs,
+            )
+
+            block_end = self._draft_block_end_buf[:bs]
+            torch.add(draft_prefix_lens, block_size, out=block_end)
+            assign_req_to_token_pool_func(
+                model_worker_batch.req_pool_indices,
+                self.draft_model_runner.req_to_token_pool.req_to_token,
+                draft_prefix_lens,
+                block_end,
+                draft_cache_loc,
+                bs,
+            )
+            draft_seq_lens = draft_prefix_lens
+            draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
+        else:
+            draft_seq_lens = prefix_lens
+            seq_lens_cpu.copy_(
+                (prefix_lens + block_size).to(device="cpu", dtype=torch.int32)
+            )
+            draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
+
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=bs,
+            input_ids=block_ids.flatten(),
+            req_pool_indices=model_worker_batch.req_pool_indices,
+            seq_lens=draft_seq_lens,
+            out_cache_loc=draft_cache_loc,
+            seq_lens_sum=draft_seq_lens_sum,
+            seq_lens_cpu=seq_lens_cpu,
+            positions=draft_positions,
+            input_embeds=input_embeds,
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            spec_info=self._draft_block_spec_info,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+
+        with torch.inference_mode():
+            draft_logits_output = self.draft_model_runner.forward(
+                forward_batch
+            ).logits_output
+
+        draft_hidden = draft_logits_output.hidden_states
+        if draft_hidden is None:
+            raise RuntimeError("DFLASH draft model returned no hidden states.")
+        draft_hidden = draft_hidden.view(bs, block_size, -1)
+        depth_count = max(block_size - 1, 0)
+        topk_logprobs, topk_tokens = self._topk_from_vocab_parallel_head(
+            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+            lm_head=lm_head,
+            k=tree_width,
+        )
+        topk_logprobs = topk_logprobs.view(bs, depth_count, tree_width)
+        topk_tokens = topk_tokens.view(bs, depth_count, tree_width)
+
+        tree_tokens = torch.zeros((bs, tree_budget), dtype=torch.long, device=device)
+        tree_parents = torch.zeros((bs, tree_budget), dtype=torch.long, device=device)
+        tree_depths = torch.ones((bs, tree_budget), dtype=torch.long, device=device)
+        num_real_nodes: list[int] = []
+        tree_parent_rows: list[torch.Tensor] = []
+        for i in range(bs):
+            tree: DraftTreeCPU = build_tree_from_topk_cpu(
+                int(block_ids[i, 0].item()),
+                topk_tokens[i],
+                topk_logprobs[i],
+                tree_budget,
+                depth_first=False,
+                score_mode=self.tree_draft,
+            )
+            num_nodes = int(tree.num_nodes)
+            num_real_nodes.append(num_nodes)
+            token_row = torch.tensor(tree.token_ids, dtype=torch.long, device=device)
+            parent_row = torch.tensor(
+                tree.parent_indices, dtype=torch.long, device=device
+            )
+            depth_row = torch.tensor(tree.depths, dtype=torch.long, device=device)
+            tree_tokens[i, :num_nodes].copy_(token_row)
+            tree_parents[i, :num_nodes].copy_(parent_row)
+            tree_depths[i, :num_nodes].copy_(depth_row)
+            tree_parent_rows.append(tree_parents[i])
+
+        tree_positions_2d = prefix_lens.to(torch.int64).unsqueeze(1) + tree_depths
+        tree_cache_loc = assign_extend_cache_locs_func(
+            req_pool_indices=model_worker_batch.req_pool_indices,
+            req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+            start_offset=prefix_lens,
+            end_offset=prefix_lens + tree_budget,
+            batch_size=bs,
+            draft_token_num=tree_budget,
+            device=device,
+        )
+        tree_cache_loc_2d = tree_cache_loc.view(bs, tree_budget)
+
+        custom_mask = build_tree_custom_mask(
+            parent_indices_batch=tree_parent_rows,
+            num_real_nodes=num_real_nodes,
+            prefix_lens=prefix_lens,
+            num_verify_tokens=tree_budget,
+            device=device,
+        )
+        retrieve_index_rows = []
+        retrieve_next_token_rows = []
+        retrieve_next_sibling_rows = []
+        for parents in tree_parent_rows:
+            retrieve_index, retrieve_next_token, retrieve_next_sibling = (
+                build_retrieve_links_from_parents(
+                    parents,
+                    num_verify_tokens=tree_budget,
+                )
+            )
+            retrieve_index_rows.append(retrieve_index)
+            retrieve_next_token_rows.append(retrieve_next_token)
+            retrieve_next_sibling_rows.append(retrieve_next_sibling)
+
+        verify_input = DFlashVerifyInput(
+            draft_token=tree_tokens.reshape(-1),
+            positions=tree_positions_2d.reshape(-1),
+            draft_token_num=tree_budget,
+            topk=tree_width,
+            custom_mask=custom_mask,
+            retrieve_index=torch.stack(retrieve_index_rows, dim=0),
+            retrieve_next_token=torch.stack(retrieve_next_token_rows, dim=0),
+            retrieve_next_sibling=torch.stack(retrieve_next_sibling_rows, dim=0),
+            max_tree_depth=block_size,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            allow_cuda_graph=False,
+            num_tokens_per_batch=tree_budget,
+        )
+
+        model_worker_batch.out_cache_loc = tree_cache_loc
+        need_mamba_verify_commit = hasattr(
+            self.target_worker.model_runner.attn_backend,
+            "update_mamba_state_after_mtp_verify",
+        )
+        if need_mamba_verify_commit:
+            raise NotImplementedError(
+                "DFLASH tree mode does not support Mamba state commit yet."
+            )
+
+        seq_lens_cpu_backup = model_worker_batch.seq_lens_cpu
+        seq_lens_sum_backup = model_worker_batch.seq_lens_sum
+        if draft_input.planning_seq_lens_cpu is not None:
+            model_worker_batch.seq_lens_cpu = draft_input.planning_seq_lens_cpu
+            model_worker_batch.seq_lens_sum = int(draft_input.planning_seq_lens_sum)
+        elif draft_input.reserved_seq_lens_cpu is not None:
+            model_worker_batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
+            model_worker_batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+
+        verify_forward_batch, _ = verify_input.prepare_for_verify(
+            model_worker_batch, self.target_worker
+        )
+        model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
+        model_worker_batch.seq_lens_sum = seq_lens_sum_backup
+
+        target_out = self.target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            skip_attn_backend_init=True,
+        )
+        logits_output = target_out.logits_output
+        if sampling_info is not None:
+            apply_dflash_verify_logits_adjustments(
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                draft_token_num=tree_budget,
+            )
+
+        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
+            bs, tree_budget
+        )
+        accept_len = torch.empty((bs,), dtype=torch.int32, device=device)
+        commit_lens = torch.empty((bs,), dtype=torch.int32, device=device)
+        bonus = torch.empty((bs,), dtype=torch.int64, device=device)
+        out_tokens = torch.zeros((bs, tree_budget), dtype=torch.int64, device=device)
+        accept_indices = torch.zeros((bs, tree_budget), dtype=torch.long, device=device)
+        for i in range(bs):
+            path, correct_len, bonus_id = tree_accept_greedy(
+                tree_tokens[i],
+                tree_parents[i],
+                target_predict[i],
+                num_nodes=num_real_nodes[i],
+            )
+            commit_len = int(correct_len) + 1
+            path_tensor = torch.tensor(path, dtype=torch.long, device=device)
+            accept_indices[i, :commit_len].copy_(path_tensor)
+            accept_len[i] = int(correct_len)
+            commit_lens[i] = commit_len
+            bonus[i] = int(bonus_id)
+            if correct_len > 0:
+                accepted_draft_indices = path_tensor[1:]
+                out_tokens[i, :correct_len].copy_(
+                    torch.index_select(tree_tokens[i], 0, accepted_draft_indices)
+                )
+            out_tokens[i, correct_len] = int(bonus_id)
+
+        new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+
+        cache_loc_for_commit = torch.gather(tree_cache_loc_2d, 1, accept_indices)
+        positions_for_commit = torch.gather(tree_positions_2d, 1, accept_indices)
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        commit_offsets = prefix_lens.to(torch.int64).unsqueeze(1) + torch.arange(
+            tree_budget, dtype=torch.int64, device=device
+        ).unsqueeze(0)
+        req_to_token[
+            model_worker_batch.req_pool_indices.to(torch.int64).unsqueeze(1),
+            commit_offsets,
+        ] = cache_loc_for_commit
+
+        hidden = logits_output.hidden_states
+        if hidden is None:
+            raise RuntimeError(
+                "DFLASH tree verify requires target hidden states, but got None."
+            )
+        hidden = hidden.view(bs, tree_budget, -1)
+        hidden_for_commit = torch.gather(
+            hidden,
+            1,
+            accept_indices.unsqueeze(-1).expand(-1, -1, hidden.shape[-1]),
+        )
+        self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=hidden_for_commit.reshape(-1, hidden.shape[-1]),
+            cache_loc=cache_loc_for_commit.reshape(-1),
+            cache_loc_2d=cache_loc_for_commit,
+            positions=positions_for_commit.reshape(-1),
+            commit_lens=commit_lens,
+        )
+
+        logits_output.hidden_states = None
+
+        next_draft_input = self._make_next_draft_input_decode(
+            bonus_tokens=bonus,
+            new_seq_lens=new_seq_lens,
+            cur_allocated_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
+        )
+        verify_done = torch.get_device_module(device).Event()
+        verify_done.record()
+        next_draft_input.verify_done = verify_done
+
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=out_tokens.reshape(-1),
+            accept_lens=commit_lens,
+            can_run_cuda_graph=False,
+            next_draft_input=next_draft_input,
+            speculative_num_draft_tokens=tree_budget,
+            new_seq_lens=new_seq_lens,
+        )
+
     def forward_batch_generation(
         self,
         model_worker_batch: ScheduleBatch,
@@ -1320,6 +1898,12 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(model_worker_batch.seq_lens)
         device = self.device
+        if self.use_tree_draft:
+            return self._forward_batch_generation_tree(
+                model_worker_batch,
+                draft_input,
+                on_publish=on_publish,
+            )
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model

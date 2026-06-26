@@ -36,7 +36,12 @@ class DFlashVerifyInput(SpecInput):
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
+    retrieve_index: torch.Tensor | None = None
+    retrieve_next_token: torch.Tensor | None = None
+    retrieve_next_sibling: torch.Tensor | None = None
+    max_tree_depth: int = -1
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
+    allow_cuda_graph: bool = True
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
@@ -45,6 +50,12 @@ class DFlashVerifyInput(SpecInput):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_batch == -1:
             self.num_tokens_per_batch = int(self.draft_token_num)
+        if self.max_tree_depth == -1:
+            self.max_tree_depth = int(self.draft_token_num)
+
+    @property
+    def tree_topk(self) -> int:
+        return self.topk
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -72,7 +83,8 @@ class DFlashVerifyInput(SpecInput):
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
         can_run_cuda_graph = bool(
-            target_worker.model_runner.decode_cuda_graph_runner
+            self.allow_cuda_graph
+            and target_worker.model_runner.decode_cuda_graph_runner
             and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
                 verify_forward_batch
             )

@@ -371,6 +371,71 @@ def add_linear_attn_kernel_backend_choices(choices):
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
 
 
+_DFLASH_SPECULATIVE_CONFIG_KEYS = {
+    "speculative_dflash_tree_width": "speculative_dflash_tree_width",
+    "dflash_tree_width": "speculative_dflash_tree_width",
+    "tree_width": "speculative_dflash_tree_width",
+    "speculative_dflash_tree_budget": "speculative_dflash_tree_budget",
+    "dflash_tree_budget": "speculative_dflash_tree_budget",
+    "tree_budget": "speculative_dflash_tree_budget",
+    "max_tree_budget": "speculative_dflash_tree_budget",
+    "speculative_dflash_tree_draft": "speculative_dflash_tree_draft",
+    "dflash_tree_draft": "speculative_dflash_tree_draft",
+    "tree_draft": "speculative_dflash_tree_draft",
+    "speculative_dflash_head_type": "speculative_dflash_head_type",
+    "dflash_head_type": "speculative_dflash_head_type",
+    "head_type": "speculative_dflash_head_type",
+}
+
+
+def _load_speculative_config(raw_config: str) -> dict[str, Any]:
+    raw_config = raw_config.strip()
+    if not raw_config:
+        return {}
+    if raw_config.startswith("@"):
+        with open(raw_config[1:], "r") as fin:
+            return json.load(fin)
+    return json.loads(raw_config)
+
+
+def _merge_speculative_config(kwargs: dict[str, Any]) -> None:
+    raw_config = kwargs.get("speculative_config")
+    if raw_config is None:
+        return
+
+    try:
+        config = _load_speculative_config(raw_config)
+    except Exception as e:
+        raise ValueError(
+            "--speculative-config must be a JSON object or @path to a JSON file. "
+            f"Failed to parse: {e}"
+        ) from e
+
+    if not isinstance(config, dict):
+        raise ValueError(
+            "--speculative-config must decode to a JSON object, "
+            f"got {type(config).__name__}."
+        )
+
+    if "dflash" in config:
+        dflash_config = config.pop("dflash")
+        if not isinstance(dflash_config, dict):
+            raise ValueError(
+                "--speculative-config key 'dflash' must contain a JSON object."
+            )
+        config = {**config, **dflash_config}
+
+    for key, value in config.items():
+        dest = _DFLASH_SPECULATIVE_CONFIG_KEYS.get(key)
+        if dest is None:
+            allowed = ", ".join(sorted(_DFLASH_SPECULATIVE_CONFIG_KEYS))
+            raise ValueError(
+                f"Unsupported --speculative-config key {key!r}. "
+                f"Supported DFLASH keys: {allowed}."
+            )
+        kwargs[dest] = value
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """Server-wide configuration for SGLang.
@@ -1521,6 +1586,32 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_config: A[
+        Optional[str],
+        "Speculative decoding config as a JSON object. For DFLASH, supported keys are tree_width, tree_budget, tree_draft, and head_type.",
+    ] = None
+    speculative_dflash_tree_width: A[
+        int,
+        "DFLASH only. Tree fanout width for JetSpec-style crossproduct drafting. The default 1 keeps the existing linear DFlash path.",
+    ] = 1
+    speculative_dflash_tree_budget: A[
+        Optional[int],
+        "DFLASH only. Maximum root-inclusive tree verify-token budget. Defaults to the DFlash block size.",
+    ] = None
+    speculative_dflash_tree_draft: A[
+        str,
+        Arg(
+            help="DFLASH only. Tree construction scoring mode.",
+            choices=["accum_logp", "entropy", "hybrid"],
+        ),
+    ] = "accum_logp"
+    speculative_dflash_head_type: A[
+        str,
+        Arg(
+            help="DFLASH only. Draft head attention type. 'auto' reads dflash_config.causal_head from the draft checkpoint.",
+            choices=["auto", "causal", "bidirectional"],
+        ),
+    ] = "auto"
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -6687,7 +6778,9 @@ class ServerArgs:
         attrs = [
             attr.name for attr in dataclasses.fields(cls) if hasattr(args, attr.name)
         ]
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        kwargs = {attr: getattr(args, attr) for attr in attrs}
+        _merge_speculative_config(kwargs)
+        return cls(**kwargs)
 
     def url(self, port: Optional[int] = None):
         scheme = "https" if self.ssl_certfile else "http"
