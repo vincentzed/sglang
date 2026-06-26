@@ -36,6 +36,65 @@ import triton
 import triton.language as tl
 
 
+# --- Checkpoint store-precision prototypes (empirical A/B test harness) ---
+# Selected per-server via env (no server_args/dispatch plumbing):
+#   SGLANG_REPLAYSSM_STORE_MODE   = rne (default) | sr (stochastic round) | ef (error-feedback)
+#   SGLANG_REPLAYSSM_PHILOX_ROUNDS= 0 (triton default) | N
+# sr/ef require --mamba-ssm-dtype float16; sr additionally needs --disable-cuda-graph
+# (per-call seed). EF residual is a module global (prototype), not the MambaPool.
+import os as _os
+
+_STORE_MODE = {"rne": 0, "sr": 1, "ef": 2}.get(
+    _os.environ.get("SGLANG_REPLAYSSM_STORE_MODE", "rne").lower(), 0
+)
+_PHILOX_ROUNDS = int(_os.environ.get("SGLANG_REPLAYSSM_PHILOX_ROUNDS", "0"))
+# --- Algorithmic lever #2: conditioning-triggered early flush ---
+# When a verify chunk is ill-conditioned (large row-L1 of A => (I+A)^-1 amplifies, the
+# weak-decay/correlated-key regime), force an early flush so the slot folds into h0 sooner
+# and stops accumulating in the bad replay basis. Env-gated + threshold-tunable (sweep).
+_COND_FLUSH = _os.environ.get("SGLANG_REPLAYSSM_COND_FLUSH", "0") == "1"
+_COND_THRESH = float(_os.environ.get("SGLANG_REPLAYSSM_COND_THRESH", "2.0"))
+_FORCE_FLUSH: dict = {}
+_EF_RESID: dict = {}
+
+
+def _force_flush(num_slots: int, device) -> torch.Tensor:
+    """Persistent per-slot 'flush soon' bit set by the verify kernel's conditioning proxy
+    and consumed+cleared by the cursor kernel. Module global (prototype), like _ef_resid."""
+    key = (num_slots, getattr(device, "index", device))
+    t = _FORCE_FLUSH.get(key)
+    if t is None:
+        t = torch.zeros(num_slots, dtype=torch.int32, device=device)
+        _FORCE_FLUSH[key] = t
+    return t
+
+
+def _ef_resid(ckpt: torch.Tensor) -> torch.Tensor:
+    """Persistent fp32 error-feedback residual, one per (shape, device). Prototype: a
+    module global (not the MambaPool) -- fine for an accuracy A/B since slots are stable
+    and |residual| < 1 ulp, so stale-slot carryover is negligible."""
+    key = (tuple(ckpt.shape), ckpt.device.index)
+    r = _EF_RESID.get(key)
+    if r is None:
+        r = torch.zeros(ckpt.shape, dtype=torch.float32, device=ckpt.device)
+        _EF_RESID[key] = r
+    return r
+
+
+@triton.jit
+def _sr_fp16x2(x, rand):
+    """Stochastic-round an fp32 pair -> fp16x2 (PTX cvt.rs), as in TRT-LLM's
+    replay_selective_state_update / SGLang PR 26929."""
+    return tl.inline_asm_elementwise(
+        asm="{ cvt.rs.f16x2.f32 $0, $2, $1, $3; }",
+        constraints="=r,r,r,r,r",
+        args=(x, rand),
+        dtype=tl.float16,
+        is_pure=True,
+        pack=2,
+    )
+
+
 @triton.jit
 def gdn_replayssm_spec_circular_kernel(
     q,  # [total_tokens, H, K]
@@ -57,6 +116,10 @@ def gdn_replayssm_spec_circular_kernel(
     cache_base,  # [num_slots] int32  block-keyed circular origin
     is_flush_flags,  # [num_slots] int8  block-keyed
     scale,
+    resid,  # [num_slots, HV, V, K] fp32 EF residual (or dummy when STORE_MODE!=2)
+    rand_seed,  # SR philox seed scalar (or 0 when STORE_MODE!=1)
+    force_flush,  # [num_slots] int32 conditioning early-flush bits (atomic_or target)
+    cond_thresh,  # row-L1(A) threshold above which to force a flush
     stride_q_t: tl.constexpr,  # per-token stride of q (= H*K)
     stride_k_t: tl.constexpr,  # per-token stride of k (= H*K)
     stride_v_t: tl.constexpr,  # per-token stride of v (= HV*V)
@@ -84,6 +147,9 @@ def gdn_replayssm_spec_circular_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_FLUSH: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
+    STORE_MODE: tl.constexpr = 0,  # 0=RNE 1=stochastic-round 2=error-feedback
+    PHILOX_ROUNDS: tl.constexpr = 0,
+    COND_FLUSH: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -271,7 +337,42 @@ def gdn_replayssm_spec_circular_kernel(
             sw_f = tl.dot(
                 b_d_scaled, khist_tile, acc=b_total_decay * sc_tile.to(tl.float32)
             )
-            sw_tile = sw_f.to(h0.dtype.element_ty)
+            if STORE_MODE == 1:  # stochastic rounding -> fp16. Per-step variation
+                # comes from b_cache_base (ring origin, advances each flush, updated
+                # in-place by commit) -> SR re-randomizes per flush under CUDA graph
+                # with NO host seed / .item() sync.
+                rs_off = (
+                    state_idx * stride_state_slot
+                    + i_hv * V * K
+                    + o_v[:, None] * K
+                    + o_kt[None, :]
+                    + b_cache_base * 1000003
+                ).to(tl.int32)
+                if PHILOX_ROUNDS > 0:
+                    rnd = tl.randint(rand_seed, rs_off, PHILOX_ROUNDS)
+                else:
+                    rnd = tl.randint(rand_seed, rs_off)
+                sw_tile = _sr_fp16x2(sw_f, rnd)
+            elif STORE_MODE == 2:  # error-feedback (fp16 store + fp32 residual carry)
+                p_rs = (
+                    resid
+                    + state_idx * stride_state_slot
+                    + i_hv * V * K
+                    + o_v[:, None] * K
+                    + o_kt[None, :]
+                )
+                r_old = tl.load(
+                    p_rs, mask=mask_v[:, None] & mask_kt[None, :], other=0.0
+                )
+                corrected = sw_f + r_old
+                sw_tile = corrected.to(h0.dtype.element_ty)
+                tl.store(
+                    p_rs,
+                    corrected - sw_tile.to(tl.float32),
+                    mask=mask_v[:, None] & mask_kt[None, :],
+                )
+            else:  # round-to-nearest-even (default / current PR)
+                sw_tile = sw_f.to(h0.dtype.element_ty)
             hw_q += tl.dot(sw_tile, qT)
             hw_k += tl.dot(sw_tile, kT)
             p_ht = (
@@ -313,6 +414,13 @@ def gdn_replayssm_spec_circular_kernel(
     lower = (o_s[:, None] > o_s[None, :]) & mask_s[:, None] & mask_s[None, :]
     diff_ij = G_s[:, None] - G_s[None, :]
     A_mat = tl.where(lower, beta_s[:, None] * tl.exp(diff_ij) * kk_mat, 0.0)
+
+    if COND_FLUSH and (not IS_FLUSH):
+        # row-L1 of A bounds the (I+A)^-1 amplification; large => ill-conditioned verify
+        # chunk (weak decay + correlated keys). Flag the slot for an early flush (any head).
+        row_l1 = tl.sum(tl.abs(A_mat), axis=1)
+        bad = ((tl.max(row_l1) > cond_thresh) & (state_idx > NULL_BLOCK_ID)).to(tl.int32)
+        tl.atomic_or(force_flush + state_idx, bad)
 
     b_Ai = -A_mat
     for ii in range(2, BS):
@@ -378,6 +486,7 @@ def _advance_gdn_spec_cursors_kernel(
     is_flush_ptr,
     num_accepted_ptr,
     state_batch_indices_ptr,
+    force_flush_ptr,
     n_rows,
     stride_sbi: tl.constexpr,
     stride_na: tl.constexpr,
@@ -386,6 +495,7 @@ def _advance_gdn_spec_cursors_kernel(
     CACHE_BUF_LEN: tl.constexpr,
     BLOCK: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
+    COND_FLUSH: tl.constexpr = False,
 ):
     offs = tl.arange(0, BLOCK)
     row_mask = offs < n_rows
@@ -421,7 +531,14 @@ def _advance_gdn_spec_cursors_kernel(
     # flush step = max_cache_len - max_spec_len, zero headroom); usable committed
     # history is max_cache_len - 2*max_spec_len + 1; raise the cache length
     # for more. Config enforces max_cache_len >= 2 * max_spec_len.
-    next_is_flush = ((new_wp + 2 * MAX_SPEC_LEN) > MAX_CACHE_LEN).to(tl.int8)
+    next_is_flush = (new_wp + 2 * MAX_SPEC_LEN) > MAX_CACHE_LEN
+    if COND_FLUSH:
+        # Conditioning-triggered early flush: OR in the bit the verify kernel set for an
+        # ill-conditioned chunk, then consume (clear) it so it only forces one flush.
+        ff = tl.load(force_flush_ptr + blk, mask=valid, other=0)
+        next_is_flush = next_is_flush | (ff != 0)
+        tl.store(force_flush_ptr + blk, tl.zeros_like(ff), mask=valid)
+    next_is_flush = next_is_flush.to(tl.int8)
 
     tl.store(write_pos_ptr + blk, new_wp, mask=valid)
     tl.store(cache_base_ptr + blk, new_base, mask=valid)
@@ -493,6 +610,13 @@ def _launch_gdn_spec(
     nk,
     bs_min,
     null_block_id,
+    resid,
+    rand_seed,
+    store_mode,
+    philox_rounds,
+    force_flush,
+    cond_thresh,
+    cond_flush,
 ):
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
@@ -535,6 +659,10 @@ def _launch_gdn_spec(
         cache_base,
         is_flush,
         scale,
+        resid,
+        rand_seed,
+        force_flush,
+        cond_thresh,
         q.stride(0),
         k.stride(0),
         v.stride(0),
@@ -562,6 +690,9 @@ def _launch_gdn_spec(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_FLUSH=is_flush_kernel,
         NULL_BLOCK_ID=null_block_id,
+        STORE_MODE=store_mode,
+        PHILOX_ROUNDS=philox_rounds,
+        COND_FLUSH=cond_flush,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -613,6 +744,16 @@ def gdn_replayssm_spec_decode(
     if is_flush.dtype != torch.int8:
         is_flush = is_flush.to(torch.int8)
 
+    resid = _ef_resid(checkpoint_state) if _STORE_MODE == 2 else checkpoint_state
+    # Fixed seed -> CUDA-graph safe (no host .item() sync). SR's temporal variation
+    # comes from b_cache_base inside the kernel, not from re-seeding per call.
+    rand_seed = 1831565813 if _STORE_MODE == 1 else 0
+    force_flush = (
+        _force_flush(checkpoint_state.shape[0], checkpoint_state.device)
+        if _COND_FLUSH
+        else checkpoint_state  # dummy; kernel never touches it when COND_FLUSH=False
+    )
+
     if launch_mode in ("both", "verify"):
         _launch_gdn_spec(
             q,
@@ -643,6 +784,13 @@ def gdn_replayssm_spec_decode(
             nk,
             bs_min,
             null_block_id,
+            resid,
+            rand_seed,
+            _STORE_MODE,
+            _PHILOX_ROUNDS,
+            force_flush,
+            _COND_THRESH,
+            _COND_FLUSH,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(
@@ -674,6 +822,13 @@ def gdn_replayssm_spec_decode(
             nk_flush,
             bs_min,
             null_block_id,
+            resid,
+            rand_seed,
+            _STORE_MODE,
+            _PHILOX_ROUNDS,
+            force_flush,
+            _COND_THRESH,
+            _COND_FLUSH,
         )
     return out
 
@@ -694,12 +849,16 @@ def commit_gdn_replayssm_spec(
         cache_buf_len = max_cache_len
     n_rows = state_batch_indices.shape[0]
     BLOCK = triton.next_power_of_2(max(1, n_rows))
+    force_flush = (
+        _force_flush(write_pos.shape[0], write_pos.device) if _COND_FLUSH else write_pos
+    )
     _advance_gdn_spec_cursors_kernel[(1,)](
         write_pos,
         cache_base,
         is_flush,
         num_accepted,
         state_batch_indices,
+        force_flush,
         n_rows,
         stride_sbi=state_batch_indices.stride(0),
         stride_na=num_accepted.stride(0),
@@ -708,6 +867,7 @@ def commit_gdn_replayssm_spec(
         CACHE_BUF_LEN=cache_buf_len,
         BLOCK=BLOCK,
         NULL_BLOCK_ID=null_block_id,
+        COND_FLUSH=_COND_FLUSH,
     )
 
 

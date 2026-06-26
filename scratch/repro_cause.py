@@ -21,7 +21,7 @@ import torch
 torch.manual_seed(0)
 K = V = 128
 L = 16          # chunk / cache_len (draft window folded together)
-FOLDS = 200      # 200 shows it; FOLDS=1000 (~16k tok) confirms SR never crosses over
+FOLDS = 200      # 200 shows it; FOLDS=1000 (~16k tok) confirms trends hold
 dev = "cuda"
 
 def make_chunk(regime, gen):
@@ -101,11 +101,12 @@ MODES = {
     "bf16sr": dict(rd="bf16", dot="bf16",   st="bf16sr"),  # + stochastic-rounded store (2B)
     "fp16tc": dict(rd="fp16", dot="fp16",   st="fp16"),    # full fp16 (2B, 10-bit dots == TF32)
     "fp16sr": dict(rd="fp16", dot="fp16",   st="fp16sr"),  # fp16 dots + STOCHASTIC-ROUNDED fp16 store (PR 26929)
+    "ef16":   dict(rd="fp16", dot="fp16",   st="ef16"),    # fp16 dots + ERROR-FEEDBACK fp16 store (residual carry, 2B)
     "tf32":   dict(rd="fp32", dot="tf32",   st="fp32"),    # fp32 storage + TF32 dots (4B)
     "fp32":   dict(rd="fp32", dot="fp32",   st="fp32"),    # true IEEE fp32 (no tensor cores)
 }
 
-def advance_chunked(S0, a, b, k, v, dtype, gen=None):
+def advance_chunked(S0, a, b, k, v, dtype, gen=None, ef=None):
     """ReplaySSM-style: solve D=(I+A)^-1 B once, fold S. Returns (S_L, cond(I+A))."""
     g = torch.log(a)
     G = torch.cumsum(g, 0)                                            # inclusive cumsum of log-decay
@@ -132,16 +133,24 @@ def advance_chunked(S0, a, b, k, v, dtype, gen=None):
     DW = cast_rt(D * wt[:, None], m["dot"], gen)                     # reconstruction-dot operands
     kb = cast_rt(k, m["dot"], gen)
     SL = total * Sin + DW.T @ kb                                     # fp32 accumulate (tensor-core model)
-    SL = cast_rt(SL, m["st"], gen)                                   # checkpoint STORE round-trip
+    if m["st"] == "ef16":                                            # error-feedback: carry the fp16 residual fwd
+        corrected = SL + ef[dtype]
+        stored = corrected.to(torch.float16).to(torch.float32)
+        ef[dtype] = corrected - stored                               # lost low bits -> added back next fold
+        SL = stored
+    else:
+        SL = cast_rt(SL, m["st"], gen)                               # checkpoint STORE round-trip
     return SL, cond, maxinv
 
 def run(regime):
     gen = torch.Generator(device=dev).manual_seed(42)
     S64 = torch.zeros(V, K, device=dev, dtype=torch.float64)        # ground-truth (exact recurrence)
     # baseline -> fp16 -> max precision (tensor-core TF32, then true IEEE fp32):
-    modes = ["bf16", "fp16tc", "fp16sr", "tf32"]                     # 2B,2B,2B,4B
-    hdr = {"bf16": "bf16(2B)", "fp16tc": "fp16 RNE", "fp16sr": "fp16+SR", "tf32": "tf32(4B)"}
+    modes = ["bf16", "fp16tc", "fp16sr", "ef16", "tf32"]            # 2B,2B,2B,2B,4B
+    hdr = {"bf16": "bf16(2B)", "fp16tc": "fp16 RNE", "fp16sr": "fp16+SR",
+           "ef16": "fp16+EF", "tf32": "tf32(4B)"}
     sr_gen = torch.Generator(device=dev).manual_seed(7)
+    ef = {m: torch.zeros(V, K, device=dev) for m in modes if MODES[m]["st"] == "ef16"}
     S = {m: torch.zeros(V, K, device=dev) for m in modes}
     S_seq = torch.zeros(V, K, device=dev)                            # exact recurrent verify (contractive)
     flips = {m: 0 for m in modes}
@@ -153,7 +162,7 @@ def run(regime):
         S_seq = advance_sequential(S_seq, a, b, k, v)
         c = None
         for m in modes:
-            S[m], c, _ = advance_chunked(S[m], a, b, k, v, m, sr_gen)
+            S[m], c, _ = advance_chunked(S[m], a, b, k, v, m, sr_gen, ef)
             flips[m] += int((torch.argmax(S_seq @ q[-1]) != torch.argmax(S[m] @ q[-1])).item())
         if f < 3 or (f + 1) % 50 == 0:
             ref = S64.float(); rn = ref.norm().item() + 1e-9
