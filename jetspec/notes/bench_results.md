@@ -18,6 +18,40 @@ Hardware/env:
 - The MoE server accepts `--attention-backend trtllm_mha` for the target, but the DFlash draft worker logs: `DFLASH draft worker does not support 'trtllm_mha' because the draft path requires per-layer DFlash attention. Falling back to 'flashinfer'.`
 - `z-lab/Qwen3.6-35B-A3B-DFlash` config was fetched under `jetspec/_hf_configs/` and confirmed `architectures: ["DFlashDraftModel"]`.
 
+## Job 3 final CUDA graph perf
+
+Date/time: 2026-06-27 23:41-23:49 UTC.
+
+Mode:
+- Normal greedy serving mode: no deterministic flags, `temperature=0` in the harness.
+- CUDA graph enabled: decode graph backend `full`; dense prefill graph used the default `tc_piecewise`, while MoE prefill graph auto-disabled and target/draft verify decode graphs captured.
+- Single-request fixed-prompt harness: `jetspec/run_fixed_prompts.py`, 10 prompts, `max_new_tokens=96`, `max_running_requests=1`, `cuda_graph_max_bs_decode=1`.
+- Dense target: `Qwen/Qwen3-8B`, draft: `JetSpec/jetspec-qwen3-8b`, `--attention-backend flashinfer`.
+- MoE target: `Qwen/Qwen3.6-35B-A3B`, draft: `z-lab/Qwen3.6-35B-A3B-DFlash`, `--attention-backend trtllm_mha`, `--linear-attn-decode-backend cutedsl`, `--linear-attn-prefill-backend cutedsl`, `--mamba-ssm-dtype bfloat16`.
+
+Dense results:
+
+| run | artifact | token exact vs fresh graph-linear | mean accept length | aggregate tok/s | speed vs linear |
+|---|---|---:|---:|---:|---:|
+| 8B linear width=1 | `jetspec/runs/job3_8b_linear_cudagraph_31530.json` | oracle | 3.7569 | 510.53 | 1.00x |
+| 8B tree w7/b64 | `jetspec/runs/job3_8b_tree_w7_b64_cudagraph_31531.json` | PASS | 4.5441 | 131.52 | 0.26x |
+| 8B tree w7/b128 | `jetspec/runs/job3_8b_tree_w7_b128_cudagraph_31532.json` | PASS | 5.2161 | 85.69 | 0.17x |
+
+MoE results:
+
+| run | artifact | token exact vs fresh graph-linear | mean accept length | aggregate tok/s | speed vs linear |
+|---|---|---:|---:|---:|---:|
+| MoE linear width=1 | `jetspec/runs/job3_moe_linear_cudagraph_31540.json` | oracle | 4.4179 | 499.06 | 1.00x |
+| MoE tree w4/b64 | `jetspec/runs/job2_moe_tree_w4_b64_cudagraph_31520.json` | PASS | 4.4179 | 80.64 | 0.16x |
+| MoE tree w4/b128 | `jetspec/runs/job2_moe_tree_w4_b128_cudagraph_31521.json` | PASS | 4.4179 | 66.40 | 0.13x |
+| MoE tree w7/b64 | `jetspec/runs/job2_moe_tree_w7_b64_cudagraph_31522.json` | PASS | 4.4179 | 78.78 | 0.16x |
+| MoE tree w7/b128 | `jetspec/runs/job2_moe_tree_w7_b128_cudagraph_31523.json` | PASS | 4.4179 | 67.34 | 0.13x |
+
+Verdict:
+- Losslessness is green in normal mode with CUDA graph on. Dense tree w7/b64 and w7/b128 are token-exact against `job3_8b_linear_cudagraph_31530.json`; MoE tree w4/w7, budget 64/128 artifacts are token-exact against `job3_moe_linear_cudagraph_31540.json`.
+- Tree does not beat linear on throughput. Dense tree improves mean accept length from 3.7569 to 4.5441/5.2161, but the fixed-shape tree verify cost and accepted-path replay/commit work swamp that gain. MoE tree does not improve accept length at all under the current accepted-path linear replay fallback, so it only adds tree verify overhead.
+- The practical bottleneck is not CUDA graph correctness anymore. The next lever is acceptance and amortization: crossproduct draft scoring/width/budget needs to raise dense acceptance much closer to the paper's 7-9 range, and the MoE direct KV/GDN-state commit path would need to replace the current correctness fallback before tree can plausibly beat width=1 linear on tok/s.
+
 ## 8B smoke pair
 
 Models:
@@ -131,9 +165,10 @@ MoE performance status: FAIL for speedup/accept-length improvement. The hybrid-M
 
 ## CUDA graph status
 
-- Existing server graph capture remains enabled for the required MoE launch flags; logs show target prefill, target verify, and draft verify CUDA graph capture completing during startup.
-- The new tree speculative decode path still returns `can_run_cuda_graph=False`.
-- Custom-mask tree target verification and causal branch reverify are explicitly guarded with `allow_cuda_graph=False`. Enabling replay for tree decode still requires fixed tree capture buckets/padded tree-budget graph runners.
+- Current status: enabled for DFlash tree target verify.
+- Dense FlashInfer tree verify captures fixed expanded-causal graph buckets: w7/b64 captured `bs=64`, `tokens_per_bs=16`; w7/b128 captured `bs=128`, `tokens_per_bs=16`. Decode logs reported `cuda graph: True`.
+- MoE hybrid-GDN tree verify captures fixed custom-mask target-verify graph buckets using a graph-capable `flashinfer` full-attention replacement for periodic full-attention layers. MoE w4/w7, budget 64/128 decode logs reported `cuda graph: True`.
+- Prefill graph behavior differs by model in the measured runs: dense used the default `tc_piecewise` prefill graph, while MoE prefill graph was auto-disabled by the resolved cuda graph config. The throughput verdict above is based on the measured end-to-end fixed-prompt artifacts, not launch-time graph capture.
 
 ## Validation commands
 

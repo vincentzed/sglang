@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-27 23:48 UTC
+Updated: 2026-06-27 23:54 UTC
 
 ## Done / Committed
 
@@ -10,6 +10,8 @@ Updated: 2026-06-27 23:48 UTC
 - `5817fc9d2e90`: made the MoE tree path token-exact against a fresh width=1 oracle by using a labeled hybrid/MoE linear-commit fallback for the accepted commit block. This is a correctness fallback, not a direct tree-state commit speedup.
 - `5c2120c5a91c`: recorded Job 1 status and validation artifacts.
 - `11c65c076d`: enabled DFlash tree target-verify CUDA graphs for dense FlashInfer expanded-causal verify and MoE hybrid-GDN custom-mask verify; dense and MoE cuda-graph gates are token-exact against fresh oracles.
+- `ff275594dd`: recorded Job 2 status and validation artifacts.
+- this commit: recorded Job 3 normal-mode CUDA graph performance results and verdict in `jetspec/notes/bench_results.md`.
 
 ## Job 0 Validation
 
@@ -39,12 +41,10 @@ Notes:
 
 ## In Progress
 
-Job 3: normal-mode performance bench with CUDA graph on.
+- None.
 
 Exact next step:
-- Run normal/non-deterministic linear and tree perf for dense 8B and MoE with cuda graph enabled.
-- Re-confirm losslessness in normal mode.
-- Update `jetspec/notes/bench_results.md` with an honest linear-vs-tree table and verdict, then commit the docs.
+- If continuing performance work, focus on acceptance/amortization rather than correctness: improve crossproduct draft scoring/width/budget acceptance and replace the MoE accepted-path linear replay fallback with a direct exact KV/GDN-state commit.
 
 ## Job 1 Validation
 
@@ -125,6 +125,37 @@ Notes:
 - Dense FlashInfer tree verify uses a graph shape of `tree_budget` expanded rows by `speculative_num_draft_tokens` tokens, with fixed buckets capped to the active request count.
 - MoE hybrid-GDN tree verify uses fixed `tree_budget` tokens per request and reuses the graph-captured full-attention replacement at runtime so target-verify graph replay and eager fallback share the same backend semantics.
 - The MoE correctness path still relies on the labeled accepted-path linear replay fallback introduced in Job 1 for persistent KV/GDN state commit. Job 2 proves cuda graph does not change emitted tokens.
+
+## Job 3 Validation
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Normal greedy mode: no deterministic flags, harness `temperature=0`
+- CUDA graph enabled: `--cuda-graph-max-bs-decode 1`, decode backend `full`
+- Harness: `PYTHONPATH=python python jetspec/run_fixed_prompts.py`, 10 fixed prompts, `max_new_tokens=96`
+
+Dense artifacts:
+
+| run | artifact | token exact vs fresh graph-linear | mean accept length | aggregate tok/s |
+|---|---|---:|---:|---:|
+| 8B linear width=1 | `jetspec/runs/job3_8b_linear_cudagraph_31530.json` | oracle | 3.7569 | 510.53 |
+| 8B tree w7/b64 | `jetspec/runs/job3_8b_tree_w7_b64_cudagraph_31531.json` | PASS, 10/10 | 4.5441 | 131.52 |
+| 8B tree w7/b128 | `jetspec/runs/job3_8b_tree_w7_b128_cudagraph_31532.json` | PASS, 10/10 | 5.2161 | 85.69 |
+
+MoE artifacts:
+
+| run | artifact | token exact vs fresh graph-linear | mean accept length | aggregate tok/s |
+|---|---|---:|---:|---:|
+| MoE linear width=1 | `jetspec/runs/job3_moe_linear_cudagraph_31540.json` | oracle | 4.4179 | 499.06 |
+| MoE tree w4/b64 | `jetspec/runs/job2_moe_tree_w4_b64_cudagraph_31520.json` | PASS, 10/10 | 4.4179 | 80.64 |
+| MoE tree w4/b128 | `jetspec/runs/job2_moe_tree_w4_b128_cudagraph_31521.json` | PASS, 10/10 | 4.4179 | 66.40 |
+| MoE tree w7/b64 | `jetspec/runs/job2_moe_tree_w7_b64_cudagraph_31522.json` | PASS, 10/10 | 4.4179 | 78.78 |
+| MoE tree w7/b128 | `jetspec/runs/job2_moe_tree_w7_b128_cudagraph_31523.json` | PASS, 10/10 | 4.4179 | 67.34 |
+
+Verdict:
+- Tree does not beat linear on tok/s in these normal-mode graph runs.
+- Dense tree gains accept length but loses throughput because fixed-shape tree verify and accepted-path replay/commit overhead dominate.
+- MoE tree keeps the same mean accept length as linear under the accepted-path linear replay fallback, so it adds overhead without an acceptance gain.
 
 ## Not Started
 
