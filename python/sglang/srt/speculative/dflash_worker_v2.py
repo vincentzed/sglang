@@ -3481,6 +3481,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 model_worker_batch.token_to_kv_pool_allocator,
                 overlap_safe=True,
             ).to(torch.int64)
+        mamba_commit_accept_index = None
+        mamba_commit_draft_token_num = None
         if use_flashinfer_expanded_causal_tree and expanded_mamba_indices is not None:
             req_to_token_pool = self.model_runner.req_to_token_pool
             mamba_caches = (
@@ -3542,10 +3544,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             expanded_mamba_indices = None
         else:
             if use_reverify_commit and reverify_mamba_state_snapshots is not None:
+                # Persistent Mamba state was already committed from the direct
+                # causal-reverify snapshots above.
                 pass
             else:
                 if use_reverify_commit:
-                    accept_index_for_mamba_commit = (
+                    mamba_commit_accept_index = (
                         torch.arange(
                             block_size, dtype=accept_index.dtype, device=device
                         )
@@ -3561,13 +3565,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                     )
                     mamba_commit_draft_token_num = block_size
                 else:
-                    accept_index_for_mamba_commit = accept_index
+                    mamba_commit_accept_index = accept_index
                     mamba_commit_draft_token_num = tree_budget
+
+            if mamba_commit_accept_index is not None:
                 commit_mamba_states_after_verify(
                     self.target_worker,
                     model_worker_batch,
                     commit_lens,
-                    accept_index_for_mamba_commit,
+                    mamba_commit_accept_index,
                     mamba_commit_draft_token_num,
                 )
 
