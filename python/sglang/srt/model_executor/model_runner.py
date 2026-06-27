@@ -2573,6 +2573,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.is_draft_worker,
                 )
             )
+            if (
+                self.spec_algorithm.is_dflash()
+                and not self.is_draft_worker
+                and self.server_args.speculative_dflash_tree_width > 1
+            ):
+                num_tokens_per_bs = int(
+                    self.server_args.speculative_dflash_tree_budget
+                )
         else:
             capture_name = f"{role} decode"
             num_tokens_per_bs = 1

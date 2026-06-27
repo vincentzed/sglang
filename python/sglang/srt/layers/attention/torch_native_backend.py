@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -276,6 +279,81 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         return output
 
+    def _run_sdpa_forward_target_verify(
+        self,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        draft_token_num: int,
+        custom_mask: torch.Tensor,
+        scaling=None,
+        enable_gqa=False,
+    ):
+        """Run TARGET_VERIFY with an explicit flattened tree/custom mask."""
+
+        query = query.movedim(0, query.dim() - 2)
+
+        start_q = 0
+        mask_start = 0
+        for seq_idx in range(seq_lens.shape[0]):
+            q_len = int(draft_token_num)
+            prefix_len = int(seq_lens[seq_idx].item())
+            kv_len = prefix_len + q_len
+            end_q = start_q + q_len
+
+            per_req_query = query[:, start_q:end_q, :]
+            req_pool_idx = req_pool_indices[seq_idx]
+            per_req_tokens = req_to_token[req_pool_idx, :kv_len]
+            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+
+            if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
+                per_req_key = per_req_key.to(per_req_query.dtype)
+                per_req_value = per_req_value.to(per_req_query.dtype)
+
+            mask_len = q_len * kv_len
+            per_req_mask = custom_mask[mask_start : mask_start + mask_len].view(
+                q_len, kv_len
+            )
+            per_req_mask = torch.where(
+                per_req_mask,
+                torch.zeros((), dtype=per_req_query.dtype, device=per_req_query.device),
+                torch.full(
+                    (),
+                    float("-inf"),
+                    dtype=per_req_query.dtype,
+                    device=per_req_query.device,
+                ),
+            )
+            sdpa_context = (
+                sdpa_kernel(SDPBackend.MATH)
+                if os.environ.get("SGLANG_DFLASH_TREE_TORCH_SDPA_MATH") == "1"
+                else nullcontext()
+            )
+            with sdpa_context:
+                per_req_out = (
+                    scaled_dot_product_attention(
+                        per_req_query.unsqueeze(0),
+                        per_req_key.unsqueeze(0),
+                        per_req_value.unsqueeze(0),
+                        attn_mask=per_req_mask,
+                        enable_gqa=enable_gqa,
+                        scale=scaling,
+                        is_causal=False,
+                    )
+                    .squeeze(0)
+                    .movedim(query.dim() - 2, 0)
+                )
+            output[start_q:end_q, :, :] = per_req_out
+            start_q = end_q
+            mask_start += mask_len
+
+        return output
+
     def forward_extend(
         self,
         q,
@@ -308,6 +386,27 @@ class TorchNativeAttnBackend(AttentionBackend):
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
+
+        spec_info = forward_batch.spec_info
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and spec_info is not None
+            and getattr(spec_info, "custom_mask", None) is not None
+        ):
+            self._run_sdpa_forward_target_verify(
+                q_,
+                o_,
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                int(spec_info.draft_token_num),
+                spec_info.custom_mask,
+                scaling=layer.scaling,
+                enable_gqa=use_gqa,
+            )
+            return o
 
         self._run_sdpa_forward_extend(
             q_,

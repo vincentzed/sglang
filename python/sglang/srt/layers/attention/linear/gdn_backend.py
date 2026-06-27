@@ -422,6 +422,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mamba_cache_params.intermediate_conv_window[0]
             )
             intermediate_state_indices = self.verify_intermediate_state_indices
+            override_indices = getattr(
+                forward_batch.spec_info, "mamba_cache_indices", None
+            )
+            if override_indices is not None:
+                intermediate_state_indices = override_indices.to(
+                    device=cache_indices.device, dtype=torch.int32
+                )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 

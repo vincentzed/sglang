@@ -401,7 +401,9 @@ def _fwd_kernel(
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
             )
-            qk = tl.dot(q.to(k.dtype), k)
+            qk = tl.dot(
+                q.to(k.dtype), k, out_dtype=tl.float32, allow_tf32=False
+            ).to(tl.float32)
             if BLOCK_DPE > 0:
                 offs_kpe = (
                     offs_kv_loc[None, :] * stride_buf_kbs
@@ -413,7 +415,12 @@ def _fwd_kernel(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
-                qk += tl.dot(qpe.to(kpe.dtype), kpe)
+                qk += tl.dot(
+                    qpe.to(kpe.dtype),
+                    kpe,
+                    out_dtype=tl.float32,
+                    allow_tf32=False,
+                ).to(tl.float32)
             qk *= sm_scale * k_scale
 
             if logit_cap > 0:
@@ -443,7 +450,9 @@ def _fwd_kernel(
                 other=0.0,
             )
             p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
+            acc = acc * re_scale[:, None] + tl.dot(
+                p, v, out_dtype=tl.float32, allow_tf32=False
+            ) * v_scale
 
             e_max = n_e_max
 
@@ -507,7 +516,7 @@ def _fwd_kernel(
                 K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
             )
 
-            qk = tl.dot(q, k, out_dtype=tl.float32)
+            qk = tl.dot(q, k, out_dtype=tl.float32, allow_tf32=False)
             if BLOCK_DPE > 0:
                 offs_kpe = (
                     (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
@@ -519,7 +528,7 @@ def _fwd_kernel(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
-                qk += tl.dot(qpe, kpe)
+                qk += tl.dot(qpe, kpe, out_dtype=tl.float32, allow_tf32=False)
 
             qk *= sm_scale
 
@@ -548,7 +557,9 @@ def _fwd_kernel(
                 V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
             )
             p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
+            acc = acc * re_scale[:, None] + tl.dot(
+                p, v, out_dtype=tl.float32, allow_tf32=False
+            ).to(tl.float32)
 
             e_max = n_e_max
 
@@ -930,7 +941,9 @@ def _fwd_kernel_unified(
                 other=0.0,
             )
 
-            qk = tl.dot(q.to(k.dtype), k)
+            qk = tl.dot(
+                q.to(k.dtype), k, out_dtype=tl.float32, allow_tf32=False
+            )
             if BLOCK_DPE > 0:
                 offs_kpe = (
                     offs_kv_loc[None, :] * stride_buf_kbs
@@ -942,7 +955,12 @@ def _fwd_kernel_unified(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
-                qk += tl.dot(qpe.to(kpe.dtype), kpe)
+                qk += tl.dot(
+                    qpe.to(kpe.dtype),
+                    kpe,
+                    out_dtype=tl.float32,
+                    allow_tf32=False,
+                )
 
             qk *= sm_scale_withk
 
@@ -975,7 +993,9 @@ def _fwd_kernel_unified(
                 other=0.0,
             )
             p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
+            acc = acc * re_scale[:, None] + tl.dot(
+                p, v, out_dtype=tl.float32, allow_tf32=False
+            )
 
             e_max = n_e_max
 

@@ -130,6 +130,10 @@ class ModelRunnerKVCacheMixin:
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
+            max_speculative_num_draft_tokens = (
+                server_args.max_speculative_num_draft_tokens
+                or server_args.speculative_num_draft_tokens
+            )
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
@@ -147,7 +151,7 @@ class ModelRunnerKVCacheMixin:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
                     * capped_reqs
-                    * server_args.speculative_num_draft_tokens
+                    * max_speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
@@ -163,7 +167,7 @@ class ModelRunnerKVCacheMixin:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
                     * server_args.max_mamba_cache_size
-                    * server_args.speculative_num_draft_tokens
+                    * max_speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -185,7 +189,7 @@ class ModelRunnerKVCacheMixin:
 
             if has_spec_dec:
                 ratio = self._calculate_mamba_ratio()
-                D = server_args.speculative_num_draft_tokens
+                D = max_speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
                 server_args.max_mamba_cache_size = int(
                     mamba_budget_bytes // (per_req * (1 + D / ratio))
@@ -335,6 +339,16 @@ class ModelRunnerKVCacheMixin:
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
+        req_to_token_pool_size = max_num_reqs
+        if (
+            self.server_args.speculative_algorithm == "DFLASH"
+            and not self.is_draft_worker
+            and self.mambaish_config is None
+            and int(self.server_args.speculative_dflash_tree_width) > 1
+        ):
+            req_to_token_pool_size += (
+                max_num_reqs * int(self.server_args.speculative_dflash_tree_budget)
+            )
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
@@ -366,6 +380,7 @@ class ModelRunnerKVCacheMixin:
                         ),
                         speculative_num_draft_tokens=max_spec_draft_tokens,
                         speculative_eagle_topk=self.server_args.speculative_eagle_topk,
+                        speculative_dflash_tree_width=self.server_args.speculative_dflash_tree_width,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
@@ -402,6 +417,7 @@ class ModelRunnerKVCacheMixin:
                     enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
+                    speculative_dflash_tree_width=self.server_args.speculative_dflash_tree_width,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
                     enable_linear_replayssm=self.server_args.enable_linear_replayssm,
@@ -419,7 +435,7 @@ class ModelRunnerKVCacheMixin:
                     req_to_token_pool_cls = DSV4NPUReqToTokenPool
 
                 self.req_to_token_pool = req_to_token_pool_cls(
-                    size=max_num_reqs,
+                    size=req_to_token_pool_size,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
                     device=self.device,

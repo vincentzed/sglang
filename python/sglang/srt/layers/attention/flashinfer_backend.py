@@ -397,6 +397,15 @@ class FlashInferAttnBackend(AttentionBackend):
         max_bs = _cuda_graph_capture_max_bs(
             model_runner.server_args, model_runner.req_to_token_pool.size
         )
+        if (
+            model_runner.spec_algorithm.is_dflash()
+            and not model_runner.is_draft_worker
+            and model_runner.server_args.speculative_dflash_tree_width > 1
+        ):
+            max_bs = max(
+                max_bs,
+                max_bs * int(model_runner.server_args.speculative_dflash_tree_budget),
+            )
         if kv_indptr_buf is None:
             self.kv_indptr = [
                 torch.zeros(
@@ -983,9 +992,28 @@ class FlashInferAttnBackend(AttentionBackend):
                         layer.v_scale,
                     )
 
+            tree_masked_dflash_verify = (
+                forward_batch.forward_mode.is_target_verify()
+                and isinstance(forward_batch.spec_info, SpecInput)
+                and forward_batch.spec_info.spec_input_type
+                == SpecInputType.DFLASH_VERIFY
+                and (
+                    getattr(forward_batch.spec_info, "compact_kv_indices", None)
+                    is not None
+                    or getattr(forward_batch.spec_info, "custom_mask", None) is not None
+                )
+            )
+            force_tree_causal = (
+                tree_masked_dflash_verify
+                and (
+                    getattr(forward_batch.spec_info, "force_causal", False)
+                    or os.environ.get("SGLANG_DFLASH_TREE_FORCE_CAUSAL", "0") == "1"
+                )
+            )
             causal = (
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
+                and (not tree_masked_dflash_verify or force_tree_causal)
             )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),

@@ -88,6 +88,13 @@ class EagerRunner(BaseRunner):
                         num_draft_tokens, mr.is_draft_worker
                     )
                 )
+                if (
+                    mr.spec_algorithm.is_dflash()
+                    and mr.server_args.speculative_dflash_tree_width > 1
+                ):
+                    num_tokens_per_bs = int(
+                        mr.server_args.speculative_dflash_tree_budget
+                    )
         else:
             dllm_config = DllmConfig.from_server_args(sa)
             if dllm_config is not None:
@@ -102,6 +109,12 @@ class EagerRunner(BaseRunner):
             # Frozen-KV MTP expands the draft batch by topk on the bs axis
             # (expand_for_topk_draft) before the eager fallback.
             max_bs *= sa.speculative_eagle_topk
+        if (
+            not mr.is_draft_worker
+            and mr.spec_algorithm.is_dflash()
+            and sa.speculative_dflash_tree_width > 1
+        ):
+            max_bs *= int(sa.speculative_dflash_tree_budget)
         # Mirror prepare_mlp_sync_batch padding so the registry holds what load_batch copies.
         if require_mlp_sync(sa):
             from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size

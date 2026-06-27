@@ -5,6 +5,7 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.memory_pool import conv_window_dedup_enabled
 from sglang.srt.speculative.dflash_tree_utils import (
     build_ancestor_matrix_from_parents,
     build_retrieve_links_from_parents,
@@ -12,6 +13,7 @@ from sglang.srt.speculative.dflash_tree_utils import (
     build_tree_from_topk_cpu,
     compute_tree_budget,
     tree_accept_greedy,
+    tree_accept_greedy_batched,
 )
 from sglang.srt.server_args import _merge_speculative_config
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -170,6 +172,42 @@ class TestDFlashTreeConstruction(CustomTestCase):
             for child, sibling in zip(child_list, child_list[1:]):
                 self.assertEqual(int(retrieve_next_sibling[child]), sibling)
 
+    def test_retrieve_links_ignore_padded_budget_slots(self):
+        parents = torch.tensor([-1, 0, 0, 0, 0], dtype=torch.long)
+        retrieve_index, retrieve_next_token, retrieve_next_sibling = (
+            build_retrieve_links_from_parents(
+                parents,
+                num_verify_tokens=5,
+                num_nodes=3,
+            )
+        )
+        self.assertEqual(retrieve_index.tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(retrieve_next_token.tolist(), [1, -1, -1, -1, -1])
+        self.assertEqual(retrieve_next_sibling.tolist(), [-1, 2, -1, -1, -1])
+
+    def test_retrieve_index_uses_global_flat_offsets(self):
+        parents = torch.tensor([-1, 0, 1], dtype=torch.long)
+        retrieve_index, retrieve_next_token, retrieve_next_sibling = (
+            build_retrieve_links_from_parents(
+                parents,
+                num_verify_tokens=5,
+                row_offset=64,
+            )
+        )
+        self.assertEqual(retrieve_index.tolist(), [64, 65, 66, 67, 68])
+        self.assertEqual(retrieve_next_token.tolist(), [1, 2, -1, -1, -1])
+        self.assertEqual(retrieve_next_sibling.tolist(), [-1, -1, -1, -1, -1])
+
+    def test_retrieve_links_preserve_duplicate_token_siblings_for_state(self):
+        parents = torch.tensor([-1, 0, 0, 1, 2], dtype=torch.long)
+        tokens = torch.tensor([4, 5, 5, 7, 8], dtype=torch.long)
+        _, retrieve_next_token, retrieve_next_sibling = build_retrieve_links_from_parents(
+            parents,
+            token_ids=tokens,
+        )
+        self.assertEqual(retrieve_next_token.tolist(), [1, 3, 4, -1, -1])
+        self.assertEqual(retrieve_next_sibling.tolist(), [-1, 2, -1, -1, -1])
+
     def test_tree_custom_mask_prepends_prefix(self):
         parents = torch.tensor([-1, 0, 0, 1], dtype=torch.long)
         mask = build_tree_custom_mask(
@@ -202,6 +240,56 @@ class TestDFlashTreeConstruction(CustomTestCase):
         self.assertEqual(correct_drafts, 2)
         self.assertEqual(bonus, 42)
 
+    def test_tree_accept_greedy_matches_reference_duplicate_child_rule(self):
+        # Duplicate token 5 appears under the root. JetSpec's child map keeps
+        # the later duplicate, so accepting token 5 must walk through node 2.
+        tree_tokens = torch.tensor([4, 5, 5, 7, 8], dtype=torch.long)
+        parents = torch.tensor([-1, 0, 0, 1, 2], dtype=torch.long)
+        target_tokens = torch.tensor([5, 7, 8, 99, 42], dtype=torch.long)
+        path, correct_drafts, bonus = tree_accept_greedy(
+            tree_tokens, parents, target_tokens
+        )
+        self.assertEqual(path, [0, 2, 4])
+        self.assertEqual(correct_drafts, 2)
+        self.assertEqual(bonus, 42)
+
+    def test_tree_accept_greedy_batched_packs_reference_path(self):
+        tree_tokens = torch.tensor([[4, 5, 5, 7, 8, 0]], dtype=torch.long)
+        parents = torch.tensor([[-1, 0, 0, 1, 2, 0]], dtype=torch.long)
+        depths = torch.tensor([[0, 1, 1, 2, 2, 1]], dtype=torch.long)
+        target_tokens = torch.tensor([[5, 7, 8, 99, 42, 0]], dtype=torch.long)
+
+        predict, accept_index, correct_drafts = tree_accept_greedy_batched(
+            tree_tokens=tree_tokens,
+            parent_indices=parents,
+            depths=depths,
+            target_tokens=target_tokens,
+            num_real_nodes=torch.tensor([5], dtype=torch.long),
+            max_tree_depth=3,
+        )
+
+        self.assertEqual(predict.tolist(), [5, 7, 8, 99, 42, 0])
+        self.assertEqual(accept_index.tolist(), [[0, 2, 4, -1]])
+        self.assertEqual(correct_drafts.tolist(), [2])
+
+    def test_tree_accept_greedy_batched_ignores_padded_duplicate(self):
+        tree_tokens = torch.tensor([[4, 5, 5, 5]], dtype=torch.long)
+        parents = torch.tensor([[-1, 0, 0, 0]], dtype=torch.long)
+        depths = torch.tensor([[0, 1, 1, 1]], dtype=torch.long)
+        target_tokens = torch.tensor([[5, 11, 22, 33]], dtype=torch.long)
+
+        _, accept_index, correct_drafts = tree_accept_greedy_batched(
+            tree_tokens=tree_tokens,
+            parent_indices=parents,
+            depths=depths,
+            target_tokens=target_tokens,
+            num_real_nodes=torch.tensor([3], dtype=torch.long),
+            max_tree_depth=2,
+        )
+
+        self.assertEqual(accept_index.tolist(), [[0, 2, -1]])
+        self.assertEqual(correct_drafts.tolist(), [1])
+
     def test_speculative_config_json_maps_dflash_tree_keys(self):
         kwargs = {
             "speculative_config": (
@@ -214,6 +302,24 @@ class TestDFlashTreeConstruction(CustomTestCase):
         self.assertEqual(kwargs["speculative_dflash_tree_budget"], 128)
         self.assertEqual(kwargs["speculative_dflash_tree_draft"], "accum_logp")
         self.assertEqual(kwargs["speculative_dflash_head_type"], "causal")
+
+    def test_dflash_tree_uses_dense_mamba_intermediate_conv_windows(self):
+        self.assertTrue(
+            conv_window_dedup_enabled(
+                is_npu=False,
+                is_cpu=False,
+                speculative_eagle_topk=1,
+                speculative_dflash_tree_width=1,
+            )
+        )
+        self.assertFalse(
+            conv_window_dedup_enabled(
+                is_npu=False,
+                is_cpu=False,
+                speculative_eagle_topk=1,
+                speculative_dflash_tree_width=4,
+            )
+        )
 
     def test_speculative_config_rejects_unknown_key(self):
         with self.assertRaisesRegex(ValueError, "Unsupported --speculative-config"):

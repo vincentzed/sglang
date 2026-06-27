@@ -328,11 +328,17 @@ def create_dummy_verify_input(
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
         # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
+        topk = server_args.speculative_dflash_tree_width if not is_draft_worker else 1
         spec_info = DFlashVerifyInput(
             draft_token=None,
             positions=None,
-            draft_token_num=server_args.speculative_num_draft_tokens,
-            custom_mask=None,
+            draft_token_num=num_tokens_per_bs,
+            topk=topk,
+            custom_mask=(
+                None
+                if (is_draft_worker or topk <= 1)
+                else custom_mask
+            ),
             capture_hidden_mode=(
                 CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL
             ),

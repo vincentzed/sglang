@@ -484,26 +484,36 @@ def build_retrieve_links_from_parents(
     parent_indices: torch.Tensor,
     *,
     num_verify_tokens: Optional[int] = None,
+    num_nodes: Optional[int] = None,
+    row_offset: int = 0,
+    token_ids: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     device = parent_indices.device
-    parents = parent_indices.to(dtype=torch.long).tolist()
-    num_nodes = len(parents)
-    width = num_nodes if num_verify_tokens is None else int(num_verify_tokens)
-    if width < num_nodes:
+    total_nodes = int(parent_indices.numel()) if num_nodes is None else int(num_nodes)
+    parents = parent_indices[:total_nodes].to(dtype=torch.long).tolist()
+    width = total_nodes if num_verify_tokens is None else int(num_verify_tokens)
+    if width < total_nodes:
         raise ValueError(
-            f"num_verify_tokens={width} is smaller than num_nodes={num_nodes}."
+            f"num_verify_tokens={width} is smaller than num_nodes={total_nodes}."
         )
 
-    retrieve_index = torch.arange(width, dtype=torch.long, device=device)
+    retrieve_index = torch.arange(
+        int(row_offset), int(row_offset) + width, dtype=torch.long, device=device
+    )
     retrieve_next_token = torch.full((width,), -1, dtype=torch.long, device=device)
     retrieve_next_sibling = torch.full((width,), -1, dtype=torch.long, device=device)
 
     children: list[list[int]] = [[] for _ in range(width)]
-    for idx in range(1, num_nodes):
+    for idx in range(1, total_nodes):
         children[parents[idx]].append(idx)
-    for idx, node_children in enumerate(children[:num_nodes]):
+    for idx, node_children in enumerate(children[:total_nodes]):
         if not node_children:
             continue
+        # These links drive tree-state kernels (conv/GDN/Mamba), so they must
+        # encode the physical parent/child topology for every node.  JetSpec's
+        # duplicate-token overwrite rule belongs only to acceptance; pruning
+        # duplicate-token siblings here would leave the pruned nodes with an
+        # incorrect parent state during verify.
         retrieve_next_token[idx] = node_children[0]
         for child, sibling in zip(node_children, node_children[1:]):
             retrieve_next_sibling[child] = sibling
@@ -588,34 +598,156 @@ def tree_accept_greedy(
     parents = parent_indices[:n].to(dtype=torch.long).tolist()
     targets = target_tokens[:n].tolist()
 
-    children: list[list[int]] = [[] for _ in range(n)]
+    child_maps: list[dict[int, int]] = [dict() for _ in range(n)]
     for idx in range(1, n):
-        children[parents[idx]].append(idx)
+        parent = parents[idx]
+        if 0 <= parent < n:
+            child_maps[parent][int(tokens[idx])] = idx
 
-    best_path = [0]
-    best_len = 0
-    stack: list[list[int]] = [[0]]
-    while stack:
-        path = stack.pop()
-        node = path[-1]
-        if children[node]:
-            for child in reversed(children[node]):
-                stack.append([*path, child])
-            continue
+    path = [0]
+    current = 0
+    while True:
+        child = child_maps[current].get(int(targets[current]))
+        if child is None:
+            break
+        path.append(child)
+        current = child
 
-        correct_drafts = 0
-        for depth_idx in range(1, len(path)):
-            parent = path[depth_idx - 1]
-            child = path[depth_idx]
-            if tokens[child] != targets[parent]:
-                break
-            correct_drafts += 1
-        if correct_drafts > best_len:
-            best_len = correct_drafts
-            best_path = path[: correct_drafts + 1]
+    bonus_token = int(targets[current])
+    return path, len(path) - 1, bonus_token
 
-    bonus_token = int(targets[best_path[-1]])
-    return best_path, best_len, bonus_token
+
+def tree_accept_greedy_batched(
+    *,
+    tree_tokens: torch.Tensor,
+    parent_indices: torch.Tensor,
+    depths: torch.Tensor,
+    target_tokens: torch.Tensor,
+    num_real_nodes: torch.Tensor,
+    max_tree_depth: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batched JetSpec greedy tree acceptance.
+
+    This mirrors ``jetspec.tree._core.accept.gpu_tree_accept`` for fixed-width
+    padded batches.  Acceptance is a child-map walk: at node ``n``, accept the
+    unique child whose draft token equals ``target_tokens[n]``.  If siblings
+    under the same parent have the same token, the later node overwrites the
+    earlier one, matching the Python ``dict`` child map used by JetSpec.
+
+    Returns:
+        predicts: flat target argmax tokens, used by the spec-v2 publish path.
+        accept_index: global flat node indices for the root-inclusive accepted
+            path, padded with -1 to ``max_tree_depth + 1``.
+        num_correct_drafts: accepted draft-token count, excluding the trailing
+            correction token emitted from the last accepted node.
+    """
+
+    if tree_tokens.ndim != 2:
+        raise ValueError(
+            f"tree_tokens must be 2D [bs, num_nodes], got {tuple(tree_tokens.shape)}."
+        )
+    if parent_indices.shape != tree_tokens.shape:
+        raise ValueError(
+            "parent_indices shape must match tree_tokens shape, "
+            f"got {tuple(parent_indices.shape)} vs {tuple(tree_tokens.shape)}."
+        )
+    if depths.shape != tree_tokens.shape:
+        raise ValueError(
+            f"depths shape must match tree_tokens shape, got {tuple(depths.shape)}."
+        )
+    if target_tokens.shape != tree_tokens.shape:
+        raise ValueError(
+            "target_tokens shape must match tree_tokens shape, "
+            f"got {tuple(target_tokens.shape)} vs {tuple(tree_tokens.shape)}."
+        )
+
+    bs, num_nodes = tree_tokens.shape
+    device = tree_tokens.device
+    path_width = int(max_tree_depth) + 1
+    if path_width <= 0:
+        raise ValueError(f"max_tree_depth must be non-negative, got {max_tree_depth}.")
+
+    if bs == 0:
+        return (
+            target_tokens.reshape(-1).to(torch.int32),
+            torch.empty((0, path_width), dtype=torch.int32, device=device),
+            torch.empty((0,), dtype=torch.int32, device=device),
+        )
+    if num_nodes <= 0:
+        raise ValueError("tree_tokens must contain at least the root node.")
+
+    real_nodes = num_real_nodes.to(device=device, dtype=torch.long)
+    if real_nodes.ndim != 1 or int(real_nodes.shape[0]) != bs:
+        raise ValueError(
+            "num_real_nodes must be 1D with one entry per batch row, "
+            f"got {tuple(num_real_nodes.shape)} for bs={bs}."
+        )
+
+    node_ids = torch.arange(num_nodes, dtype=torch.long, device=device)
+    valid_node = node_ids.unsqueeze(0) < real_nodes.unsqueeze(1)
+    valid_node[:, 0] = real_nodes > 0
+
+    parents = parent_indices.to(torch.long)
+    safe_parents = parents.clamp(min=0, max=num_nodes - 1)
+    valid_parent = (parents >= 0) & (parents < real_nodes.unsqueeze(1))
+
+    same_parent = parents[:, :, None] == parents[:, None, :]
+    same_token = tree_tokens[:, :, None] == tree_tokens[:, None, :]
+    later_node = node_ids[None, None, :] > node_ids[None, :, None]
+    later_valid = valid_node[:, None, :]
+    overwritten = (same_parent & same_token & later_node & later_valid).any(dim=2)
+
+    parent_targets = torch.gather(target_tokens, 1, safe_parents)
+    match = (
+        valid_node
+        & valid_parent
+        & ~overwritten
+        & (tree_tokens == parent_targets)
+    )
+    match[:, 0] = valid_node[:, 0]
+
+    prefix_match = match.clone()
+    jump = safe_parents.clone()
+    for _ in range(max(1, int(max_tree_depth).bit_length())):
+        prefix_match = prefix_match & torch.gather(prefix_match, 1, jump)
+        jump = torch.gather(jump, 1, jump)
+
+    score = torch.where(
+        prefix_match,
+        depths.to(torch.long),
+        torch.full_like(depths.to(torch.long), -1),
+    )
+    best_node = torch.argmax(score, dim=1)
+    accepted_depth = torch.gather(depths.to(torch.long), 1, best_node[:, None]).squeeze(
+        1
+    )
+    accepted_depth = accepted_depth.clamp(min=0, max=int(max_tree_depth))
+
+    path_buf = torch.empty((bs, path_width), dtype=torch.long, device=device)
+    current = best_node
+    for depth in range(path_width - 1, -1, -1):
+        path_buf[:, depth] = current
+        current = torch.gather(safe_parents, 1, current[:, None]).squeeze(1)
+
+    path_pos = torch.arange(path_width, dtype=torch.long, device=device)
+    valid_path_pos = path_pos.unsqueeze(0) <= accepted_depth.unsqueeze(1)
+    valid_start = (path_width - 1) - accepted_depth
+    gather_pos = valid_start.unsqueeze(1) + path_pos.unsqueeze(0)
+    local_accept = torch.gather(path_buf, 1, gather_pos.clamp(max=path_width - 1))
+    row_offsets = (
+        torch.arange(bs, dtype=torch.long, device=device).unsqueeze(1) * num_nodes
+    )
+    accept_index = torch.where(
+        valid_path_pos,
+        row_offsets + local_accept,
+        torch.full_like(local_accept, -1),
+    ).to(torch.int32)
+
+    return (
+        target_tokens.reshape(-1).to(torch.int32),
+        accept_index,
+        accepted_depth.to(torch.int32),
+    )
 
 
 def tree_signature(tree: DraftTreeCPU | DraftTree) -> str:

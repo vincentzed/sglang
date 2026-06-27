@@ -742,27 +742,39 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
             bs = len(forward_batch.req_pool_indices)
-            qo_indptr = torch.arange(
-                0,
-                (1 + bs) * self.num_draft_tokens,
-                step=self.num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
+            num_draft_tokens = int(
+                getattr(spec_info, "draft_token_num", self.num_draft_tokens)
             )
-            # Different with flashinfer kv_indptr and kv_indices construction.
-            # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
-            seq_lens_sum = forward_batch.seq_lens_sum
-            if seq_lens_sum is None:
-                seq_lens_sum = bs * self.max_context_len
-            kv_indices = torch.empty(
-                seq_lens_sum, dtype=torch.int64, device=self.device
-            )
-            kv_indptr = self._fill_kv_indptr_and_indices(
-                bs,
-                forward_batch.seq_lens,
-                forward_batch.req_pool_indices,
-                kv_indices,
-            )
+            compact_kv_indices = getattr(spec_info, "compact_kv_indices", None)
+            if compact_kv_indices is not None:
+                assert spec_info.compact_kv_indptr is not None
+                assert spec_info.compact_qo_indptr is not None
+                kv_indices = compact_kv_indices.to(dtype=torch.int64)
+                kv_indptr = spec_info.compact_kv_indptr.to(dtype=torch.int32)
+                qo_indptr = spec_info.compact_qo_indptr.to(dtype=torch.int32)
+                bs = int(qo_indptr.numel()) - 1
+            else:
+                qo_indptr = torch.arange(
+                    0,
+                    (1 + bs) * num_draft_tokens,
+                    step=num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                # Different with flashinfer kv_indptr and kv_indices construction.
+                # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
+                seq_lens_sum = forward_batch.seq_lens_sum
+                if seq_lens_sum is None:
+                    seq_lens_sum = bs * self.max_context_len
+                kv_indices = torch.empty(
+                    seq_lens_sum, dtype=torch.int64, device=self.device
+                )
+                kv_indptr = self._fill_kv_indptr_and_indices(
+                    bs,
+                    forward_batch.seq_lens,
+                    forward_batch.req_pool_indices,
+                    kv_indices,
+                )
 
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
                 # window_kv_offsets is used to calculate the start position in custom mask
@@ -783,13 +795,18 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
             custom_mask = spec_info.custom_mask
-            seq_mask_len = self.num_draft_tokens * (
-                forward_batch.seq_lens + self.num_draft_tokens
-            )
-            mask_indptr = self.mask_indptr
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
-            mask_indptr = mask_indptr[: bs + 1]
-            max_extend_len = self.num_draft_tokens
+            if custom_mask is not None:
+                seq_mask_len = num_draft_tokens * (
+                    forward_batch.seq_lens[:bs] + num_draft_tokens
+                )
+                mask_indptr = torch.empty(
+                    (bs + 1,), dtype=torch.int64, device=self.device
+                )
+                mask_indptr[0] = 0
+                mask_indptr[1:] = torch.cumsum(seq_mask_len, dim=0)
+            else:
+                mask_indptr = None
+            max_extend_len = num_draft_tokens
             num_kv_splits = None
             attn_logits = None
             attn_lse = None

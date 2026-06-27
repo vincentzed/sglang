@@ -6876,6 +6876,15 @@ class ServerArgs:
         """Return the maximum draft-token count speculative decoding may use."""
         if self.speculative_num_draft_tokens is None:
             return None
+        if (
+            str(self.speculative_algorithm).upper() == "DFLASH"
+            and int(self.speculative_dflash_tree_width or 1) > 1
+            and self.speculative_dflash_tree_budget is not None
+        ):
+            return max(
+                int(self.speculative_num_draft_tokens),
+                int(self.speculative_dflash_tree_budget),
+            )
         if not self.speculative_adaptive:
             return self.speculative_num_draft_tokens
 

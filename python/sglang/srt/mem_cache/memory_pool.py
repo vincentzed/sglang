@@ -97,22 +97,29 @@ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
 def conv_window_dedup_enabled(
-    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int]
+    is_npu: bool,
+    is_cpu: bool,
+    speculative_eagle_topk: Optional[int],
+    speculative_dflash_tree_width: Optional[int] = None,
 ) -> bool:
     """Whether the deduplicated sliding-window conv-intermediate layout is safe.
 
-    It is only correct for a *linear* draft chain (``speculative_eagle_topk <= 1``,
-    i.e. NEXTN / MTP): consecutive draft tokens then form a true sliding window, so
-    the overlapping physical columns hold identical values. Under EAGLE *tree*
-    verify (``topk > 1``) the conv kernel walks per-token tree ancestors, so aliased
-    columns can need different values from different parent chains -> fall back to
-    the dense layout. NPU/CPU also keep the dense layout (their kernels assume
-    contiguous per-step windows). See ``MambaPool.__init__``.
+    It is only correct for a *linear* draft chain: consecutive draft tokens then
+    form a true sliding window, so the overlapping physical columns hold
+    identical values. Under tree verify (EAGLE ``topk > 1`` or DFlash tree
+    width > 1), the conv kernel walks per-token tree ancestors, so aliased
+    columns can need different values from different parent chains -> fall back
+    to the dense layout. NPU/CPU also keep the dense layout (their kernels
+    assume contiguous per-step windows). See ``MambaPool.__init__``.
     """
     return (
         not is_npu
         and not is_cpu
         and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
+        and (
+            speculative_dflash_tree_width is None
+            or speculative_dflash_tree_width <= 1
+        )
     )
 
 
@@ -355,6 +362,7 @@ class MambaPool:
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
+        speculative_dflash_tree_width: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
     ):
@@ -488,12 +496,15 @@ class MambaPool:
                 #
                 # Dedup the sliding-window conv-intermediate only when it is safe:
                 # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
-                # verify (topk > 1) keep the dense layout -- see
+                # verify (topk > 1 / tree width > 1) keep the dense layout -- see
                 # `conv_window_dedup_enabled` for the full rationale. The
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
                 dedup_conv_window = conv_window_dedup_enabled(
-                    _is_npu, _is_cpu, speculative_eagle_topk
+                    _is_npu,
+                    _is_cpu,
+                    speculative_eagle_topk,
+                    speculative_dflash_tree_width,
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
@@ -787,6 +798,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer_lazy: bool = False,
         speculative_num_draft_tokens: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        speculative_dflash_tree_width: Optional[int] = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
         enable_linear_replayssm: bool = False,
@@ -814,6 +826,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            speculative_dflash_tree_width=speculative_dflash_tree_width,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
         )
@@ -828,6 +841,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        speculative_dflash_tree_width: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
     ):
@@ -840,6 +854,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            speculative_dflash_tree_width=speculative_dflash_tree_width,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
         )

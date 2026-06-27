@@ -41,12 +41,25 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+def _get_dflash_causal_head(config) -> bool:
+    dflash_config = getattr(config, "dflash_config", None)
+    if isinstance(dflash_config, dict) and "causal_head" in dflash_config:
+        return bool(dflash_config["causal_head"])
+    if dflash_config is not None and hasattr(dflash_config, "causal_head"):
+        return bool(getattr(dflash_config, "causal_head"))
+    if hasattr(config, "causal_head"):
+        return bool(getattr(config, "causal_head"))
+    return False
+
+
 def _get_dflash_layer_attention_params(
     config, layer_id: int
 ) -> Tuple[int, AttentionType]:
     layer_types = get_dflash_layer_types(config)
+    causal_head = _get_dflash_causal_head(config)
     if layer_types is None:
-        return -1, AttentionType.ENCODER_ONLY
+        attn_type = AttentionType.DECODER if causal_head else AttentionType.ENCODER_ONLY
+        return -1, attn_type
     if layer_id >= len(layer_types):
         raise ValueError(
             "DFLASH config.layer_types must contain one entry per draft layer. "
@@ -55,7 +68,8 @@ def _get_dflash_layer_attention_params(
 
     layer_type = layer_types[layer_id]
     if layer_type == "full_attention":
-        return -1, AttentionType.ENCODER_ONLY
+        attn_type = AttentionType.DECODER if causal_head else AttentionType.ENCODER_ONLY
+        return -1, attn_type
     if layer_type == "sliding_attention":
         sliding_window_size = get_dflash_attention_sliding_window_size(config)
         assert sliding_window_size is not None

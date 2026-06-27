@@ -53,6 +53,13 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
 
+    @staticmethod
+    def _uses_tree_verify(forward_mode: ForwardMode, spec_info: Optional[SpecInput]):
+        if not forward_mode.is_target_verify() or spec_info is None:
+            return False
+        tree_topk = getattr(spec_info, "tree_topk", getattr(spec_info, "topk", 0))
+        return int(tree_topk or 0) > 1
+
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
         if (
@@ -103,9 +110,18 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_final_src = None
         track_ssm_final_dst = None
 
-        mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
-            forward_batch.req_pool_indices
-        )
+        mamba_cache_indices = None
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and forward_batch.spec_info is not None
+        ):
+            mamba_cache_indices = getattr(
+                forward_batch.spec_info, "mamba_cache_indices", None
+            )
+        if mamba_cache_indices is None:
+            mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
+                forward_batch.req_pool_indices
+            )
         _real_bs = getattr(forward_batch, "_original_batch_size", None)
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
             mamba_cache_indices = mamba_cache_indices.clone()
@@ -203,7 +219,9 @@ class MambaAttnBackendBase(AttentionBackend):
                     device=forward_batch.input_ids.device,
                 )
 
-                if self.topk > 1:
+                if self._uses_tree_verify(
+                    forward_batch.forward_mode, forward_batch.spec_info
+                ):
                     retrieve_next_token = forward_batch.spec_info.retrieve_next_token
                     retrieve_next_sibling = (
                         forward_batch.spec_info.retrieve_next_sibling
@@ -577,8 +595,10 @@ class MambaAttnBackendBase(AttentionBackend):
             else None
         )
 
-        # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and self.topk > 1:
+        # Tree verify uses retrieve_next_token / retrieve_next_sibling to make
+        # Mamba/GDN state updates follow the accepted tree edges. This applies to
+        # EAGLE and to DFlash tree mode.
+        if self._uses_tree_verify(forward_mode, spec_info):
             # They are None during cuda graph capture so skip the copy_...
             # self.retrieve_next_token_list[bs - 1].copy_(spec_info.retrieve_next_token)
             # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrieve_next_sibling)
@@ -726,8 +746,10 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
-        # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and self.topk > 1:
+        # Tree verify uses retrieve_next_token / retrieve_next_sibling to make
+        # Mamba/GDN state updates follow the accepted tree edges. This applies to
+        # EAGLE and to DFlash tree mode.
+        if self._uses_tree_verify(forward_mode, spec_info):
             if (
                 spec_info is not None
                 and getattr(spec_info, "retrieve_next_token", None) is not None

@@ -481,6 +481,12 @@ class BaseRunner(ABC):
                     mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
                 )
             )
+            if (
+                mr.spec_algorithm.is_dflash()
+                and not mr.is_draft_worker
+                and mr.server_args.speculative_dflash_tree_width > 1
+            ):
+                num_tokens_per_bs = int(mr.server_args.speculative_dflash_tree_budget)
 
         if mr.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL

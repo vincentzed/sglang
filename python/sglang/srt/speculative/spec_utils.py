@@ -508,6 +508,8 @@ def move_accept_tokens_to_target_kvcache(
     accept_index: torch.Tensor,
     num_correct_drafts: torch.Tensor,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    *,
+    overlap_safe: bool = False,
 ):
     """
     Move accepted tokens (drafts + bonus) to the target KV cache.
@@ -520,9 +522,10 @@ def move_accept_tokens_to_target_kvcache(
     """
     bs = len(batch.seq_lens)
     device = batch.seq_lens.device
+    accept_stride = accept_index.shape[1]
     # accept_index element count, NOT bs * num_draft_tokens: for topk > 1 the
     # tree exceeds the accepted chain, over-reading accept_index (illegal memory).
-    size = bs * accept_index.shape[1]
+    size = bs * accept_stride
 
     # fill_accept_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
     maybe_detect_oob(
@@ -532,30 +535,78 @@ def move_accept_tokens_to_target_kvcache(
         "spec v2 move_accept_tokens accept_index",
     )
 
-    tgt_cache_loc = torch.zeros(
-        size,
-        dtype=torch.int64,
-        device=device,
-    )
-    accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
+    tgt_cache_loc = torch.empty(size, dtype=torch.int64, device=device)
     assign_extend_cache_locs[(bs,)](
         batch.req_pool_indices,
         batch.req_to_token_pool.req_to_token,
         batch.seq_lens,
-        batch.seq_lens + num_correct_drafts + 1,
+        batch.seq_lens + accept_stride,
         tgt_cache_loc,
         batch.req_to_token_pool.req_to_token.shape[1],
         next_power_of_2(bs),
     )
-    fill_accept_out_cache_loc[(size,)](
-        accept_index,
-        batch.out_cache_loc,
-        accept_out_cache_loc,
-        next_power_of_2(size),
+    tgt_cache_loc_2d = tgt_cache_loc.view(bs, accept_stride)
+
+    accept_lens = num_correct_drafts + 1
+    valid_offsets = (
+        torch.arange(accept_stride, dtype=torch.long, device=device).unsqueeze(0)
+        < accept_lens.to(torch.long).unsqueeze(1)
     )
-    token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-        tgt_cache_loc, accept_out_cache_loc
-    )
+    tgt_cache_loc = tgt_cache_loc_2d[valid_offsets]
+    accept_out_cache_loc = batch.out_cache_loc[
+        accept_index.to(torch.long).clamp(min=0)
+    ][valid_offsets]
+    kvcache = token_to_kv_pool_allocator.get_kvcache()
+    if overlap_safe:
+        move_kv_cache_overlap_safe(kvcache, tgt_cache_loc, accept_out_cache_loc)
+    else:
+        kvcache.move_kv_cache(tgt_cache_loc, accept_out_cache_loc)
+    return tgt_cache_loc_2d
+
+
+def move_kv_cache_overlap_safe(kvcache, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+    """Move KV rows when source and destination slots may overlap.
+
+    Tree verification writes every proposed node into the target KV pool, then
+    compacts only the accepted path back into contiguous target positions.  For
+    some tree layouts, source slots such as local node 5 are also destination
+    slots for another accepted node.  The regular tiled copy is an in-place
+    parallel move, so snapshot source rows before writing destinations.
+    """
+
+    if tgt_loc.numel() == 0:
+        return
+
+    # Hybrid linear pools delegate full-attention KV to a nested pool.
+    full_kv_pool = getattr(kvcache, "full_kv_pool", None)
+    if full_kv_pool is not None:
+        move_kv_cache_overlap_safe(full_kv_pool, tgt_loc, src_loc)
+        swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
+        if swa_kv_pool is not None:
+            move_kv_cache_overlap_safe(
+                swa_kv_pool,
+                swa_kv_pool.translate_loc_from_full_to_swa(tgt_loc),
+                swa_kv_pool.translate_loc_from_full_to_swa(src_loc),
+            )
+        return
+
+    tgt_loc_flat = tgt_loc.view(-1).long()
+    src_loc_flat = src_loc.view(-1).long()
+    if hasattr(kvcache, "k_buffer") and hasattr(kvcache, "v_buffer"):
+        for k_cache, v_cache in zip(kvcache.k_buffer, kvcache.v_buffer):
+            k_src = k_cache.index_select(0, src_loc_flat).clone()
+            v_src = v_cache.index_select(0, src_loc_flat).clone()
+            k_cache.index_copy_(0, tgt_loc_flat, k_src)
+            v_cache.index_copy_(0, tgt_loc_flat, v_src)
+        return
+
+    if hasattr(kvcache, "kv_buffer"):
+        for kv_cache in kvcache.kv_buffer:
+            kv_src = kv_cache.index_select(0, src_loc_flat).clone()
+            kv_cache.index_copy_(0, tgt_loc_flat, kv_src)
+        return
+
+    kvcache.move_kv_cache(tgt_loc, src_loc)
 
 
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:

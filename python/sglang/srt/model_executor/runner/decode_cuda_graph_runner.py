@@ -242,6 +242,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self.speculative_num_draft_tokens, model_runner.is_draft_worker
                 )
             )
+            if (
+                model_runner.spec_algorithm.is_dflash()
+                and not model_runner.is_draft_worker
+                and model_runner.server_args.speculative_dflash_tree_width > 1
+            ):
+                self.num_tokens_per_bs = int(
+                    model_runner.server_args.speculative_dflash_tree_budget
+                )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -1069,15 +1077,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
+            topk = (
+                self.model_runner.server_args.speculative_dflash_tree_width
+                if not self.model_runner.is_draft_worker
+                else 1
+            )
+            custom_mask = None
+            if not self.model_runner.is_draft_worker:
+                custom_mask = (
+                    self.buffers.custom_mask
+                    if topk > 1 or build_custom_mask
+                    else None
+                )
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
-                custom_mask=(
-                    None
-                    if (self.model_runner.is_draft_worker or not build_custom_mask)
-                    else self.buffers.custom_mask
-                ),
+                draft_token_num=self.num_tokens_per_bs,
+                topk=topk,
+                custom_mask=custom_mask,
                 capture_hidden_mode=(
                     CaptureHiddenMode.NULL
                     if self.model_runner.is_draft_worker

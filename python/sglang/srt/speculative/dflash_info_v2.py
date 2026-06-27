@@ -157,7 +157,6 @@ class DFlashDraftInputV2(SpecInput):
         planning_kv_lens_cpu_t = self._prepare_planning_kv_lens_cpu_buf[:bs]
         batch_seq_lens_cpu_t = self._prepare_batch_seq_lens_cpu_buf[:bs]
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
-        cur_allocated_seq_lens_cpu = self.cur_allocated_seq_lens_cpu
 
         # For DFLASH, each decode step needs a fixed-size verify block. Linear
         # mode uses the draft block size; tree mode verifies the root-inclusive
@@ -183,12 +182,7 @@ class DFlashDraftInputV2(SpecInput):
         uniform_top_k = True
         for i, req in enumerate(batch.reqs):
             committed_len = int(req.kv_committed_len)
-            if cur_allocated_seq_lens_cpu is not None and i < len(
-                cur_allocated_seq_lens_cpu
-            ):
-                cur_alloc_len = int(cur_allocated_seq_lens_cpu[i])
-            else:
-                cur_alloc_len = int(req.kv_allocated_len)
+            cur_alloc_len = int(req.kv_allocated_len)
             planning_len = committed_len + verify_token_num
             reserved_len = max(cur_alloc_len, committed_len + 2 * verify_token_num)
             top_k = int(req.sampling_params.top_k)

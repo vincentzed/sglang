@@ -30,8 +30,9 @@ class DFlashVerifyInput(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
-    # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
-    # DFLASH verify is linear (non-tree), so this is always 1.
+    # Kept for compatibility with attention backends that gate tree metadata by
+    # `topk > 1`. Linear DFlash keeps this at 1; tree verify sets it to the
+    # configured tree width.
     topk: int = 1
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
@@ -42,14 +43,28 @@ class DFlashVerifyInput(SpecInput):
     max_tree_depth: int = -1
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
     allow_cuda_graph: bool = True
+    compact_kv_indices: torch.Tensor | None = None
+    compact_kv_indptr: torch.Tensor | None = None
+    compact_qo_indptr: torch.Tensor | None = None
+    force_causal: bool = False
+    mamba_cache_indices: torch.Tensor | None = None
 
-    # Shape info for padding (e.g., DP attention / CUDA graph).
+    # Shape info for padding (e.g., DP attention / CUDA graph).  Most SGLang
+    # speculative paths call this `num_tokens_per_req`; keep
+    # `num_tokens_per_batch` as a compatibility alias for older DFlash call
+    # sites.
+    num_tokens_per_req: int = -1
     num_tokens_per_batch: int = -1
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
-        if self.num_tokens_per_batch == -1:
-            self.num_tokens_per_batch = int(self.draft_token_num)
+        if self.num_tokens_per_req == -1:
+            self.num_tokens_per_req = (
+                int(self.num_tokens_per_batch)
+                if self.num_tokens_per_batch != -1
+                else int(self.draft_token_num)
+            )
+        self.num_tokens_per_batch = int(self.num_tokens_per_req)
         if self.max_tree_depth == -1:
             self.max_tree_depth = int(self.draft_token_num)
 
@@ -111,6 +126,15 @@ class DFlashVerifyInput(SpecInput):
     ):
         device = req_pool_indices.device
         bs = len(req_pool_indices)
+        if self.compact_kv_indices is not None:
+            assert self.compact_kv_indptr is not None
+            assert self.compact_qo_indptr is not None
+            return (
+                self.compact_kv_indices.to(dtype=torch.int32),
+                self.compact_kv_indptr.to(dtype=torch.int32),
+                self.compact_qo_indptr.to(dtype=torch.int32),
+                None,
+            )
 
         qo_indptr = torch.arange(
             0,
