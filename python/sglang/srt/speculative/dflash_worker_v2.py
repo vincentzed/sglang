@@ -332,10 +332,18 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _get_tree_verify_full_attn_backend(self):
         if self._tree_verify_full_attn_backend is None:
+            graph_runner = self.target_worker.model_runner.decode_cuda_graph_runner
+            graph_backend = getattr(
+                graph_runner, "dflash_tree_graph_full_attn_backend", None
+            )
+            if graph_backend is not None:
+                self._tree_verify_full_attn_backend = graph_backend
+                return self._tree_verify_full_attn_backend
+
             from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 
             backend_name = os.environ.get(
-                "SGLANG_DFLASH_TREE_VERIFY_FULL_ATTN_BACKEND", "torch_native"
+                "SGLANG_DFLASH_TREE_VERIFY_FULL_ATTN_BACKEND", "flashinfer"
             )
             self._tree_verify_full_attn_backend = ATTENTION_BACKENDS[backend_name](
                 self.target_worker.model_runner
@@ -609,7 +617,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         accepted_path_tokens = torch.gather(tree_tokens, 1, accept_index_local)
         use_linear_commit_fallback = (
-            os.environ.get("SGLANG_DFLASH_TREE_MOE_LINEAR_COMMIT_FALLBACK", "1")
+            self.target_worker.model_runner.mambaish_config is not None
+            and os.environ.get("SGLANG_DFLASH_TREE_MOE_LINEAR_COMMIT_FALLBACK", "1")
             != "0"
         )
         if use_linear_commit_fallback:
@@ -2343,9 +2352,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             max_tree_depth=block_size,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            allow_cuda_graph=not (
-                use_flashinfer_compact_tree or use_flashinfer_expanded_causal_tree
-            ),
+            allow_cuda_graph=not use_flashinfer_compact_tree,
             compact_kv_indices=compact_kv_indices,
             compact_kv_indptr=compact_kv_indptr,
             compact_qo_indptr=compact_qo_indptr,
@@ -2363,6 +2370,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             and os.environ.get("SGLANG_DFLASH_TREE_REVERIFY_ACCEPTED_COMMIT", "1")
             != "0"
         )
+        expanded_can_run_cuda_graph = False
 
         target_attn_backend_backup = None
         if self._tree_verify_attn_backend is not None:
@@ -2428,13 +2436,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
 
         target_forward_ok = False
+        skip_attn_backend_init = True
         try:
             with verify_context:
                 with self._maybe_use_tree_verify_full_attn_backend(
                     verify_input
                 ) as swapped_full_attn_backend:
                     if swapped_full_attn_backend:
-                        verify_input.allow_cuda_graph = False
+                        graph_runner = target_model_runner.decode_cuda_graph_runner
+                        if not getattr(
+                            graph_runner,
+                            "dflash_tree_graph_uses_full_attn_replacement",
+                            False,
+                        ):
+                            verify_input.allow_cuda_graph = False
 
                     model_worker_batch.out_cache_loc = tree_cache_loc
                     if use_flashinfer_expanded_causal_tree:
@@ -2465,10 +2480,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                             verify_forward_batch.mrope_positions = (
                                 verify_positions.unsqueeze(0).repeat(3, 1)
                             )
-                        verify_forward_batch.allow_cuda_graph = False
-                        target_model_runner.attn_backend.init_forward_metadata(
-                            verify_forward_batch
+                        verify_forward_batch.allow_cuda_graph = (
+                            verify_input.allow_cuda_graph
                         )
+                        expanded_can_run_cuda_graph = bool(
+                            verify_forward_batch.allow_cuda_graph
+                            and target_model_runner.decode_cuda_graph_runner
+                            and target_model_runner.decode_cuda_graph_runner.can_run_graph(
+                                verify_forward_batch
+                            )
+                        )
+                        if expanded_can_run_cuda_graph:
+                            skip_attn_backend_init = None
+                        else:
+                            verify_forward_batch.allow_cuda_graph = False
+                            target_model_runner.attn_backend.init_forward_metadata(
+                                verify_forward_batch
+                            )
                     elif use_flashinfer_compact_tree:
                         assert compact_req_pool_indices is not None
                         assert compact_seq_lens is not None
@@ -2525,7 +2553,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         batch=None,
                         forward_batch=verify_forward_batch,
                         is_verify=True,
-                        skip_attn_backend_init=True,
+                        skip_attn_backend_init=skip_attn_backend_init,
                     )
                     target_forward_ok = True
         finally:
@@ -2553,11 +2581,24 @@ class DFlashWorkerV2(BaseSpecWorker):
                 expanded_mamba_indices = None
             model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
             model_worker_batch.seq_lens_sum = seq_lens_sum_backup
-            if use_reverify_commit and not target_forward_ok:
+            if (
+                use_reverify_commit
+                and not target_forward_ok
+                and pre_tree_mamba_snapshot is not None
+            ):
                 self._restore_persistent_mamba_state(pre_tree_mamba_snapshot)
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
-        if use_reverify_commit:
+        if (
+            use_flashinfer_expanded_causal_tree
+            and can_run_cuda_graph
+            and os.environ.get(
+                "SGLANG_DFLASH_TREE_GRAPH_REVERIFY_ACCEPTED_COMMIT", "1"
+            )
+            != "0"
+        ):
+            use_reverify_commit = True
+        if use_reverify_commit and pre_tree_mamba_snapshot is not None:
             self._restore_persistent_mamba_state(pre_tree_mamba_snapshot)
         if use_flashinfer_expanded_causal_tree:
             depth_index = tree_depths.to(torch.long).clamp(max=block_size - 1)
@@ -2571,7 +2612,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                     bs, tree_budget, 1, expanded_next_token_logits.shape[-1]
                 ),
             ).squeeze(2).reshape(bs * tree_budget, -1)
-            can_run_cuda_graph = False
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
@@ -3494,7 +3534,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             accepted_positions_2d,
         ].to(torch.int64)
 
-        if use_flashinfer_expanded_causal_tree:
+        if reverify_commit_cache_loc_2d is not None:
+            accepted_cache_loc_2d = reverify_commit_cache_loc_2d
+            assign_req_to_token_pool_func(
+                model_worker_batch.req_pool_indices,
+                self.model_runner.req_to_token_pool.req_to_token,
+                prefix_lens,
+                prefix_lens.to(torch.int64) + block_size,
+                accepted_cache_loc_2d.reshape(-1),
+                bs,
+            )
+        elif use_flashinfer_expanded_causal_tree:
             assert expanded_cache_loc_3d is not None
             accept_offsets_2d = accepted_offsets_2d.expand_as(accept_index_local)
             source_cache_loc_2d = expanded_cache_loc_3d[
@@ -3509,16 +3559,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 model_worker_batch.token_to_kv_pool_allocator.get_kvcache(),
                 accepted_cache_loc_2d[valid_offsets],
                 source_cache_loc_2d[valid_offsets],
-            )
-        elif reverify_commit_cache_loc_2d is not None:
-            accepted_cache_loc_2d = reverify_commit_cache_loc_2d
-            assign_req_to_token_pool_func(
-                model_worker_batch.req_pool_indices,
-                self.model_runner.req_to_token_pool.req_to_token,
-                prefix_lens,
-                prefix_lens.to(torch.int64) + block_size,
-                accepted_cache_loc_2d.reshape(-1),
-                bs,
             )
         elif os.environ.get("SGLANG_DFLASH_TREE_LOGICAL_COMMIT"):
             accepted_cache_loc_2d = torch.gather(

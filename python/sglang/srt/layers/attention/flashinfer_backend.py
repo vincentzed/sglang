@@ -1820,6 +1820,12 @@ class FlashInferIndicesUpdaterPrefill:
                 num_tokens_per_req is not None and num_tokens_per_req > 0
             ), f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
             seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
+            kv_lens_cpu_i32 = seq_lens_cpu_i32
+            if (
+                isinstance(spec_info, SpecInput)
+                and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+            ):
+                kv_lens_cpu_i32 = kv_lens_cpu_i32 + int(num_tokens_per_req)
             qo_indptr_host = torch.arange(
                 0,
                 (bs + 1) * num_tokens_per_req,
@@ -1828,13 +1834,13 @@ class FlashInferIndicesUpdaterPrefill:
                 device="cpu",
             )
             kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
-            kv_indptr_host[1:] = torch.cumsum(seq_lens_cpu_i32, dim=0)
+            kv_indptr_host[1:] = torch.cumsum(kv_lens_cpu_i32, dim=0)
             paged_plan_kwargs = dict(
                 qo_indptr_host=qo_indptr_host,
                 kv_indptr_host=kv_indptr_host,
-                kv_lens_host=seq_lens_cpu_i32,
+                kv_lens_host=kv_lens_cpu_i32,
                 max_q_len=num_tokens_per_req,
-                max_kv_len=int(seq_lens_cpu_i32.max()),
+                max_kv_len=int(kv_lens_cpu_i32.max()),
             )
 
         wrapper_paged.begin_forward(

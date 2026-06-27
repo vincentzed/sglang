@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-27 22:37 UTC
+Updated: 2026-06-27 23:45 UTC
 
 ## Done / Committed
 
@@ -8,6 +8,8 @@ Updated: 2026-06-27 22:37 UTC
 - `6dd0f39e75`: MoE Qwen3.6-35B-A3B narrowed to one prompt-4 holdout; known risk was an unguarded Mamba commit control-flow path.
 - `7c80ee7b40`: fixed the Mamba commit control-flow guard in `python/sglang/srt/speculative/dflash_worker_v2.py`; dense Job 0 revalidation stayed token-exact.
 - `5817fc9d2e90`: made the MoE tree path token-exact against a fresh width=1 oracle by using a labeled hybrid/MoE linear-commit fallback for the accepted commit block. This is a correctness fallback, not a direct tree-state commit speedup.
+- `5c2120c5a91c`: recorded Job 1 status and validation artifacts.
+- this commit: enabled DFlash tree target-verify CUDA graphs for dense FlashInfer expanded-causal verify and MoE hybrid-GDN custom-mask verify; dense and MoE cuda-graph gates are token-exact against fresh oracles.
 
 ## Job 0 Validation
 
@@ -37,12 +39,12 @@ Notes:
 
 ## In Progress
 
-Job 2: CUDA graph support for DFlash tree verify, using fixed `tree_budget` padding and EAGLE3-style topk>1 graph buffers/buckets.
+Job 3: normal-mode performance bench with CUDA graph on.
 
 Exact next step:
-- Read the existing EAGLE3 cuda-graph topk>1 path and mirror its fixed-shape/bucket strategy for DFlash tree verify.
-- Start with dense 8B graph capture, then route MoE tree verify through the same GDN topk>1 verify-graph hook.
-- Re-run dense and MoE fresh-oracle losslessness gates with cuda-graph enabled before committing Job 2.
+- Run normal/non-deterministic linear and tree perf for dense 8B and MoE with cuda graph enabled.
+- Re-confirm losslessness in normal mode.
+- Update `jetspec/notes/bench_results.md` with an honest linear-vs-tree table and verdict, then commit the docs.
 
 ## Job 1 Validation
 
@@ -82,6 +84,48 @@ Notes:
 - The committed MoE fix keeps tree verify for candidate evaluation but, by default for hybrid/MoE targets, replays the width=1 linear fallback block for the accepted commit block so persistent KV/GDN state and emitted tokens match the fresh oracle. The fallback is gated by `SGLANG_DFLASH_TREE_MOE_LINEAR_COMMIT_FALLBACK` and can be disabled with `0`.
 - This closes Job 1 correctness but does not prove a MoE tree throughput win; Job 3 must report perf honestly.
 
+## Job 2 Validation
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Dense backend: `--attention-backend flashinfer`
+- MoE model: `Qwen/Qwen3.6-35B-A3B`
+- MoE draft model: `z-lab/Qwen3.6-35B-A3B-DFlash`
+- MoE backends: `--linear-attn-decode-backend cutedsl --linear-attn-prefill-backend cutedsl --mamba-ssm-dtype bfloat16 --attention-backend trtllm_mha`
+- CUDA graph enabled: `--cuda-graph-max-bs-decode 1`, decode backend `full`
+- Harness: `PYTHONPATH=python python jetspec/run_fixed_prompts.py`, 10 fixed prompts, `max_new_tokens=96`
+
+Fresh-oracle artifacts:
+- Dense: `jetspec/runs/job0_8b_linear_nograph_31370.json`
+- MoE: `jetspec/runs/job1_moe_linear_cutedsl_nograph_31380.json`
+
+Artifacts:
+
+| run | artifact | token exact vs fresh oracle | mean accept length | aggregate tok/s |
+|---|---|---:|---:|---:|
+| 8B tree w7/b64 cuda graph | `jetspec/runs/job2_8b_tree_w7_b64_cudagraph_rows_31518.json` | PASS, 10/10 | 4.0495 | 74.71 |
+| 8B tree w7/b128 cuda graph | `jetspec/runs/job2_8b_tree_w7_b128_cudagraph_rows_31519.json` | PASS, 10/10 | 4.5399 | 58.64 |
+| MoE tree w4/b64 cuda graph | `jetspec/runs/job2_moe_tree_w4_b64_cudagraph_31520.json` | PASS, 10/10 | 4.4179 | 80.64 |
+| MoE tree w4/b128 cuda graph | `jetspec/runs/job2_moe_tree_w4_b128_cudagraph_31521.json` | PASS, 10/10 | 4.4179 | 66.40 |
+| MoE tree w7/b64 cuda graph | `jetspec/runs/job2_moe_tree_w7_b64_cudagraph_31522.json` | PASS, 10/10 | 4.4179 | 78.78 |
+| MoE tree w7/b128 cuda graph | `jetspec/runs/job2_moe_tree_w7_b128_cudagraph_31523.json` | PASS, 10/10 | 4.4179 | 67.34 |
+
+CUDA graph evidence:
+- Dense 8B w7/b64 and w7/b128 captured DFlash target-verify CUDA graphs with FlashInfer expanded-causal rows and decode logs reported `cuda graph: True`.
+- MoE w4/w7, budget 64/128 captured DFlash target-verify CUDA graphs with the hybrid-GDN path and a graph-capable `flashinfer` full-attention replacement for the periodic full-attention layers; decode logs reported `cuda graph: True`.
+
+Local checks after Job 2:
+- `git diff --check`: PASS
+- `PYTHONPATH=python python -m py_compile python/sglang/srt/model_executor/runner/eager_runner.py python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py python/sglang/srt/speculative/dflash_worker_v2.py python/sglang/srt/layers/attention/flashinfer_backend.py`: PASS
+- `PYTHONPATH=python python test/registered/unit/spec/test_dflash_tree_construction.py`: PASS, 18 tests
+
+Notes:
+- Dense FlashInfer tree verify uses a graph shape of `tree_budget` expanded rows by `speculative_num_draft_tokens` tokens, with fixed buckets capped to the active request count.
+- MoE hybrid-GDN tree verify uses fixed `tree_budget` tokens per request and reuses the graph-captured full-attention replacement at runtime so target-verify graph replay and eager fallback share the same backend semantics.
+- The MoE correctness path still relies on the labeled accepted-path linear replay fallback introduced in Job 1 for persistent KV/GDN state commit. Job 2 proves cuda graph does not change emitted tokens.
+
 ## Not Started
 
-- Job 3: normal-mode perf bench with CUDA graph on; update `jetspec/notes/bench_results.md` honestly with linear vs tree dense and MoE throughput.
+- None.

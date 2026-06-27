@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
@@ -231,6 +232,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
+        self.dflash_tree_expanded_causal_graph = False
+        self.dflash_tree_graph_rows_per_request = 1
+        self.dflash_tree_graph_uses_full_attn_replacement = False
+        self.dflash_tree_graph_full_attn_backend = None
+        self.dflash_tree_graph_original_full_attn_backend = None
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
@@ -247,9 +253,38 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 and not model_runner.is_draft_worker
                 and model_runner.server_args.speculative_dflash_tree_width > 1
             ):
-                self.num_tokens_per_bs = int(
-                    model_runner.server_args.speculative_dflash_tree_budget
+                active_attn_backend = model_runner.attn_backend
+                while (
+                    getattr(active_attn_backend, "full_attn_backend", None)
+                    is not None
+                ):
+                    active_attn_backend = active_attn_backend.full_attn_backend
+                self.dflash_tree_expanded_causal_graph = (
+                    type(active_attn_backend).__name__ == "FlashInferAttnBackend"
+                    and os.environ.get("SGLANG_DFLASH_TREE_VERIFY_BACKEND") is None
+                    and os.environ.get("SGLANG_DFLASH_TREE_COMPACT_FLASHINFER", "0")
+                    != "1"
+                    and os.environ.get("SGLANG_DFLASH_TREE_EXPANDED_CAUSAL", "1")
+                    != "0"
                 )
+                if self.dflash_tree_expanded_causal_graph:
+                    # FlashInfer's exact tree verifier expands each tree node
+                    # into one causal row of block_size tokens. The graph shape
+                    # is therefore (request_bs * tree_budget) rows by
+                    # block_size tokens, not one row by tree_budget tokens.
+                    self.num_tokens_per_bs = int(self.speculative_num_draft_tokens)
+                    self.dflash_tree_graph_rows_per_request = int(
+                        model_runner.server_args.speculative_dflash_tree_budget
+                    )
+                else:
+                    self.num_tokens_per_bs = int(
+                        model_runner.server_args.speculative_dflash_tree_budget
+                    )
+                # DFlash target verify needs hidden states to materialize the
+                # draft KV cache for the next step. Capture that mode up front
+                # so tree verify can use the initial graphs instead of failing
+                # the hidden-mode check and recapturing/falling back at runtime.
+                self.capture_hidden_mode = CaptureHiddenMode.FULL
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -258,6 +293,53 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
         )
+        if (
+            model_runner.spec_algorithm.is_dflash()
+            and not model_runner.is_draft_worker
+            and model_runner.server_args.speculative_dflash_tree_width > 1
+        ):
+            # DFlash tree target verify uses either tree_budget tokens per
+            # request (custom tree-mask path) or tree_budget expanded rows of
+            # block_size tokens (FlashInfer causal path). The generic decode
+            # capture list goes up to large decode batch sizes, which can make
+            # startup graph capture plan tens of thousands of verify tokens. Cap
+            # tree verify capture to realistic request buckets and roughly the
+            # same total-token scale as EAGLE topk>1.
+            if self.dflash_tree_expanded_causal_graph:
+                row_multiplier = self.dflash_tree_graph_rows_per_request
+                self.capture_bs = sorted(
+                    {int(bs) * row_multiplier for bs in self.capture_bs}
+                )
+                self.compile_bs = sorted(
+                    {int(bs) * row_multiplier for bs in self.compile_bs}
+                )
+            max_running_requests = int(getattr(model_runner, "max_running_requests", 0))
+            max_tree_graph_tokens = 4096
+            if max_running_requests:
+                max_tree_graph_rows = (
+                    max_running_requests * self.dflash_tree_graph_rows_per_request
+                )
+            else:
+                max_tree_graph_rows = max(self.capture_bs)
+            max_tree_capture_bs = max(
+                1,
+                min(
+                    max_tree_graph_rows,
+                    max_tree_graph_tokens // max(1, int(self.num_tokens_per_bs)),
+                ),
+            )
+            self.capture_bs = [bs for bs in self.capture_bs if bs <= max_tree_capture_bs]
+            self.compile_bs = [bs for bs in self.compile_bs if bs <= max_tree_capture_bs]
+            if not self.capture_bs:
+                self.capture_bs = [max_tree_capture_bs]
+            logger.info(
+                "DFLASH tree target verify CUDA graph capture buckets capped to %s "
+                "(tokens_per_bs=%s, rows_per_request=%s, max_running_requests=%s).",
+                self.capture_bs,
+                self.num_tokens_per_bs,
+                self.dflash_tree_graph_rows_per_request,
+                max_running_requests,
+            )
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
@@ -268,6 +350,35 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        if (
+            model_runner.spec_algorithm.is_dflash()
+            and not model_runner.is_draft_worker
+            and model_runner.server_args.speculative_dflash_tree_width > 1
+            and not self.dflash_tree_expanded_causal_graph
+        ):
+            full_attn_backend = getattr(self.attn_backend, "full_attn_backend", None)
+            if type(full_attn_backend).__name__ == "TRTLLMHAAttnBackend":
+                from sglang.srt.layers.attention.attention_registry import (
+                    ATTENTION_BACKENDS,
+                )
+
+                backend_name = os.environ.get(
+                    "SGLANG_DFLASH_TREE_VERIFY_FULL_ATTN_BACKEND", "flashinfer"
+                )
+                self.dflash_tree_graph_full_attn_backend = ATTENTION_BACKENDS[
+                    backend_name
+                ](model_runner)
+                self.dflash_tree_graph_original_full_attn_backend = full_attn_backend
+                self.dflash_tree_graph_uses_full_attn_replacement = True
+                self._set_hybrid_full_attn_backend(
+                    self.attn_backend, self.dflash_tree_graph_full_attn_backend
+                )
+                logger.warning(
+                    "DFLASH tree target verify CUDA graph captures full-attention "
+                    "layers with %s because the configured full-attention backend "
+                    "cannot consume the tree verify mask.",
+                    backend_name,
+                )
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
@@ -277,6 +388,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.dllm_config is None
             else self.dllm_config.block_size
         )
+        if self.dflash_tree_expanded_causal_graph:
+            self.seq_len_fill_value = max(
+                int(self.seq_len_fill_value),
+                int(model_runner.model_config.context_len),
+            )
 
         # Non-zero encoder length ensures cross-attention kernels are captured in the graph.
         self.encoder_len_fill_value = (
@@ -363,6 +479,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+        finally:
+            if self.dflash_tree_graph_original_full_attn_backend is not None:
+                self._set_hybrid_full_attn_backend(
+                    self.attn_backend,
+                    self.dflash_tree_graph_original_full_attn_backend,
+                )
+
+    @staticmethod
+    def _set_hybrid_full_attn_backend(hybrid_backend, full_attn_backend):
+        hybrid_backend.full_attn_backend = full_attn_backend
+        hybrid_backend.attn_backend_list = [
+            full_attn_backend,
+            hybrid_backend.linear_attn_backend,
+        ]
+        hybrid_backend.token_to_kv_pool = full_attn_backend.token_to_kv_pool
+        hybrid_backend.req_to_token_pool = full_attn_backend.req_to_token_pool
+        hybrid_backend.max_context_len = getattr(
+            full_attn_backend, "max_context_len", None
+        )
+        hybrid_backend.needs_cpu_seq_lens = (
+            full_attn_backend.needs_cpu_seq_lens
+            or hybrid_backend.linear_attn_backend.needs_cpu_seq_lens
+        )
 
     def _autotune_buffers(self):
         """Reuse these static decode buffers (sized to max_bs) for the warmup
@@ -1086,7 +1225,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if not self.model_runner.is_draft_worker:
                 custom_mask = (
                     self.buffers.custom_mask
-                    if topk > 1 or build_custom_mask
+                    if (
+                        not self.dflash_tree_expanded_causal_graph
+                        and (topk > 1 or build_custom_mask)
+                    )
                     else None
                 )
             spec_info = DFlashVerifyInput(
@@ -1100,6 +1242,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if self.model_runner.is_draft_worker
                     else CaptureHiddenMode.FULL
                 ),
+                force_causal=self.dflash_tree_expanded_causal_graph,
+                num_tokens_per_batch=self.num_tokens_per_bs,
             )
 
         elif self.model_runner.spec_algorithm.is_ngram():

@@ -157,19 +157,20 @@ class EagerRunner(BaseRunner):
         be optimal at decode. The eager input registry spans the prefill token
         ceiling; the dummy run only needs the decode-sized slice.
         """
+        batch_size = self._eager_max_bs
         mr = self.model_runner
-        num_tokens_per_bs = 1
-        if mr.spec_algorithm.is_speculative():
-            num_tokens_per_bs = (
-                mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
-                )
-            )
+        if (
+            not mr.is_draft_worker
+            and mr.spec_algorithm.is_dflash()
+            and mr.server_args.speculative_dflash_tree_width > 1
+        ):
+            batch_size = mr.max_running_requests
         return (
             self._alloc_dummy_decode_buffers(
-                self._eager_max_bs, num_tokens_per_bs=num_tokens_per_bs
+                batch_size,
+                num_tokens_per_bs=self._eager_num_tokens_per_bs,
             ),
-            self._eager_max_bs,
+            batch_size,
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
