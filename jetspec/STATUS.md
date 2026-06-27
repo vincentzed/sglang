@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-27 23:54 UTC
+Updated: 2026-06-27 23:56 UTC
 
 ## Done / Committed
 
@@ -11,7 +11,7 @@ Updated: 2026-06-27 23:54 UTC
 - `5c2120c5a91c`: recorded Job 1 status and validation artifacts.
 - `11c65c076d`: enabled DFlash tree target-verify CUDA graphs for dense FlashInfer expanded-causal verify and MoE hybrid-GDN custom-mask verify; dense and MoE cuda-graph gates are token-exact against fresh oracles.
 - `ff275594dd`: recorded Job 2 status and validation artifacts.
-- this commit: recorded Job 3 normal-mode CUDA graph performance results and verdict in `jetspec/notes/bench_results.md`.
+- `e8d533a19c`: recorded Job 3 normal-mode CUDA graph performance results and verdict in `jetspec/notes/bench_results.md`.
 
 ## Job 0 Validation
 
