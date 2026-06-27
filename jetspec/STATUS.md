@@ -6,7 +6,7 @@ Updated: 2026-06-27 19:55 UTC
 
 - `8f9e732f2c`: dense Qwen3-8B tree verify was previously token-exact.
 - `6dd0f39e75`: MoE Qwen3.6-35B-A3B narrowed to one prompt-4 holdout; known risk was an unguarded Mamba commit control-flow path.
-- Pending Job 0 commit: fixed the Mamba commit control-flow guard in `python/sglang/srt/speculative/dflash_worker_v2.py`.
+- `7c80ee7b40`: fixed the Mamba commit control-flow guard in `python/sglang/srt/speculative/dflash_worker_v2.py`; dense Job 0 revalidation stayed token-exact.
 
 ## Job 0 Validation
 
