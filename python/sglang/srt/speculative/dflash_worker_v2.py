@@ -334,13 +334,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._tree_verify_full_attn_backend is None:
             from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 
-            self._tree_verify_full_attn_backend = ATTENTION_BACKENDS["triton"](
+            backend_name = os.environ.get(
+                "SGLANG_DFLASH_TREE_VERIFY_FULL_ATTN_BACKEND", "torch_native"
+            )
+            self._tree_verify_full_attn_backend = ATTENTION_BACKENDS[backend_name](
                 self.target_worker.model_runner
             )
             logger.warning(
-                "DFLASH tree target verify uses Triton for full-attention layers "
+                "DFLASH tree target verify uses %s for full-attention layers "
                 "because the configured full-attention backend cannot consume the "
-                "tree verify mask/causal path."
+                "tree verify mask/causal path.",
+                backend_name,
             )
         return self._tree_verify_full_attn_backend
 
@@ -388,6 +392,306 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._set_hybrid_full_attn_backend(
                 target_attn_backend, original_full_attn_backend
             )
+
+    def _snapshot_persistent_mamba_state(
+        self,
+        model_worker_batch: ScheduleBatch,
+        bs: int,
+    ):
+        target_model_runner = self.target_worker.model_runner
+        linear_backend = getattr(
+            target_model_runner.attn_backend, "linear_attn_backend", None
+        )
+        if linear_backend is None:
+            return None
+        try:
+            mamba_caches = (
+                linear_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            )
+            state_indices = linear_backend.req_to_token_pool.get_mamba_indices(
+                model_worker_batch.req_pool_indices
+            )[:bs].to(torch.long)
+            conv_snapshots = [
+                conv_cache[:, state_indices].clone()
+                for conv_cache in mamba_caches.conv
+            ]
+            return (
+                state_indices,
+                mamba_caches.temporal[:, state_indices].clone(),
+                conv_snapshots,
+            )
+        except Exception:
+            logger.exception("DFLASH tree failed to snapshot persistent mamba state")
+            return None
+
+    def _restore_persistent_mamba_state(self, snapshot) -> None:
+        if snapshot is None:
+            return
+        target_model_runner = self.target_worker.model_runner
+        linear_backend = getattr(
+            target_model_runner.attn_backend, "linear_attn_backend", None
+        )
+        if linear_backend is None:
+            return
+        try:
+            mamba_caches = (
+                linear_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            )
+            state_indices, temporal_snapshot, conv_snapshots = snapshot
+            mamba_caches.temporal[:, state_indices] = temporal_snapshot
+            for conv_cache, conv_snapshot in zip(mamba_caches.conv, conv_snapshots):
+                conv_cache[:, state_indices] = conv_snapshot
+        except Exception:
+            logger.exception("DFLASH tree failed to restore persistent mamba state")
+
+    def _commit_selected_persistent_mamba_snapshots(
+        self,
+        snapshots,
+        commit_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        model_worker_batch: ScheduleBatch,
+    ) -> None:
+        if not snapshots:
+            return
+        target_model_runner = self.target_worker.model_runner
+        linear_backend = getattr(
+            target_model_runner.attn_backend, "linear_attn_backend", None
+        )
+        if linear_backend is None:
+            return
+        try:
+            mamba_caches = (
+                linear_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            )
+
+            def copy_snapshot_row(snapshot, row: int, dst_slot: torch.Tensor) -> None:
+                _, temporal_snapshot, conv_snapshots = snapshot
+                mamba_caches.temporal[:, dst_slot] = temporal_snapshot[:, row]
+                for conv_cache, conv_snapshot in zip(
+                    mamba_caches.conv, conv_snapshots
+                ):
+                    conv_cache[:, dst_slot] = conv_snapshot[:, row]
+
+            state_indices = snapshots[0][0]
+            bs = int(commit_lens.shape[0])
+            for row in range(bs):
+                step = max(0, int(commit_lens[row].item()) - 1)
+                step = min(step, len(snapshots) - 1)
+                copy_snapshot_row(snapshots[step], row, state_indices[row])
+
+            if model_worker_batch.mamba_track_indices is None:
+                return
+
+            mamba_track_interval = get_global_server_args().mamba_track_interval
+            seq_lens_post_verify = prefix_lens + commit_lens.to(prefix_lens.dtype)
+            to_track_mask = (
+                prefix_lens // mamba_track_interval
+                != seq_lens_post_verify // mamba_track_interval
+            )
+            tracking_point = (
+                seq_lens_post_verify
+                // mamba_track_interval
+                * mamba_track_interval
+            )
+            to_track_ith = torch.clamp(tracking_point - prefix_lens - 1, min=0).to(
+                torch.long
+            )
+            for row in range(bs):
+                if not bool(to_track_mask[row].item()):
+                    continue
+                step = max(0, int(to_track_ith[row].item()))
+                step = min(step, len(snapshots) - 1)
+                dst_slot = model_worker_batch.mamba_track_indices[row].to(torch.long)
+                copy_snapshot_row(snapshots[step], row, dst_slot)
+        except Exception:
+            logger.exception(
+                "DFLASH tree failed to commit selected persistent mamba snapshot"
+            )
+
+    def _commit_latest_verify_mamba_state(
+        self,
+        model_worker_batch: ScheduleBatch,
+        bs: int,
+    ) -> None:
+        target_model_runner = self.target_worker.model_runner
+        linear_backend = getattr(
+            target_model_runner.attn_backend, "linear_attn_backend", None
+        )
+        if linear_backend is None:
+            return
+        linear_metadata = getattr(linear_backend, "forward_metadata", None)
+        if linear_metadata is None:
+            return
+        try:
+            state_indices = linear_metadata.mamba_cache_indices[:bs].to(torch.long)
+            mamba_caches = (
+                linear_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            )
+            mamba_caches.temporal[:, state_indices] = (
+                mamba_caches.intermediate_ssm[:, state_indices, 0]
+            )
+            for conv_idx, conv_cache in enumerate(mamba_caches.conv):
+                conv_cache[:, state_indices] = (
+                    mamba_caches.intermediate_conv_window[conv_idx][
+                        :, state_indices, 0
+                    ]
+                )
+        except Exception:
+            logger.exception("DFLASH tree failed to commit latest verify mamba state")
+
+    def _reverify_accepted_tree_path_for_commit(
+        self,
+        *,
+        model_worker_batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        tree_tokens: torch.Tensor,
+        tree_cache_loc_2d: torch.Tensor,
+        linear_fallback_tokens: torch.Tensor,
+        accept_index_local: torch.Tensor,
+        commit_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+    ) -> tuple[
+        Optional[torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[list],
+    ]:
+        """Replay the accepted tree path as a causal verify for exact state commit.
+
+        Hybrid MoE models can produce shape-sensitive full-attention KV during the
+        wide tree verify even when the accepted token predictions match a linear
+        replay. Commit the linear replay's KV/hidden/mamba intermediates so the
+        persistent state remains identical to width=1 decode.
+        """
+
+        bs = int(tree_tokens.shape[0])
+        block_size = int(self.block_size)
+        device = tree_tokens.device
+        path_pos = torch.arange(block_size, dtype=torch.long, device=device)
+        path_mask = path_pos.unsqueeze(0) < commit_lens.to(torch.long).unsqueeze(1)
+
+        branch_cache_alloc: Optional[torch.Tensor] = None
+        branch_cache_loc_2d = tree_cache_loc_2d[:, :block_size].to(torch.int64)
+
+        accepted_path_tokens = torch.gather(tree_tokens, 1, accept_index_local)
+        branch_tokens = torch.where(
+            path_mask,
+            accepted_path_tokens,
+            linear_fallback_tokens[:, :block_size].to(accepted_path_tokens.dtype),
+        )
+        branch_positions_2d = prefix_lens.to(torch.int64).unsqueeze(
+            1
+        ) + path_pos.to(torch.int64).unsqueeze(0)
+
+        branch_verify_input = DFlashVerifyInput(
+            draft_token=branch_tokens.reshape(-1),
+            positions=branch_positions_2d.reshape(-1),
+            draft_token_num=block_size,
+            custom_mask=None,
+            force_causal=False,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            allow_cuda_graph=False,
+        )
+
+        persistent_mamba_snapshot = self._snapshot_persistent_mamba_state(
+            model_worker_batch, bs
+        )
+
+        batch_input_ids_backup = model_worker_batch.input_ids
+        batch_spec_info_backup = model_worker_batch.spec_info
+        batch_forward_mode_backup = model_worker_batch.forward_mode
+        batch_capture_hidden_mode_backup = model_worker_batch.capture_hidden_mode
+        batch_out_cache_loc_backup = model_worker_batch.out_cache_loc
+        batch_seq_lens_backup = model_worker_batch.seq_lens
+        seq_lens_cpu_backup = model_worker_batch.seq_lens_cpu
+        seq_lens_sum_backup = model_worker_batch.seq_lens_sum
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        req_rows = model_worker_batch.req_pool_indices.to(torch.long).unsqueeze(1)
+        branch_req_to_token_backup = req_to_token[
+            req_rows,
+            branch_positions_2d,
+        ].clone()
+        req_to_token[req_rows, branch_positions_2d] = branch_cache_loc_2d.to(
+            req_to_token.dtype
+        )
+        branch_verify_context = nullcontext()
+        branch_hidden_steps = []
+        branch_target_predict_steps = []
+        mamba_state_snapshots = []
+        try:
+            with branch_verify_context:
+                for step in range(block_size):
+                    step_prefix_lens = prefix_lens + step
+                    step_verify_input = DFlashVerifyInput(
+                        draft_token=branch_tokens[:, step].contiguous(),
+                        positions=branch_positions_2d[:, step].contiguous(),
+                        draft_token_num=1,
+                        custom_mask=None,
+                        force_causal=False,
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        allow_cuda_graph=False,
+                    )
+                    model_worker_batch.out_cache_loc = branch_cache_loc_2d[
+                        :, step
+                    ].contiguous()
+                    model_worker_batch.seq_lens = step_prefix_lens
+                    model_worker_batch.seq_lens_cpu = step_prefix_lens.to(
+                        device="cpu", dtype=torch.int32
+                    )
+                    model_worker_batch.seq_lens_sum = int(
+                        step_prefix_lens.sum().item()
+                    )
+
+                    branch_forward_batch, _ = step_verify_input.prepare_for_verify(
+                        model_worker_batch, self.target_worker
+                    )
+                    branch_target_out = self.target_worker.forward_batch_generation(
+                        batch=None,
+                        forward_batch=branch_forward_batch,
+                        is_verify=True,
+                        skip_attn_backend_init=True,
+                    )
+                    step_hidden = branch_target_out.logits_output.hidden_states
+                    if step_hidden is None:
+                        raise RuntimeError(
+                            "DFLASH accepted-path reverify requires hidden states, "
+                            "but got None."
+                        )
+                    branch_hidden_steps.append(step_hidden.view(bs, -1))
+                    branch_target_predict_steps.append(
+                        torch.argmax(
+                            branch_target_out.logits_output.next_token_logits,
+                            dim=-1,
+                        ).view(bs)
+                    )
+                    self._commit_latest_verify_mamba_state(model_worker_batch, bs)
+                    mamba_state_snapshots.append(
+                        self._snapshot_persistent_mamba_state(model_worker_batch, bs)
+                    )
+        finally:
+            req_to_token[req_rows, branch_positions_2d] = branch_req_to_token_backup
+            model_worker_batch.input_ids = batch_input_ids_backup
+            model_worker_batch.spec_info = batch_spec_info_backup
+            model_worker_batch.forward_mode = batch_forward_mode_backup
+            model_worker_batch.capture_hidden_mode = batch_capture_hidden_mode_backup
+            model_worker_batch.out_cache_loc = batch_out_cache_loc_backup
+            model_worker_batch.seq_lens = batch_seq_lens_backup
+            model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
+            model_worker_batch.seq_lens_sum = seq_lens_sum_backup
+            self._restore_persistent_mamba_state(persistent_mamba_snapshot)
+
+        branch_hidden = torch.stack(branch_hidden_steps, dim=1)
+        branch_target_predict = torch.stack(branch_target_predict_steps, dim=1)
+        return (
+            branch_cache_alloc,
+            branch_cache_loc_2d.to(torch.int64),
+            branch_hidden,
+            branch_target_predict,
+            branch_tokens,
+            mamba_state_snapshots,
+        )
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -1552,11 +1856,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
+        assert self._draft_block_tokens_buf is not None
         assert self._draft_verify_out_cache_loc_buf is not None
         assert self._draft_block_end_buf is not None
         assert self._draft_seq_lens_cpu_buf is not None
 
         block_ids = self._draft_block_ids_buf[:bs]
+        linear_draft_tokens = self._draft_block_tokens_buf[:bs]
         prefix_lens = model_worker_batch.seq_lens
         positions_2d = self._draft_block_positions_buf[:bs]
         verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
@@ -1677,6 +1983,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         topk_logprobs = topk_logprobs.view(bs, depth_count, tree_width)
         topk_tokens = topk_tokens.view(bs, depth_count, tree_width)
+        linear_draft_tokens[:, 0].copy_(block_ids[:, 0])
+        if depth_count > 0:
+            linear_draft_tokens[:, 1:].copy_(topk_tokens[:, :, 0])
 
         tree_tokens = torch.zeros((bs, tree_budget), dtype=torch.long, device=device)
         tree_parents = torch.zeros((bs, tree_budget), dtype=torch.long, device=device)
@@ -1753,10 +2062,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             and os.environ.get("SGLANG_DFLASH_TREE_COMPACT_FLASHINFER", "0") == "1"
         )
         use_flashinfer_expanded_causal_tree = (
-            (
-                type(active_target_attn_backend).__name__ == "FlashInferAttnBackend"
-                or target_model_runner.mambaish_config is not None
-            )
+            type(active_target_attn_backend).__name__ == "FlashInferAttnBackend"
             and self._tree_verify_attn_backend is None
             and not use_flashinfer_compact_tree
             and os.environ.get("SGLANG_DFLASH_TREE_EXPANDED_CAUSAL", "1") != "0"
@@ -2031,6 +2337,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             num_tokens_per_batch=verify_draft_token_num,
         )
+        use_reverify_commit = (
+            target_model_runner.mambaish_config is not None
+            and not use_flashinfer_expanded_causal_tree
+            and os.environ.get("SGLANG_DFLASH_TREE_REVERIFY_ACCEPTED_COMMIT", "1")
+            != "0"
+        )
 
         target_attn_backend_backup = None
         if self._tree_verify_attn_backend is not None:
@@ -2044,6 +2356,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         seq_lens_cpu_backup = model_worker_batch.seq_lens_cpu
         seq_lens_sum_backup = model_worker_batch.seq_lens_sum
+        pre_tree_mamba_snapshot = (
+            self._snapshot_persistent_mamba_state(model_worker_batch, bs)
+            if use_reverify_commit
+            else None
+        )
         compare_persistent_mamba_snapshot = None
         if os.environ.get("SGLANG_DFLASH_TREE_COMPARE_CAUSAL"):
             linear_backend = getattr(
@@ -2216,8 +2533,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 expanded_mamba_indices = None
             model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
             model_worker_batch.seq_lens_sum = seq_lens_sum_backup
+            if use_reverify_commit and not target_forward_ok:
+                self._restore_persistent_mamba_state(pre_tree_mamba_snapshot)
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+        if use_reverify_commit:
+            self._restore_persistent_mamba_state(pre_tree_mamba_snapshot)
         if use_flashinfer_expanded_causal_tree:
             depth_index = tree_depths.to(torch.long).clamp(max=block_size - 1)
             expanded_next_token_logits = logits_output.next_token_logits.view(
@@ -3045,6 +3366,70 @@ class DFlashWorkerV2(BaseSpecWorker):
                         branch_cache_alloc
                     )
 
+        reverify_commit_cache_alloc = None
+        reverify_commit_cache_loc_2d = None
+        reverify_commit_hidden = None
+        reverify_target_predict = None
+        reverify_candidates = None
+        reverify_mamba_state_snapshots = None
+        if use_reverify_commit:
+            (
+                reverify_commit_cache_alloc,
+                reverify_commit_cache_loc_2d,
+                reverify_commit_hidden,
+                reverify_target_predict,
+                reverify_candidates,
+                reverify_mamba_state_snapshots,
+            ) = self._reverify_accepted_tree_path_for_commit(
+                model_worker_batch=model_worker_batch,
+                draft_input=draft_input,
+                tree_tokens=tree_tokens,
+                tree_cache_loc_2d=tree_cache_loc_2d,
+                linear_fallback_tokens=linear_draft_tokens,
+                accept_index_local=accept_index_local,
+                commit_lens=commit_lens,
+                prefix_lens=prefix_lens,
+            )
+            reverify_accept_len, reverify_bonus = (
+                compute_dflash_correct_drafts_and_bonus(
+                    candidates=reverify_candidates,
+                    target_predict=reverify_target_predict,
+                )
+            )
+            # The replay only validates the tree-selected path. If tree verify
+            # stopped earlier than the replay would, keep the tree boundary.
+            num_correct_drafts = torch.minimum(
+                num_correct_drafts, reverify_accept_len.to(num_correct_drafts.dtype)
+            )
+            commit_lens = num_correct_drafts + 1
+            bonus = reverify_target_predict[
+                req_indices,
+                num_correct_drafts.to(torch.long),
+            ].to(torch.int64)
+            if os.environ.get("SGLANG_DFLASH_TREE_REVERIFY_DEBUG"):
+                logger.info(
+                    "DFLASH tree reverify accept prefix=%s candidates=%s "
+                    "target_predict=%s old_correct=%s new_correct=%s bonus=%s",
+                    prefix_lens.detach().cpu().tolist(),
+                    reverify_candidates.detach().cpu().tolist(),
+                    reverify_target_predict.detach().cpu().tolist(),
+                    reverify_accept_len.detach().cpu().tolist(),
+                    num_correct_drafts.detach().cpu().tolist(),
+                    bonus.detach().cpu().tolist(),
+                )
+            out_tokens.zero_()
+            if block_size > 1:
+                out_tokens[:, : block_size - 1].copy_(reverify_candidates[:, 1:])
+            out_tokens.scatter_(
+                1, num_correct_drafts.to(torch.long)[:, None], bonus[:, None]
+            )
+            self._commit_selected_persistent_mamba_snapshots(
+                reverify_mamba_state_snapshots,
+                commit_lens,
+                prefix_lens,
+                model_worker_batch,
+            )
+
         accepted_offsets_2d = torch.arange(
             block_size, dtype=torch.int64, device=device
         ).unsqueeze(0)
@@ -3072,6 +3457,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accepted_cache_loc_2d[valid_offsets],
                 source_cache_loc_2d[valid_offsets],
             )
+        elif reverify_commit_cache_loc_2d is not None:
+            accepted_cache_loc_2d = reverify_commit_cache_loc_2d
         elif os.environ.get("SGLANG_DFLASH_TREE_LOGICAL_COMMIT"):
             accepted_cache_loc_2d = torch.gather(
                 tree_cache_loc_2d,
@@ -3154,24 +3541,53 @@ class DFlashWorkerV2(BaseSpecWorker):
             req_to_token_pool.mamba_allocator.free(expanded_mamba_indices)
             expanded_mamba_indices = None
         else:
-            commit_mamba_states_after_verify(
-                self.target_worker,
-                model_worker_batch,
-                commit_lens,
-                accept_index,
-                tree_budget,
-            )
+            if use_reverify_commit and reverify_mamba_state_snapshots is not None:
+                pass
+            else:
+                if use_reverify_commit:
+                    accept_index_for_mamba_commit = (
+                        torch.arange(
+                            block_size, dtype=accept_index.dtype, device=device
+                        )
+                        .unsqueeze(0)
+                        .expand(bs, block_size)
+                        + torch.arange(
+                            0,
+                            bs * block_size,
+                            step=block_size,
+                            dtype=accept_index.dtype,
+                            device=device,
+                        ).unsqueeze(1)
+                    )
+                    mamba_commit_draft_token_num = block_size
+                else:
+                    accept_index_for_mamba_commit = accept_index
+                    mamba_commit_draft_token_num = tree_budget
+                commit_mamba_states_after_verify(
+                    self.target_worker,
+                    model_worker_batch,
+                    commit_lens,
+                    accept_index_for_mamba_commit,
+                    mamba_commit_draft_token_num,
+                )
 
         new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
             on_publish(new_seq_lens)
 
-        hidden = logits_output.hidden_states
+        hidden = (
+            reverify_commit_hidden
+            if reverify_commit_hidden is not None
+            else logits_output.hidden_states
+        )
         if hidden is None:
             raise RuntimeError(
                 "DFLASH tree verify requires target hidden states, but got None."
             )
-        if use_flashinfer_expanded_causal_tree:
+        if reverify_commit_hidden is not None:
+            hidden = hidden.view(bs, block_size, -1)
+            accepted_hidden = hidden
+        elif use_flashinfer_expanded_causal_tree:
             hidden = hidden.view(bs, tree_budget, block_size, -1)
             accepted_hidden = hidden[
                 req_indices.to(torch.long).unsqueeze(1),
@@ -3193,20 +3609,26 @@ class DFlashWorkerV2(BaseSpecWorker):
             cache_loc_2d=accepted_cache_loc_2d,
             positions=accepted_positions_2d.reshape(-1),
             commit_lens=commit_lens,
-        )
+            )
 
         logits_output.hidden_states = None
         verify_done = torch.get_device_module(device).Event()
         verify_done.record()
         if (
-            expanded_cache_loc is not None
+            (expanded_cache_loc is not None or reverify_commit_cache_alloc is not None)
             and os.environ.get("SGLANG_DFLASH_TREE_KEEP_SCRATCH", "0") != "1"
         ):
             verify_done.synchronize()
-            model_worker_batch.tree_cache.token_to_kv_pool_allocator.free(
-                expanded_cache_loc
-            )
-            expanded_cache_loc = None
+            if expanded_cache_loc is not None:
+                model_worker_batch.tree_cache.token_to_kv_pool_allocator.free(
+                    expanded_cache_loc
+                )
+                expanded_cache_loc = None
+            if reverify_commit_cache_alloc is not None:
+                model_worker_batch.tree_cache.token_to_kv_pool_allocator.free(
+                    reverify_commit_cache_alloc
+                )
+                reverify_commit_cache_alloc = None
 
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus,
