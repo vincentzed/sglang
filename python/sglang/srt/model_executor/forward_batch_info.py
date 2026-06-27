@@ -427,6 +427,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # === Resolved from SB one-shot overrides (consumed + reset by init_new) ===
     capture_hidden_mode: CaptureHiddenMode = None
+    allow_cuda_graph: bool = True
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 

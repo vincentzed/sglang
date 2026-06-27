@@ -1577,11 +1577,22 @@ class DFlashWorkerV2(BaseSpecWorker):
         topk_logprobs = topk_logprobs.view(bs, depth_count, tree_width)
         topk_tokens = topk_tokens.view(bs, depth_count, tree_width)
 
+        need_mamba_verify_commit = hasattr(
+            self.target_worker.model_runner.attn_backend,
+            "update_mamba_state_after_mtp_verify",
+        )
+        # Hybrid Mamba/linear-attention target verify kernels size their MTP
+        # intermediate state for the linear DFlash block. The exploratory tree
+        # pass can exceed that size, so Mamba targets use the draft tree only to
+        # pick a branch, then causally reverify that branch before committing.
+        use_draft_branch_only = need_mamba_verify_commit
+
         tree_tokens = torch.zeros((bs, tree_budget), dtype=torch.long, device=device)
         tree_parents = torch.zeros((bs, tree_budget), dtype=torch.long, device=device)
         tree_depths = torch.ones((bs, tree_budget), dtype=torch.long, device=device)
         num_real_nodes: list[int] = []
         tree_parent_rows: list[torch.Tensor] = []
+        draft_branch_paths: list[list[int]] = []
         for i in range(bs):
             tree: DraftTreeCPU = build_tree_from_topk_cpu(
                 int(block_ids[i, 0].item()),
@@ -1602,65 +1613,141 @@ class DFlashWorkerV2(BaseSpecWorker):
             tree_parents[i, :num_nodes].copy_(parent_row)
             tree_depths[i, :num_nodes].copy_(depth_row)
             tree_parent_rows.append(tree_parents[i])
+            draft_branch_paths.append(tree.longest_path()[:block_size])
 
         tree_positions_2d = prefix_lens.to(torch.int64).unsqueeze(1) + tree_depths
+        verify_cache_tokens = block_size if use_draft_branch_only else tree_budget
         tree_cache_loc = assign_extend_cache_locs_func(
             req_pool_indices=model_worker_batch.req_pool_indices,
             req_to_token=self.model_runner.req_to_token_pool.req_to_token,
             start_offset=prefix_lens,
-            end_offset=prefix_lens + tree_budget,
+            end_offset=prefix_lens + verify_cache_tokens,
             batch_size=bs,
-            draft_token_num=tree_budget,
+            draft_token_num=verify_cache_tokens,
             device=device,
         )
-        tree_cache_loc_2d = tree_cache_loc.view(bs, tree_budget)
+        tree_cache_loc_2d = tree_cache_loc.view(bs, verify_cache_tokens)
 
-        custom_mask = build_tree_custom_mask(
-            parent_indices_batch=tree_parent_rows,
-            num_real_nodes=num_real_nodes,
-            prefix_lens=prefix_lens,
-            num_verify_tokens=tree_budget,
+        branch_candidates = torch.full(
+            (bs, block_size),
+            int(self._mask_token_id),
+            dtype=torch.long,
             device=device,
         )
-        retrieve_index_rows = []
-        retrieve_next_token_rows = []
-        retrieve_next_sibling_rows = []
-        for parents in tree_parent_rows:
-            retrieve_index, retrieve_next_token, retrieve_next_sibling = (
-                build_retrieve_links_from_parents(
-                    parents,
-                    num_verify_tokens=tree_budget,
+        branch_path_lens = torch.empty((bs,), dtype=torch.int32, device=device)
+
+        if use_draft_branch_only:
+            for i, path in enumerate(draft_branch_paths):
+                path_tensor = torch.tensor(path, dtype=torch.long, device=device)
+                branch_len = int(path_tensor.numel())
+                branch_path_lens[i] = branch_len
+                branch_candidates[i, :branch_len].copy_(
+                    torch.index_select(tree_tokens[i], 0, path_tensor)
                 )
+        else:
+            custom_mask = build_tree_custom_mask(
+                parent_indices_batch=tree_parent_rows,
+                num_real_nodes=num_real_nodes,
+                prefix_lens=prefix_lens,
+                num_verify_tokens=tree_budget,
+                device=device,
             )
-            retrieve_index_rows.append(retrieve_index)
-            retrieve_next_token_rows.append(retrieve_next_token)
-            retrieve_next_sibling_rows.append(retrieve_next_sibling)
+            retrieve_index_rows = []
+            retrieve_next_token_rows = []
+            retrieve_next_sibling_rows = []
+            for parents in tree_parent_rows:
+                retrieve_index, retrieve_next_token, retrieve_next_sibling = (
+                    build_retrieve_links_from_parents(
+                        parents,
+                        num_verify_tokens=tree_budget,
+                    )
+                )
+                retrieve_index_rows.append(retrieve_index)
+                retrieve_next_token_rows.append(retrieve_next_token)
+                retrieve_next_sibling_rows.append(retrieve_next_sibling)
 
-        verify_input = DFlashVerifyInput(
-            draft_token=tree_tokens.reshape(-1),
-            positions=tree_positions_2d.reshape(-1),
-            draft_token_num=tree_budget,
-            topk=tree_width,
-            custom_mask=custom_mask,
-            retrieve_index=torch.stack(retrieve_index_rows, dim=0),
-            retrieve_next_token=torch.stack(retrieve_next_token_rows, dim=0),
-            retrieve_next_sibling=torch.stack(retrieve_next_sibling_rows, dim=0),
-            max_tree_depth=block_size,
+            verify_input = DFlashVerifyInput(
+                draft_token=tree_tokens.reshape(-1),
+                positions=tree_positions_2d.reshape(-1),
+                draft_token_num=tree_budget,
+                topk=tree_width,
+                custom_mask=custom_mask,
+                retrieve_index=torch.stack(retrieve_index_rows, dim=0),
+                retrieve_next_token=torch.stack(retrieve_next_token_rows, dim=0),
+                retrieve_next_sibling=torch.stack(retrieve_next_sibling_rows, dim=0),
+                max_tree_depth=block_size,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                allow_cuda_graph=False,
+                num_tokens_per_batch=tree_budget,
+            )
+
+            model_worker_batch.out_cache_loc = tree_cache_loc
+
+            seq_lens_cpu_backup = model_worker_batch.seq_lens_cpu
+            seq_lens_sum_backup = model_worker_batch.seq_lens_sum
+            if draft_input.planning_seq_lens_cpu is not None:
+                model_worker_batch.seq_lens_cpu = draft_input.planning_seq_lens_cpu
+                model_worker_batch.seq_lens_sum = int(draft_input.planning_seq_lens_sum)
+            elif draft_input.reserved_seq_lens_cpu is not None:
+                model_worker_batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
+                model_worker_batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+
+            verify_forward_batch, _ = verify_input.prepare_for_verify(
+                model_worker_batch, self.target_worker
+            )
+            model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
+            model_worker_batch.seq_lens_sum = seq_lens_sum_backup
+
+            target_out = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=True,
+            )
+            logits_output = target_out.logits_output
+            if sampling_info is not None:
+                apply_dflash_verify_logits_adjustments(
+                    next_token_logits=logits_output.next_token_logits,
+                    sampling_info=sampling_info,
+                    draft_token_num=tree_budget,
+                )
+
+            tree_target_predict = torch.argmax(
+                logits_output.next_token_logits, dim=-1
+            ).view(bs, tree_budget)
+            for i in range(bs):
+                path, _, _ = tree_accept_greedy(
+                    tree_tokens[i],
+                    tree_parents[i],
+                    tree_target_predict[i],
+                    num_nodes=num_real_nodes[i],
+                )
+                path = path[:block_size]
+                path_tensor = torch.tensor(path, dtype=torch.long, device=device)
+                branch_len = int(path_tensor.numel())
+                branch_path_lens[i] = branch_len
+                branch_candidates[i, :branch_len].copy_(
+                    torch.index_select(tree_tokens[i], 0, path_tensor)
+                )
+
+        seq_lens_pre_verify = (
+            model_worker_batch.seq_lens.clone() if need_mamba_verify_commit else None
+        )
+
+        branch_positions_2d = prefix_lens.to(torch.int64).unsqueeze(1) + torch.arange(
+            block_size, dtype=torch.int64, device=device
+        ).unsqueeze(0)
+        branch_cache_loc_2d = tree_cache_loc_2d[:, :block_size].clone()
+        branch_verify_input = DFlashVerifyInput(
+            draft_token=branch_candidates.reshape(-1),
+            positions=branch_positions_2d.reshape(-1),
+            draft_token_num=block_size,
+            custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             allow_cuda_graph=False,
-            num_tokens_per_batch=tree_budget,
         )
 
-        model_worker_batch.out_cache_loc = tree_cache_loc
-        need_mamba_verify_commit = hasattr(
-            self.target_worker.model_runner.attn_backend,
-            "update_mamba_state_after_mtp_verify",
-        )
-        if need_mamba_verify_commit:
-            raise NotImplementedError(
-                "DFLASH tree mode does not support Mamba state commit yet."
-            )
-
+        model_worker_batch.out_cache_loc = branch_cache_loc_2d.reshape(-1)
         seq_lens_cpu_backup = model_worker_batch.seq_lens_cpu
         seq_lens_sum_backup = model_worker_batch.seq_lens_sum
         if draft_input.planning_seq_lens_cpu is not None:
@@ -1670,85 +1757,77 @@ class DFlashWorkerV2(BaseSpecWorker):
             model_worker_batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
             model_worker_batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
 
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
+        branch_forward_batch, _ = branch_verify_input.prepare_for_verify(
             model_worker_batch, self.target_worker
         )
         model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
         model_worker_batch.seq_lens_sum = seq_lens_sum_backup
 
-        target_out = self.target_worker.forward_batch_generation(
+        branch_target_out = self.target_worker.forward_batch_generation(
             batch=None,
-            forward_batch=verify_forward_batch,
+            forward_batch=branch_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
         )
-        logits_output = target_out.logits_output
+        logits_output = branch_target_out.logits_output
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=tree_budget,
+                draft_token_num=block_size,
             )
 
-        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-            bs, tree_budget
+        branch_target_predict = torch.argmax(
+            logits_output.next_token_logits, dim=-1
+        ).view(bs, block_size)
+        accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+            candidates=branch_candidates,
+            target_predict=branch_target_predict,
         )
-        accept_len = torch.empty((bs,), dtype=torch.int32, device=device)
-        commit_lens = torch.empty((bs,), dtype=torch.int32, device=device)
-        bonus = torch.empty((bs,), dtype=torch.int64, device=device)
+        max_branch_accept = (branch_path_lens - 1).to(torch.int32)
+        accept_len = torch.minimum(accept_len, max_branch_accept)
+        bonus = branch_target_predict[
+            torch.arange(bs, device=device), accept_len.to(torch.long)
+        ].to(torch.int64)
+        commit_lens = accept_len.to(torch.int32) + 1
         out_tokens = torch.zeros((bs, tree_budget), dtype=torch.int64, device=device)
-        accept_indices = torch.zeros((bs, tree_budget), dtype=torch.long, device=device)
-        for i in range(bs):
-            path, correct_len, bonus_id = tree_accept_greedy(
-                tree_tokens[i],
-                tree_parents[i],
-                target_predict[i],
-                num_nodes=num_real_nodes[i],
+        if block_size > 1:
+            out_tokens[:, : block_size - 1].copy_(branch_candidates[:, 1:])
+        out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+
+        if need_mamba_verify_commit:
+            assert seq_lens_pre_verify is not None
+            self._update_target_mamba_state_after_verify(
+                batch=model_worker_batch,
+                seq_lens_pre_verify=seq_lens_pre_verify,
+                commit_lens=commit_lens,
             )
-            commit_len = int(correct_len) + 1
-            path_tensor = torch.tensor(path, dtype=torch.long, device=device)
-            accept_indices[i, :commit_len].copy_(path_tensor)
-            accept_len[i] = int(correct_len)
-            commit_lens[i] = commit_len
-            bonus[i] = int(bonus_id)
-            if correct_len > 0:
-                accepted_draft_indices = path_tensor[1:]
-                out_tokens[i, :correct_len].copy_(
-                    torch.index_select(tree_tokens[i], 0, accepted_draft_indices)
-                )
-            out_tokens[i, correct_len] = int(bonus_id)
 
         new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
             on_publish(new_seq_lens)
 
-        cache_loc_for_commit = torch.gather(tree_cache_loc_2d, 1, accept_indices)
-        positions_for_commit = torch.gather(tree_positions_2d, 1, accept_indices)
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
-        commit_offsets = prefix_lens.to(torch.int64).unsqueeze(1) + torch.arange(
-            tree_budget, dtype=torch.int64, device=device
-        ).unsqueeze(0)
-        req_to_token[
-            model_worker_batch.req_pool_indices.to(torch.int64).unsqueeze(1),
-            commit_offsets,
-        ] = cache_loc_for_commit
+        for i in range(bs):
+            num_accept_tokens = int(commit_lens[i].item())
+            req_pool_index = int(model_worker_batch.req_pool_indices[i].item())
+            commit_start = int(prefix_lens[i].item())
+            commit_end = commit_start + num_accept_tokens
+            req_to_token[req_pool_index, commit_start:commit_end] = branch_cache_loc_2d[
+                i, :num_accept_tokens
+            ].to(req_to_token.dtype)
 
         hidden = logits_output.hidden_states
         if hidden is None:
             raise RuntimeError(
                 "DFLASH tree verify requires target hidden states, but got None."
             )
-        hidden = hidden.view(bs, tree_budget, -1)
-        hidden_for_commit = torch.gather(
-            hidden,
-            1,
-            accept_indices.unsqueeze(-1).expand(-1, -1, hidden.shape[-1]),
-        )
+        hidden = hidden.view(bs, block_size, -1)
         self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden_for_commit.reshape(-1, hidden.shape[-1]),
-            cache_loc=cache_loc_for_commit.reshape(-1),
-            cache_loc_2d=cache_loc_for_commit,
-            positions=positions_for_commit.reshape(-1),
+            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+            cache_loc=branch_cache_loc_2d.reshape(-1),
+            cache_loc_2d=branch_cache_loc_2d,
+            positions=branch_positions_2d.reshape(-1),
             commit_lens=commit_lens,
         )
 

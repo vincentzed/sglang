@@ -81,6 +81,7 @@ class DFlashVerifyInput(SpecInput):
         )
         batch.capture_hidden_mode = self.capture_hidden_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+        verify_forward_batch.allow_cuda_graph = self.allow_cuda_graph
 
         can_run_cuda_graph = bool(
             self.allow_cuda_graph
@@ -123,8 +124,18 @@ class DFlashVerifyInput(SpecInput):
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
+        mask = self.custom_mask
+        if mask is not None:
+            # Custom tree masks are flattened per-request over the exact
+            # prefix-plus-verify KV span. In overlap mode seq_lens_sum may be a
+            # host-side planning bound, so derive the actual total from the GPU
+            # lengths that create_flashinfer_kv_indices_triton will consume.
+            kv_total_len = int(paged_kernel_lens.sum().item())
+        else:
+            kv_total_len = paged_kernel_lens_sum + self.draft_token_num * bs
+
         kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * bs,
+            kv_total_len,
             dtype=torch.int32,
             device=device,
         )
@@ -137,13 +148,14 @@ class DFlashVerifyInput(SpecInput):
             kv_indices,
             req_to_token.size(1),
         )
-        mask = self.custom_mask
         if mask is not None:
-            mask_numel = (
-                paged_kernel_lens_sum * self.draft_token_num
-                + (self.draft_token_num**2) * bs
-            )
+            mask_numel = kv_total_len * self.draft_token_num
             if mask.numel() < mask_numel:
+                if not self.allow_cuda_graph:
+                    raise RuntimeError(
+                        "DFLASH custom mask is shorter than the actual verify KV span: "
+                        f"mask={mask.numel()}, expected={mask_numel}."
+                    )
                 # FIXME(attn): temporary fix for custom mask padding with cuda graph
                 mask = torch.cat(
                     [
@@ -157,5 +169,13 @@ class DFlashVerifyInput(SpecInput):
                     ],
                     dim=0,
                 )
+                self.custom_mask = mask
+            elif mask.numel() > mask_numel:
+                if not self.allow_cuda_graph:
+                    raise RuntimeError(
+                        "DFLASH custom mask is longer than the actual verify KV span: "
+                        f"mask={mask.numel()}, expected={mask_numel}."
+                    )
+                mask = mask[:mask_numel]
                 self.custom_mask = mask
         return kv_indices, cum_kv_seq_len, qo_indptr, mask

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import heapq
-from dataclasses import dataclass
 from typing import Iterable, Optional
 
+import msgspec
 import torch
 
 
@@ -38,8 +38,7 @@ def _node_expand_score(
     return cum_logprob
 
 
-@dataclass
-class DraftTree:
+class DraftTree(msgspec.Struct):
     # Root-inclusive canonical node order.
     token_ids: torch.Tensor
     parent_indices: torch.Tensor
@@ -63,8 +62,7 @@ class DraftTree:
         )
 
 
-@dataclass
-class DraftTreeCPU:
+class DraftTreeCPU(msgspec.Struct):
     # Root-inclusive canonical node order.
     token_ids: list[int]
     parent_indices: list[int]
