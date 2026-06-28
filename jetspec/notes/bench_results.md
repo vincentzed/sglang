@@ -106,6 +106,53 @@ Benchmark verdict:
 - The compact verifier still does not make tree beat or match linear. Tree reaches only `0.37x` linear throughput, or `2.73x` slower wall-clock, despite the 12.8x verify-position reduction from A1.
 - The expanded-causal verify blowup is no longer the dominant measured cost for w7/b64. Remaining costs are the extra 64-node compact target verify, the 16-token causal accepted-branch reverify needed for token-exact commit, and tree/draft bookkeeping. The next real lever is removing or shrinking those residual costs without losing causal-branch equivalence; otherwise the current accept gain is not enough to pay for tree verification.
 
+## Dense direct-commit causal-equivalence probe
+
+Date/time: 2026-06-28 03:30-03:55 UTC.
+
+Goal:
+- Test whether dense compact tree verify can be made causal-exact enough to remove the accepted-path reverify and directly gather accepted KV, EAGLE-style.
+- Scope was dense `Qwen/Qwen3-8B` only. MoE was not changed because its persistent GDN/conv state still requires replay/fallback.
+
+Mode:
+- Normal greedy serving mode, harness `temperature=0`.
+- Dense target: `Qwen/Qwen3-8B`, draft: `JetSpec/jetspec-qwen3-8b`, `--attention-backend flashinfer`.
+- Gate used CUDA graph on: `--cuda-graph-max-bs-decode 1`, decode backend `full`.
+- Harness: `jetspec/run_fixed_prompts.py`, 10 prompts, `max_new_tokens=96`, `--flush-cache-before-run --flush-cache-between-prompts`.
+
+Fresh flushed oracle:
+
+| run | artifact | mean accept length | aggregate tok/s |
+|---|---|---:|---:|
+| 8B linear width=1 | `jetspec/runs/job1_fresh_linear_all_w1_31747.json` | 3.7569 | 516.20 |
+
+No-reverify direct-commit gate:
+
+| run | artifact | token exact vs fresh flushed oracle | mismatches | mean accept length | aggregate tok/s |
+|---|---|---:|---:|---:|---:|
+| 8B compact tree w7/b64, dense reverify disabled | `jetspec/runs/job1_compactkv_direct_commit_w7_b64_all_flush_31748.json` | FAIL | 6/10 | 4.5164 | 245.73 |
+
+Mismatch details:
+- Prompt 0 first differed at token index `17`: expected `... 17,18,14 ...`, actual `... 17,19,14 ...`.
+- Other first diffs: prompt 3 at `51`, prompt 5 at `36`, prompt 6 at `32`, prompt 8 at `57`, prompt 9 at `14`.
+- The `245.73 tok/s` number is not a valid speedup result because the output is not lossless.
+
+Per-layer diagnostic:
+- Instrumented the accepted path in the compact FlashInfer tree verify and compared hidden/K/V against a clean causal branch forward of the exact same accepted tokens.
+- Diagnostic artifact: `jetspec/logs/job1_compactkv_exactlen_nograph_compare_w7_b64_31751_server.log`.
+- Representative step: prefix `[6]`, commit length `[2]`, accepted local nodes `[[0,3]]`, branch candidates `[[12095,13]]`.
+- Tree and branch next-token predictions still matched for that step: `tree_predict=[[13,576]]`, `branch_predict=[[13,576]]`.
+- Final hidden state mismatch was large: `hidden_max_abs=8.0`.
+- First per-layer hidden mismatch appeared at layer 0: `first_layer_hidden_delta=(0, 0.0078125)`.
+- Layer-0 K/V were identical: layer-0 `kv_max_abs=(0.0, 0.0)`.
+- Layer-1 K/V then diverged, for example `(0.03125, 0.0009765625)`, and later layers amplified the difference.
+
+Verdict:
+- Position IDs, RoPE, and the layer-0 K/V projection are not the first failing point. The first observed discrepancy is the layer-0 attention output produced by the target verifier path.
+- Because this discrepancy flips tokens under the fresh flushed gate, the dense accepted-path reverify cannot be removed yet.
+- No canonical MT-bench no-reverify run was performed. The no-reverify path failed correctness before it reached the benchmark stage.
+- Current honest performance baseline remains the canonical compact+reverify table above: linear `774.91 tok/s`, compact tree w7/b64 `283.90 tok/s`, tree `2.73x` slower despite accept length `5.08` vs `4.11`.
+
 ## Job 3 final CUDA graph perf
 
 Date/time: 2026-06-27 23:41-23:49 UTC.

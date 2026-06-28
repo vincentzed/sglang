@@ -579,6 +579,52 @@ class DFlashWorkerV2(BaseSpecWorker):
         except Exception:
             logger.exception("DFLASH tree failed to commit latest verify mamba state")
 
+    @contextmanager
+    def _capture_decoder_layer_hidden(self, enabled: bool):
+        captures = []
+        handles = []
+        if not enabled:
+            yield captures
+            return
+
+        model = getattr(self.target_worker.model_runner, "model", None)
+        decoder = getattr(model, "model", None)
+        layers = getattr(decoder, "layers", None)
+        if layers is None:
+            logger.info("DFLASH layer-hidden compare skipped: decoder layers not found")
+            yield captures
+            return
+
+        def make_hook(layer_id: int):
+            def hook(_module, _inputs, output):
+                tensor = None
+                if isinstance(output, tuple) and output:
+                    tensor = output[0]
+                    residual = output[1] if len(output) > 1 else None
+                    if residual is not None:
+                        tensor = tensor + residual
+                elif torch.is_tensor(output):
+                    tensor = output
+                if tensor is not None:
+                    captures.append((layer_id, tensor.detach().clone()))
+
+            return hook
+
+        try:
+            for idx, layer in enumerate(layers):
+                if not hasattr(layer, "register_forward_hook"):
+                    continue
+                layer_id = getattr(
+                    getattr(getattr(layer, "self_attn", None), "attn", None),
+                    "layer_id",
+                    idx,
+                )
+                handles.append(layer.register_forward_hook(make_hook(int(layer_id))))
+            yield captures
+        finally:
+            for handle in handles:
+                handle.remove()
+
     def _reverify_accepted_tree_path_for_commit(
         self,
         *,
@@ -2365,6 +2411,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             num_tokens_per_batch=verify_draft_token_num,
         )
+        compare_layer_hidden = bool(
+            os.environ.get("SGLANG_DFLASH_TREE_COMPARE_LAYER_HIDDEN")
+        )
+        if compare_layer_hidden:
+            verify_input.allow_cuda_graph = False
         use_reverify_commit = (
             not use_flashinfer_expanded_causal_tree
             and os.environ.get("SGLANG_DFLASH_TREE_REVERIFY_ACCEPTED_COMMIT", "1")
@@ -2389,6 +2440,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if use_reverify_commit
             else None
         )
+        tree_layer_hidden = []
         compare_persistent_mamba_snapshot = None
         if os.environ.get("SGLANG_DFLASH_TREE_COMPARE_CAUSAL"):
             linear_backend = getattr(
@@ -2549,12 +2601,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                         model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
                         model_worker_batch.seq_lens_sum = seq_lens_sum_backup
 
-                    target_out = self.target_worker.forward_batch_generation(
-                        batch=None,
-                        forward_batch=verify_forward_batch,
-                        is_verify=True,
-                        skip_attn_backend_init=skip_attn_backend_init,
-                    )
+                    with self._capture_decoder_layer_hidden(
+                        compare_layer_hidden
+                    ) as tree_layer_hidden:
+                        target_out = self.target_worker.forward_batch_generation(
+                            batch=None,
+                            forward_batch=verify_forward_batch,
+                            is_verify=True,
+                            skip_attn_backend_init=skip_attn_backend_init,
+                        )
                     target_forward_ok = True
         finally:
             if target_attn_backend_backup is not None:
@@ -2734,8 +2789,12 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if os.environ.get("SGLANG_DFLASH_TREE_COMPARE_CAUSAL"):
             branch_cache_alloc = None
-            scratch_start = tree_budget - block_size
-            if scratch_start >= block_size:
+            compare_branch_len = block_size
+            if os.environ.get("SGLANG_DFLASH_TREE_COMPARE_EXACT_BRANCH_LEN"):
+                compare_branch_len = max(1, int(commit_lens.max().item()))
+            compare_accept_index_local = accept_index_local[:, :compare_branch_len]
+            scratch_start = tree_budget - compare_branch_len
+            if scratch_start >= compare_branch_len:
                 scratch_nodes = torch.arange(
                     scratch_start,
                     tree_budget,
@@ -2745,34 +2804,36 @@ class DFlashWorkerV2(BaseSpecWorker):
                 branch_cache_loc_2d = tree_cache_loc_2d[:, scratch_nodes].to(torch.long)
             else:
                 branch_cache_alloc = alloc_token_slots(
-                    model_worker_batch.tree_cache, bs * block_size
+                    model_worker_batch.tree_cache, bs * compare_branch_len
                 )
-                if branch_cache_alloc.numel() != bs * block_size:
+                if branch_cache_alloc.numel() != bs * compare_branch_len:
                     logger.info(
                         "DFLASH tree causal compare skipped: failed to allocate "
                         "branch scratch slots, got=%s need=%s",
                         int(branch_cache_alloc.numel()),
-                        int(bs * block_size),
+                        int(bs * compare_branch_len),
                     )
                     branch_cache_alloc = None
                     scratch_nodes = torch.full(
-                        (block_size,),
+                        (compare_branch_len,),
                         -1,
                         dtype=torch.long,
                         device=device,
                     )
                 else:
                     scratch_nodes = torch.full(
-                        (block_size,),
+                        (compare_branch_len,),
                         -1,
                         dtype=torch.long,
                         device=device,
                     )
-                    branch_cache_loc_2d = branch_cache_alloc.view(bs, block_size)
-            path_pos = torch.arange(block_size, dtype=torch.long, device=device)
+                    branch_cache_loc_2d = branch_cache_alloc.view(
+                        bs, compare_branch_len
+                    )
+            path_pos = torch.arange(compare_branch_len, dtype=torch.long, device=device)
             path_mask = path_pos.unsqueeze(0) < commit_lens.to(torch.long).unsqueeze(1)
             overlaps_scratch = (
-                (accept_index_local.unsqueeze(-1) == scratch_nodes)
+                (compare_accept_index_local.unsqueeze(-1) == scratch_nodes)
                 & path_mask.unsqueeze(-1)
             ).any()
             if branch_cache_alloc is None and scratch_nodes[0].item() < 0:
@@ -2780,7 +2841,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             elif bool(overlaps_scratch.item()):
                 logger.info(
                     "DFLASH tree causal compare skipped: accepted path overlaps scratch tail slots local=%s scratch=%s",
-                    accept_index_local.detach().cpu().tolist(),
+                    compare_accept_index_local.detach().cpu().tolist(),
                     scratch_nodes.detach().cpu().tolist(),
                 )
             else:
@@ -2788,7 +2849,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 branch_candidates = torch.gather(
                     tree_tokens,
                     1,
-                    accept_index_local,
+                    compare_accept_index_local,
                 )
                 branch_candidates = torch.where(
                     path_mask,
@@ -2799,19 +2860,19 @@ class DFlashWorkerV2(BaseSpecWorker):
                     1
                 ) + path_pos.to(torch.int64).unsqueeze(0)
                 branch_custom_mask = None
-                if not use_flashinfer_expanded_causal_tree:
+                if os.environ.get("SGLANG_DFLASH_TREE_COMPARE_CUSTOM_MASK_CAUSAL"):
                     branch_mask_parts = []
                     for prefix_len in prefix_lens.to(
                         device="cpu", dtype=torch.int64
                     ).tolist():
                         prefix_mask = torch.ones(
-                            (block_size, int(prefix_len)),
+                            (compare_branch_len, int(prefix_len)),
                             dtype=torch.bool,
                             device=device,
                         )
                         causal_mask = torch.tril(
                             torch.ones(
-                                (block_size, block_size),
+                                (compare_branch_len, compare_branch_len),
                                 dtype=torch.bool,
                                 device=device,
                             )
@@ -2823,7 +2884,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 branch_verify_input = DFlashVerifyInput(
                     draft_token=branch_candidates.reshape(-1),
                     positions=branch_positions_2d.reshape(-1),
-                    draft_token_num=block_size,
+                    draft_token_num=compare_branch_len,
                     custom_mask=branch_custom_mask,
                     force_causal=use_flashinfer_expanded_causal_tree,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -2902,6 +2963,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     if self._tree_verify_attn_backend is not None
                     else nullcontext()
                 )
+                branch_layer_hidden = []
                 try:
                     with branch_verify_context:
                         with self._maybe_use_tree_verify_full_attn_backend(
@@ -2934,14 +2996,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                             )
                             model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
                             model_worker_batch.seq_lens_sum = seq_lens_sum_backup
-                            branch_target_out = (
-                                self.target_worker.forward_batch_generation(
-                                    batch=None,
-                                    forward_batch=branch_forward_batch,
-                                    is_verify=True,
-                                    skip_attn_backend_init=True,
+                            with self._capture_decoder_layer_hidden(
+                                compare_layer_hidden
+                            ) as branch_layer_hidden:
+                                branch_target_out = (
+                                    self.target_worker.forward_batch_generation(
+                                        batch=None,
+                                        forward_batch=branch_forward_batch,
+                                        is_verify=True,
+                                        skip_attn_backend_init=True,
+                                    )
                                 )
-                            )
                 finally:
                     req_to_token[req_rows, branch_positions_2d] = (
                         branch_req_to_token_backup
@@ -2962,16 +3027,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                     apply_dflash_verify_logits_adjustments(
                         next_token_logits=branch_logits_output.next_token_logits,
                         sampling_info=sampling_info,
-                        draft_token_num=block_size,
+                        draft_token_num=compare_branch_len,
                     )
 
                 branch_target_predict = torch.argmax(
                     branch_logits_output.next_token_logits, dim=-1
-                ).view(bs, block_size)
+                ).view(bs, compare_branch_len)
                 tree_predict_on_path = torch.gather(
                     tree_target_predict,
                     1,
-                    accept_index_local,
+                    compare_accept_index_local,
                 )
 
                 same_shape_logits_output = None
@@ -3112,6 +3177,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 hidden_max_abs = None
                 leaf_hidden_max_abs = None
                 same_shape_hidden_max_abs = None
+                layer_hidden_max_abs = None
+                first_layer_hidden_delta = None
                 kv_max_abs = None
                 leaf_kv_max_abs = None
                 same_shape_kv_max_abs = None
@@ -3123,20 +3190,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                     if use_flashinfer_expanded_causal_tree:
                         tree_hidden = tree_hidden.view(bs, tree_budget, block_size, -1)
                         hidden_offsets_2d = (
-                            torch.arange(block_size, dtype=torch.long, device=device)
+                            torch.arange(
+                                compare_branch_len, dtype=torch.long, device=device
+                            )
                             .unsqueeze(0)
-                            .expand_as(accept_index_local)
+                            .expand_as(compare_accept_index_local)
                         )
                         tree_hidden_on_path = tree_hidden[
                             req_indices.to(torch.long).unsqueeze(1),
-                            accept_index_local.to(torch.long),
+                            compare_accept_index_local.to(torch.long),
                             hidden_offsets_2d,
                         ]
                         leaf_index_2d = torch.gather(
-                            accept_index_local,
+                            compare_accept_index_local,
                             1,
                             (commit_lens.to(torch.long) - 1).clamp(min=0).unsqueeze(1),
-                        ).expand_as(accept_index_local)
+                        ).expand_as(compare_accept_index_local)
                         leaf_hidden_on_path = tree_hidden[
                             req_indices.to(torch.long).unsqueeze(1),
                             leaf_index_2d.to(torch.long),
@@ -3147,11 +3216,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                         tree_hidden_on_path = torch.gather(
                             tree_hidden,
                             1,
-                            accept_index_local.unsqueeze(-1).expand(
-                                bs, block_size, tree_hidden.shape[-1]
+                            compare_accept_index_local.unsqueeze(-1).expand(
+                                bs, compare_branch_len, tree_hidden.shape[-1]
                             ),
                         )
-                    branch_hidden = branch_hidden.view(bs, block_size, -1)
+                    branch_hidden = branch_hidden.view(bs, compare_branch_len, -1)
                     hidden_delta = (
                         tree_hidden_on_path[path_mask]
                         - branch_hidden.to(tree_hidden_on_path.device)[path_mask]
@@ -3182,7 +3251,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                             )
                             same_shape_hidden_on_path = same_shape_hidden[
                                 req_indices.to(torch.long).unsqueeze(1),
-                                accept_index_local.to(torch.long),
+                                compare_accept_index_local.to(torch.long),
                                 hidden_offsets_2d,
                             ]
                             same_shape_hidden_delta = (
@@ -3196,6 +3265,65 @@ class DFlashWorkerV2(BaseSpecWorker):
                                 if same_shape_hidden_delta.numel()
                                 else 0.0
                             )
+                if tree_layer_hidden and branch_layer_hidden:
+                    branch_layer_by_id = {
+                        layer_id: hidden for layer_id, hidden in branch_layer_hidden
+                    }
+                    layer_diffs = []
+                    for layer_id, tree_layer in tree_layer_hidden:
+                        branch_layer = branch_layer_by_id.get(layer_id)
+                        if branch_layer is None:
+                            continue
+                        try:
+                            if use_flashinfer_expanded_causal_tree:
+                                tree_layer = tree_layer.view(
+                                    bs, tree_budget, block_size, -1
+                                )
+                                hidden_offsets_2d = (
+                                    torch.arange(
+                                        compare_branch_len,
+                                        dtype=torch.long,
+                                        device=device,
+                                    )
+                                    .unsqueeze(0)
+                                    .expand_as(compare_accept_index_local)
+                                )
+                                tree_layer_on_path = tree_layer[
+                                    req_indices.to(torch.long).unsqueeze(1),
+                                    compare_accept_index_local.to(torch.long),
+                                    hidden_offsets_2d,
+                                ]
+                            else:
+                                tree_layer = tree_layer.view(bs, tree_budget, -1)
+                                tree_layer_on_path = torch.gather(
+                                    tree_layer,
+                                    1,
+                                    compare_accept_index_local.unsqueeze(-1).expand(
+                                        bs, compare_branch_len, tree_layer.shape[-1]
+                                    ),
+                                )
+                            branch_layer = branch_layer.view(
+                                bs, compare_branch_len, -1
+                            )
+                            layer_delta = (
+                                tree_layer_on_path[path_mask]
+                                - branch_layer.to(tree_layer_on_path.device)[path_mask]
+                            ).abs()
+                            layer_max_abs = (
+                                float(layer_delta.max().item())
+                                if layer_delta.numel()
+                                else 0.0
+                            )
+                            layer_diffs.append((layer_id, layer_max_abs))
+                            if first_layer_hidden_delta is None and layer_max_abs > 0.0:
+                                first_layer_hidden_delta = (layer_id, layer_max_abs)
+                        except Exception:
+                            logger.exception(
+                                "DFLASH tree failed layer-hidden compare for layer %s",
+                                layer_id,
+                            )
+                    if layer_diffs:
+                        layer_hidden_max_abs = layer_diffs
                 if (
                     tree_mamba_snapshot is not None
                     and tree_mamba_state_indices is not None
@@ -3230,7 +3358,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                             .reshape(
                                 1,
                                 bs,
-                                block_size,
+                                compare_branch_len,
                                 *([1] * (tree_mamba_snapshot.dim() - 3)),
                             )
                         )
@@ -3285,20 +3413,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                     if use_flashinfer_expanded_causal_tree:
                         assert expanded_cache_loc_3d is not None
                         accept_offsets_2d = (
-                            torch.arange(block_size, dtype=torch.long, device=device)
+                            torch.arange(
+                                compare_branch_len, dtype=torch.long, device=device
+                            )
                             .unsqueeze(0)
-                            .expand_as(accept_index_local)
+                            .expand_as(compare_accept_index_local)
                         )
                         src_locs_2d = expanded_cache_loc_3d[
                             req_indices.to(torch.long).unsqueeze(1),
-                            accept_index_local.to(torch.long),
+                            compare_accept_index_local.to(torch.long),
                             accept_offsets_2d,
                         ].to(torch.long)
                         leaf_index_2d = torch.gather(
-                            accept_index_local,
+                            compare_accept_index_local,
                             1,
                             (commit_lens.to(torch.long) - 1).clamp(min=0).unsqueeze(1),
-                        ).expand_as(accept_index_local)
+                        ).expand_as(compare_accept_index_local)
                         leaf_src_locs_2d = expanded_cache_loc_3d[
                             req_indices.to(torch.long).unsqueeze(1),
                             leaf_index_2d.to(torch.long),
@@ -3308,7 +3438,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         src_locs_2d = torch.gather(
                             tree_cache_loc_2d,
                             1,
-                            accept_index_local,
+                            compare_accept_index_local,
                         ).to(torch.long)
                         leaf_src_locs_2d = None
                     dst_locs_2d = branch_cache_loc_2d.to(torch.long)
@@ -3319,7 +3449,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     if same_shape_cache_loc_3d is not None:
                         same_shape_src_locs_2d = same_shape_cache_loc_3d[
                             req_indices.to(torch.long).unsqueeze(1),
-                            accept_index_local.to(torch.long),
+                            compare_accept_index_local.to(torch.long),
                             accept_offsets_2d,
                         ].to(torch.long)
                     else:
@@ -3396,16 +3526,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                         same_shape_kv_max_abs = same_shape_layer_diffs
 
                 logger.info(
-                    "DFLASH tree causal compare prefix=%s commit_lens=%s local=%s branch_candidates=%s tree_predict=%s branch_predict=%s hidden_max_abs=%s leaf_hidden_max_abs=%s same_shape_hidden_max_abs=%s kv_max_abs=%s leaf_kv_max_abs=%s same_shape_kv_max_abs=%s mamba_max_abs=%s conv_max_abs=%s",
+                    "DFLASH tree causal compare prefix=%s commit_lens=%s local=%s branch_candidates=%s tree_predict=%s branch_predict=%s hidden_max_abs=%s leaf_hidden_max_abs=%s same_shape_hidden_max_abs=%s layer_hidden_max_abs=%s first_layer_hidden_delta=%s kv_max_abs=%s leaf_kv_max_abs=%s same_shape_kv_max_abs=%s mamba_max_abs=%s conv_max_abs=%s",
                     prefix_lens.detach().cpu().tolist(),
                     commit_lens.detach().cpu().tolist(),
-                    accept_index_local.detach().cpu().tolist(),
+                    compare_accept_index_local.detach().cpu().tolist(),
                     branch_candidates.detach().cpu().tolist(),
                     tree_predict_on_path.detach().cpu().tolist(),
                     branch_target_predict.detach().cpu().tolist(),
                     hidden_max_abs,
                     leaf_hidden_max_abs,
                     same_shape_hidden_max_abs,
+                    layer_hidden_max_abs,
+                    first_layer_hidden_delta,
                     kv_max_abs,
                     leaf_kv_max_abs,
                     same_shape_kv_max_abs,

@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-28 03:10 UTC
+Updated: 2026-06-28 03:57 UTC
 
 ## Done / Committed
 
@@ -15,6 +15,7 @@ Updated: 2026-06-28 03:10 UTC
 - Perf pass 2026-06-28: attempted dense direct accepted-path commit, reverted it after token-exactness failed, then swept dense CUDA-graph tree width/budget. Results are recorded in `jetspec/notes/bench_results.md`.
 - `dd1cc2947f`: Job A1 dense FlashInfer tree verify now defaults to the compact custom-mask verifier and uses a causal accepted-branch reverify/commit for losslessness. For w7/b64, target tree-verify graph shape drops from expanded `64 * 16 = 1024` positions/request to compact `64` positions/request plus a `16`-position branch reverify.
 - Job B 2026-06-28: canonical MT-bench rerun completed for width=1 linear and compact tree w7/b64. Tree raised accept length from `4.11` to `5.08`, but throughput fell from `774.91` to `283.90 tok/s`, so compact tree is still `0.37x` linear on the real benchmark.
+- Direct-commit causal-equivalence probe 2026-06-28: dense no-reverify direct commit remains blocked. The fresh flushed w7/b64 gate failed `6/10` prompts, and per-layer diagnostics show the first accepted-path discrepancy at layer-0 attention output while layer-0 K/V are still identical to the clean causal branch.
 
 ## Job 0 Validation
 
@@ -109,6 +110,53 @@ Verdict:
 - Longer canonical outputs do amortize some fixed overhead and improve tree's measured accept length to `5.08`, which is `1.24x` the linear accept length.
 - The efficient compact verify still does not make tree beat or match linear. Tree is `2.73x` slower end-to-end on MT-bench (`283.90` vs `774.91 tok/s`).
 - The remaining measured cost is no longer the expanded `tree_budget * block_size` verify blowup. For w7/b64 that is fixed from `1024` target positions/request to about `80`. The remaining cost is the extra 64-node compact target verify, the 16-token causal accepted-branch reverify required for lossless commit, and tree/draft bookkeeping that still dominates the accept-length gain.
+
+## Direct-Commit Causal-Equivalence Probe
+
+Date/time: 2026-06-28 03:30-03:55 UTC.
+
+Goal:
+- Make the dense accepted tree-verify state causal-exact so DFlash can drop the dense accepted-path reverify and directly gather accepted KV, matching EAGLE's no-reverify tree-commit model.
+- Scope was dense `Qwen/Qwen3-8B` only. MoE direct commit was not changed.
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Backend: `--attention-backend flashinfer`
+- Normal greedy mode: no deterministic flags, harness `temperature=0`
+- CUDA graph enabled for the gate: `--cuda-graph-max-bs-decode 1`, decode backend `full`
+- Harness: `PYTHONPATH=python python jetspec/run_fixed_prompts.py`, 10 fixed prompts, `max_new_tokens=96`, `--flush-cache-before-run --flush-cache-between-prompts`
+
+Fresh flushed oracle:
+- `jetspec/runs/job1_fresh_linear_all_w1_31747.json`: mean accept `3.7569`, aggregate `516.20 tok/s`.
+
+Direct-commit gate:
+
+| run | artifact | token exact vs fresh flushed oracle | mean accept length | aggregate tok/s |
+|---|---|---:|---:|---:|
+| 8B compact tree w7/b64, dense reverify disabled | `jetspec/runs/job1_compactkv_direct_commit_w7_b64_all_flush_31748.json` | FAIL, 6/10 mismatched | 4.5164 | 245.73 |
+
+Mismatch notes:
+- The first mismatching prompt diverged at token index `17`, expected `... 17,18,14 ...` and produced `... 17,19,14 ...`.
+- Other first diffs were prompt 3 at `51`, prompt 5 at `36`, prompt 6 at `32`, prompt 8 at `57`, and prompt 9 at `14`.
+- Throughput from this invalid run is not a usable speed result. It is reported only to show that the no-reverify path did run and failed the losslessness gate.
+
+Per-layer causal-equivalence diagnostic:
+- Instrumented the compact FlashInfer w7/b64 path to compare accepted-path tree hidden/K/V against a clean width=1 causal forward of the same accepted tokens.
+- Diagnostic log: `jetspec/logs/job1_compactkv_exactlen_nograph_compare_w7_b64_31751_server.log`.
+- Representative step: prefix `[6]`, commit length `[2]`, accepted local nodes `[[0,3]]`, branch candidates `[[12095,13]]`.
+- Tree and branch logits still agreed on the next-token predictions for that step: `tree_predict=[[13,576]]`, `branch_predict=[[13,576]]`.
+- The final accepted-path hidden delta was large: `hidden_max_abs=8.0`.
+- The first per-layer hidden discrepancy was already at layer 0: `first_layer_hidden_delta=(0, 0.0078125)`.
+- Layer-0 K/V were still identical: `kv_max_abs` for layer 0 was `(0.0, 0.0)`.
+- Layer-1 K/V then diverged, for example `(0.03125, 0.0009765625)`, and deeper hidden/KV deltas grew from there.
+
+Conclusion:
+- The first observed discrepancy is not position IDs or RoPE/K/V projection. Those are consistent through layer-0 K/V.
+- The first observed discrepancy is the layer-0 attention output in the target verifier path. That discrepancy is enough to propagate into layer-1 K/V and eventually flip tokens under direct commit.
+- Dense direct commit is therefore still unsafe. The accepted-path reverify remains required for token-exact dense output until the target tree-verify attention path is made causal-exact or replaced with a one-forward verifier that produces identical accepted-path attention output.
+- Job 2 was not landed and no commit was made for no-reverify direct commit. Job 3 canonical no-reverify MT-bench was not run because the fresh flushed losslessness gate failed.
 
 ## Job 1 Validation
 
