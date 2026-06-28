@@ -264,8 +264,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     and os.environ.get("SGLANG_DFLASH_TREE_VERIFY_BACKEND") is None
                     and os.environ.get("SGLANG_DFLASH_TREE_COMPACT_FLASHINFER", "0")
                     != "1"
-                    and os.environ.get("SGLANG_DFLASH_TREE_EXPANDED_CAUSAL", "1")
-                    != "0"
+                    and os.environ.get("SGLANG_DFLASH_TREE_EXPANDED_CAUSAL", "0")
+                    == "1"
                 )
                 if self.dflash_tree_expanded_causal_graph:
                     # FlashInfer's exact tree verifier expands each tree node

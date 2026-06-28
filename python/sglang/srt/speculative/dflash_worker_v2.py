@@ -600,10 +600,11 @@ class DFlashWorkerV2(BaseSpecWorker):
     ]:
         """Replay the accepted tree path as a causal verify for exact state commit.
 
-        Hybrid MoE models can produce shape-sensitive full-attention KV during the
-        wide tree verify even when the accepted token predictions match a linear
-        replay. Commit the linear replay's KV/hidden/mamba intermediates so the
-        persistent state remains identical to width=1 decode.
+        Compact tree verification keeps the target pass to one position per tree
+        node, but backend-specific custom-mask math is not guaranteed to match a
+        causal branch replay bit-for-bit. Reverify only the selected branch and
+        commit its KV/hidden state so persistent state and emitted tokens remain
+        identical to width=1 decode.
         """
 
         bs = int(tree_tokens.shape[0])
@@ -2094,7 +2095,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             type(active_target_attn_backend).__name__ == "FlashInferAttnBackend"
             and self._tree_verify_attn_backend is None
             and not use_flashinfer_compact_tree
-            and os.environ.get("SGLANG_DFLASH_TREE_EXPANDED_CAUSAL", "1") != "0"
+            and os.environ.get("SGLANG_DFLASH_TREE_EXPANDED_CAUSAL", "0") == "1"
         )
 
         compact_kv_indices = None
@@ -2365,8 +2366,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             num_tokens_per_batch=verify_draft_token_num,
         )
         use_reverify_commit = (
-            target_model_runner.mambaish_config is not None
-            and not use_flashinfer_expanded_causal_tree
+            not use_flashinfer_expanded_causal_tree
             and os.environ.get("SGLANG_DFLASH_TREE_REVERIFY_ACCEPTED_COMMIT", "1")
             != "0"
         )

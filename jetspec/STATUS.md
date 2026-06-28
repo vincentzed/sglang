@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-28 00:35 UTC
+Updated: 2026-06-28 02:25 UTC
 
 ## Done / Committed
 
@@ -13,6 +13,7 @@ Updated: 2026-06-28 00:35 UTC
 - `ff275594dd`: recorded Job 2 status and validation artifacts.
 - `e8d533a19c`: recorded Job 3 normal-mode CUDA graph performance results and verdict in `jetspec/notes/bench_results.md`.
 - Perf pass 2026-06-28: attempted dense direct accepted-path commit, reverted it after token-exactness failed, then swept dense CUDA-graph tree width/budget. Results are recorded in `jetspec/notes/bench_results.md`.
+- Job A1 2026-06-28: dense FlashInfer tree verify now defaults to the compact custom-mask verifier and uses a causal accepted-branch reverify/commit for losslessness. For w7/b64, target tree-verify graph shape drops from expanded `64 * 16 = 1024` positions/request to compact `64` positions/request plus a `16`-position branch reverify.
 
 ## Job 0 Validation
 
@@ -42,11 +43,43 @@ Notes:
 
 ## In Progress
 
-- None.
+- Job B canonical MT-bench measurement: rerun linear DFlash vs compact tree DFlash with `benchmark/mtbench/bench_sglang_eagle.py`.
 
 Exact next step:
-- If continuing performance work, the dense blocker is acceptance/amortization rather than correctness: the best valid swept dense tree throughput was w2/b16 at 173.77 tok/s but it did not beat linear accept, and the best throughput while beating linear accept was w4/b32 at 163.84 tok/s, still 0.32x linear. A direct dense accepted-path commit is not safe with the current FlashInfer expanded-causal verifier because tree KV/hidden state is not causal-equivalent to the accepted replay branch.
+- Run the canonical MT-bench with the same normal-mode CUDA-graph settings for width=1 linear and compact tree w7/b64. The short fixed-prompt gate below shows the verify-position drop is real and lossless, but tree still trails linear on the 96-token harness.
 - MoE direct exact KV/GDN-state commit remains a follow-up. It was not attempted in this pass.
+
+## Job A1 Efficient Dense Verify
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Backend: `--attention-backend flashinfer`
+- Normal greedy mode: no deterministic flags, harness `temperature=0`
+- CUDA graph enabled: `--cuda-graph-max-bs-decode 1`, decode backend `full`; prefill graph disabled during this short gate to keep launch/validation tight.
+- Harness: `PYTHONPATH=python python jetspec/run_fixed_prompts.py`, 10 fixed prompts, `max_new_tokens=96`, `--flush-cache-before-run --flush-cache-between-prompts`
+
+Artifacts:
+
+| run | artifact | token exact vs fresh flushed oracle | mean accept length | aggregate tok/s |
+|---|---|---:|---:|---:|
+| 8B linear width=1 flushed oracle | `jetspec/runs/a1_fresh_linear_oracle_all_flush_31712.json` | oracle | 3.6342 | 531.98 |
+| 8B compact tree w7/b64 + branch reverify | `jetspec/runs/a1_dense_compact_reverify_w7_b64_all_flush_31711.json` | PASS, 10/10 | 4.3495 | 212.57 |
+
+Verify-position count:
+- Before A1, dense FlashInfer tree verify defaulted to expanded-causal rows. For w7/b64 with block size 16, the target verify graph processed `64 * 16 = 1024` positions/request.
+- After A1, dense tree verify defaults to the custom-mask compact graph. The captured target verify graph reported `num_tokens_per_bs=64`, `rows_per_request=1`, so the tree pass processes `64` positions/request. The lossless commit path adds one causal accepted-branch reverify of `16` positions/request, for roughly `80` target positions/request.
+- Position-count drop for w7/b64: `1024 -> ~80` positions/request, about `12.8x` fewer target verify positions.
+
+Notes:
+- Initial custom-mask-only runs reproduced the prior drift: prompt 5 passed after branch reverify, and prompt 9 exposed that unflushed width=1 output can itself differ when radix cache supplies a shared prefix. The A1 losslessness gate therefore uses a fresh flushed oracle per prompt.
+- This is an efficiency win against the expanded verifier, not a full throughput win over linear. Fixed-prompt compact w7/b64 improved over prior expanded w7/b64 throughput (`~130 tok/s` in Job 3/perf sweep) to `212.57 tok/s`, but remains `0.40x` the flushed linear oracle.
+
+Local checks after A1:
+- `PYTHONPATH=python python -m py_compile python/sglang/srt/speculative/dflash_worker_v2.py python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py`: PASS
+- `PYTHONPATH=python python test/registered/unit/spec/test_dflash_tree_construction.py`: PASS, 18 tests
+- `git diff --check`: PASS
 
 ## Job 1 Validation
 

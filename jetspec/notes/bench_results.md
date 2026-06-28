@@ -18,6 +18,43 @@ Hardware/env:
 - The MoE server accepts `--attention-backend trtllm_mha` for the target, but the DFlash draft worker logs: `DFLASH draft worker does not support 'trtllm_mha' because the draft path requires per-layer DFlash attention. Falling back to 'flashinfer'.`
 - `z-lab/Qwen3.6-35B-A3B-DFlash` config was fetched under `jetspec/_hf_configs/` and confirmed `architectures: ["DFlashDraftModel"]`.
 
+## Job A1 compact dense verify
+
+Date/time: 2026-06-28 02:16-02:24 UTC.
+
+Mode:
+- Normal greedy serving mode: no deterministic flags, harness `temperature=0`.
+- CUDA graph enabled: `--cuda-graph-max-bs-decode 1`, decode backend `full`; prefill graph disabled for this short fixed-prompt gate.
+- Dense target: `Qwen/Qwen3-8B`, draft: `JetSpec/jetspec-qwen3-8b`, `--attention-backend flashinfer`.
+- Harness: `jetspec/run_fixed_prompts.py`, 10 prompts, `max_new_tokens=96`, `--flush-cache-before-run --flush-cache-between-prompts`.
+- Fresh flushed oracle for this pass: `jetspec/runs/a1_fresh_linear_oracle_all_flush_31712.json`.
+
+Change:
+- Dense FlashInfer tree verify now defaults away from the expanded-causal verifier. `SGLANG_DFLASH_TREE_EXPANDED_CAUSAL=1` remains the opt-in escape hatch.
+- CUDA graph capture uses the same default, so w7/b64 captured `num_tokens_per_bs=64`, `rows_per_request=1`.
+- The compact tree logits/KV are still not assumed to be bit-exact causal branch state. The accepted branch is causally reverified for one DFlash block before computing the final accept/bonus/commit state.
+
+Fixed-prompt results:
+
+| run | artifact | token exact vs fresh flushed linear | mean accept length | aggregate tok/s | speed vs flushed linear |
+|---|---|---:|---:|---:|---:|
+| 8B linear width=1 flushed oracle | `jetspec/runs/a1_fresh_linear_oracle_all_flush_31712.json` | oracle | 3.6342 | 531.98 | 1.00x |
+| 8B expanded tree w7/b64 before A1 | `jetspec/runs/perf1_sweep_8b_tree_w7_b64_cudagraph_31631.json` | PASS in prior gate | 4.5441 | 130.57 | 0.25x |
+| 8B compact tree w7/b64 + branch reverify | `jetspec/runs/a1_dense_compact_reverify_w7_b64_all_flush_31711.json` | PASS | 4.3495 | 212.57 | 0.40x |
+
+Verify-position count:
+- Before A1, dense expanded-causal w7/b64 processed `tree_budget * block_size = 64 * 16 = 1024` target verify positions/request.
+- After A1, dense compact w7/b64 processes `64` target tree-verify positions/request plus one `16`-position causal branch reverify, for roughly `80` target positions/request.
+- That is a `12.8x` verify-position reduction for w7/b64. The short fixed-prompt throughput improved by about `1.63x` versus the prior expanded w7/b64 artifact, but still trails linear by about `2.5x`.
+
+Losslessness notes:
+- A custom-mask-only diagnostic reproduced the prior verifier-equivalence issue; prompt 5 and prompt 9 were used as drift probes.
+- Prompt 9 also exposed a pre-existing comparison hazard: unflushed width=1 DFlash can produce a different output when radix cache supplies a shared prefix. The token-exact A1 gate therefore compares both width=1 and tree with cache flushed before each prompt, matching the "fresh deterministic oracle" requirement.
+
+Verdict:
+- A1 landed the main efficiency lever for dense verify: the target verify graph is compact and lossless with branch reverify.
+- It is not enough by itself to beat linear on the short 96-token harness. The remaining measured cost is the extra 64-node tree verify, the 16-token branch reverify, and tree/draft bookkeeping overhead. Job B must use the canonical MT-bench to see whether longer outputs amortize this enough to close the gap.
+
 ## Job 3 final CUDA graph perf
 
 Date/time: 2026-06-27 23:41-23:49 UTC.
