@@ -97,6 +97,56 @@ Job 2 verdict:
 - The remaining correctness issue is the FA4 tree/custom-mask target-verify execution shape for this DFlash tree path.
 - The retained-reverify path remains lossless on the canonical backend for both w7/b64 and w7/b128, but it is roughly `0.25x` the fixed-prompt linear throughput. Job 3 must therefore benchmark the honest aligned configuration: FA4 page16 tree with retained reverify.
 
+## Realignment Job 3 FA4 page16 canonical MT-bench
+
+Date/time: 2026-06-28 04:36-04:59 UTC.
+
+Mode:
+- Canonical SGLang spec-decode benchmark: `benchmark/mtbench/bench_sglang_eagle.py`, MT-bench 80 questions, `--parallel 1`, `max_new_tokens=2048`.
+- Normal greedy serving mode: the benchmark sends `temperature=0`.
+- CUDA graph enabled: `--cuda-graph-max-bs-decode 1`, decode backend `full`; dense prefill graph left at normal default `tc_piecewise`.
+- Dense target: `Qwen/Qwen3-8B`, draft: `JetSpec/jetspec-qwen3-8b`.
+- Canonical backend/page: `--attention-backend fa4 --page-size 16`.
+- Tree configuration: `--speculative-dflash-tree-width 7 --speculative-dflash-tree-budget 64`.
+- Tree correctness mode: retained accepted-path reverify. The no-reverify direct commit from Job 2 did not pass losslessness and was not benchmarked as a valid speed result.
+- The tree benchmark process disabled only `sglang.global_config.global_config.enable_precache_with_tracing`, as in the earlier canonical tree pass. The linear pass used the unmodified benchmark driver.
+
+Launch knobs:
+
+```bash
+--speculative-algorithm DFLASH \
+--speculative-draft-model-path JetSpec/jetspec-qwen3-8b \
+--speculative-num-draft-tokens 16 \
+--reasoning-parser qwen3 \
+--attention-backend fa4 \
+--page-size 16 \
+--tp-size 1 --mem-fraction-static 0.8 --trust-remote-code \
+--max-running-requests 1 \
+--cuda-graph-max-bs-decode 1 \
+--cuda-graph-backend-decode full
+```
+
+Canonical results:
+
+| run | result artifact | answers | accept length | throughput | latency | speed vs linear |
+|---|---|---:|---:|---:|---:|---:|
+| 8B linear width=1 | `jetspec/runs/mtbench_fa4p16_linear_31820_result.jsonl` | 80/80 | 4.070 | 763.948 tok/s | 334.886 s | 1.00x |
+| 8B tree w7/b64 + retained accepted-path reverify | `jetspec/runs/mtbench_fa4p16_tree_w7_b64_reverify_noprecache_31821_result.jsonl` | 80/80 | 3.695 | 199.983 tok/s | 1279.286 s | 0.26x |
+
+Raw result lines:
+
+```json
+{"task": "mtbench", "backend": "srt", "num_gpus": 1, "latency": 334.886, "throughput": 763.948, "accept_length": 4.07, "num_requests": 80, "other": {"num_questions": 80, "parallel": 1}}
+{"task": "mtbench", "backend": "srt", "num_gpus": 1, "latency": 1279.286, "throughput": 199.983, "accept_length": 3.695, "num_requests": 80, "other": {"num_questions": 80, "parallel": 1}}
+```
+
+Benchmark verdict:
+- On DFlash's real dense backend (`fa4`, `page_size=16`), dense tree does not beat or match linear.
+- Tree reaches only `0.26x` linear throughput, or `3.82x` slower wall-clock (`199.983` vs `763.948 tok/s`).
+- Unlike the earlier FlashInfer compact benchmark, FA4 page16 dense tree does not show an acceptance gain on MT-bench: `3.695` vs linear `4.070`, or `0.91x` linear acceptance.
+- The remaining cost is the 64-node FA4 custom-mask target verify plus the accepted-path causal reverify and tree/draft bookkeeping. Job 2 showed the FA4 page16 custom-mask verify state is not causal-exact for direct commit, so the accepted-path reverify cannot be removed without breaking losslessness.
+- MoE was left untouched. The equivalent future MoE direction remains target `trtllm_mha` verify plus direct GDN-state/KV commit if the dense FA4 causal-equivalence problem is solved.
+
 ## Job A1 compact dense verify
 
 Date/time: 2026-06-28 02:16-02:24 UTC.
