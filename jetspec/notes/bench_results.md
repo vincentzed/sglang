@@ -9,6 +9,32 @@ Hardware/env:
 - Decode settings: BF16/default dtype, greedy `temperature=0`, `--tp-size 1`, `max_new_tokens=96`
 - Harness: `jetspec/run_fixed_prompts.py`, 10 fixed prompts including GSM-style arithmetic, sequence, code, translation, and summary prompts.
 
+## Mask root-cause Job 1 FA4 page16 attended-set dump
+
+Date/time: 2026-06-28 05:13-05:20 UTC.
+
+Mode:
+- Dense target: `Qwen/Qwen3-8B`, draft: `JetSpec/jetspec-qwen3-8b`.
+- Canonical backend/page: `--attention-backend fa4 --page-size 16`.
+- Tree configuration: `--speculative-dflash-tree-width 7 --speculative-dflash-tree-budget 64`.
+- Diagnostic server: accepted-path reverify disabled; causal layer/KV compare and attended-set dump enabled.
+
+Artifact:
+- `jetspec/logs/job1_maskdump_fa4p16_tree_w7_b64_31932_server.log`
+
+Exact finding:
+- First failing accepted path: `prefix=[6]`, `commit_lens=[2]`, accepted local nodes `[[0, 3]]`.
+- DFlash's generated custom tree mask for accepted node `3` is correct: prefix `[0,6)`, expected/allowed tree cols `[0, 3]`, no extras, no missing, physical tree slots `[22, 25]`.
+- FA4's effective verifier is wrong: `effective_mode=linear_causal_no_custom_mask`, allowed tree cols for node `3` are `[0, 1, 2, 3]`.
+- Wrong extras: non-ancestor tree cols `[1, 2]`, logical KV positions `[7, 8]`, physical slots `[23, 24]`.
+- Missing positions: none.
+- The same step reproduced the existing diagnostic signature: `first_layer_hidden_delta=(0, 0.1357421875)` with layer-0 K/V exact, `kv_max_abs=(0.0, 0.0)`.
+
+Root cause:
+- DFlash passes `DFlashVerifyInput.topk=7` plus a 64-node ancestor mask, but `FlashAttentionBackend` chooses its target-verify custom-mask/cascade path from backend `self.topk`, initialized from `server_args.speculative_eagle_topk=1`.
+- EAGLE works because its server-side `speculative_eagle_topk` drives the FA4 FULL_MASK path.
+- DFlash therefore falls through to FA4's `topk<=1` causal verifier, which ignores the custom mask and treats the first `--speculative-num-draft-tokens 16` BFS nodes as a linear causal chain.
+
 ## Caveats
 
 - `--attention-backend fa3` is not usable on this B300/SM100 host in this checkout: launch fails with `FlashAttention v3 Backend requires SM>=80 and SM<=90. Please use --attention-backend flashinfer.` The 8B smoke pair was therefore run with `--attention-backend flashinfer`.

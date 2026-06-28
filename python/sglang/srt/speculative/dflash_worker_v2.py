@@ -2707,6 +2707,88 @@ class DFlashWorkerV2(BaseSpecWorker):
         req_indices = torch.arange(bs, dtype=torch.long, device=device)
         bonus = accept_tokens[req_indices, (commit_lens - 1).to(torch.long)]
 
+        if os.environ.get("SGLANG_DFLASH_TREE_DUMP_ATTENDED_SET"):
+            step = int(getattr(self, "_dflash_tree_attended_set_dump_step", 0))
+            self._dflash_tree_attended_set_dump_step = step + 1
+            if step < int(
+                os.environ.get("SGLANG_DFLASH_TREE_DUMP_ATTENDED_SET_STEPS", "8")
+            ):
+                custom_mask_offset = 0
+                req_to_token_debug = self.model_runner.req_to_token_pool.req_to_token
+                for row in range(bs):
+                    prefix_len = int(prefix_lens[row].item())
+                    row_mask_width = prefix_len + tree_budget
+                    row_mask_numel = tree_budget * row_mask_width
+                    row_mask = custom_mask[
+                        custom_mask_offset : custom_mask_offset + row_mask_numel
+                    ].view(tree_budget, row_mask_width)
+                    custom_mask_offset += row_mask_numel
+
+                    req_row = int(model_worker_batch.req_pool_indices[row].item())
+                    prefix_slots = (
+                        req_to_token_debug[req_row, :prefix_len]
+                        .detach()
+                        .to("cpu", dtype=torch.int64)
+                        .tolist()
+                    )
+                    parents_cpu = (
+                        tree_parents[row, : num_real_nodes[row]]
+                        .detach()
+                        .to("cpu", dtype=torch.int64)
+                        .tolist()
+                    )
+                    tree_slots_cpu = (
+                        tree_cache_loc_2d[row]
+                        .detach()
+                        .to("cpu", dtype=torch.int64)
+                        .tolist()
+                    )
+                    max_dump_nodes = min(int(commit_lens[row].item()), block_size)
+                    for path_offset in range(max_dump_nodes):
+                        node = int(accept_index_local[row, path_offset].item())
+                        allowed_tree_cols = (
+                            torch.nonzero(
+                                row_mask[node, prefix_len:], as_tuple=False
+                            )
+                            .view(-1)
+                            .detach()
+                            .to("cpu", dtype=torch.int64)
+                            .tolist()
+                        )
+                        expected_tree_cols = []
+                        cur = node
+                        while cur >= 0 and cur < len(parents_cpu):
+                            expected_tree_cols.append(cur)
+                            cur = parents_cpu[cur]
+                        expected_tree_cols.reverse()
+                        allowed_set = set(allowed_tree_cols)
+                        expected_set = set(expected_tree_cols)
+                        extra_tree_cols = sorted(allowed_set - expected_set)
+                        missing_tree_cols = sorted(expected_set - allowed_set)
+                        logger.info(
+                            "DFLASH tree attended-set diff step=%s row=%s "
+                            "path_offset=%s node=%s prefix_len=%s "
+                            "expected_prefix_positions=[0,%s) "
+                            "expected_tree_cols=%s allowed_tree_cols=%s "
+                            "extra_tree_cols=%s missing_tree_cols=%s "
+                            "prefix_slots=%s expected_tree_slots=%s "
+                            "allowed_tree_slots=%s tree_slots_all=%s",
+                            step,
+                            row,
+                            path_offset,
+                            node,
+                            prefix_len,
+                            prefix_len,
+                            expected_tree_cols,
+                            allowed_tree_cols,
+                            extra_tree_cols,
+                            missing_tree_cols,
+                            prefix_slots,
+                            [tree_slots_cpu[idx] for idx in expected_tree_cols],
+                            [tree_slots_cpu[idx] for idx in allowed_tree_cols],
+                            tree_slots_cpu,
+                        )
+
         if os.environ.get("SGLANG_DFLASH_TREE_DEBUG"):
             step = int(getattr(self, "_dflash_tree_debug_step", 0))
             self._dflash_tree_debug_step = step + 1

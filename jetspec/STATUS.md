@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-28 05:01 UTC
+Updated: 2026-06-28 05:22 UTC
 
 ## Done / Committed
 
@@ -19,6 +19,44 @@ Updated: 2026-06-28 05:01 UTC
 - Realignment Job 1 2026-06-28: linear DFlash on dense Qwen3-8B now runs on the canonical FA4 target backend with `page_size=16`. The first unmodified launch rewrote `--page-size 16` to `128`; `python/sglang/srt/server_args.py` now keeps explicit FA4 page16 for DFlash while preserving the generic FA4 page128 auto-force. Fresh flushed width=1 oracle: `jetspec/runs/job1_fa4p16_linear_w1_flush_31811.json`, mean accept `3.5827`, aggregate `561.04 tok/s`.
 - Realignment Job 2 2026-06-28: dense FA4 page16 tree verify already routes through the multi-token custom-mask/FULL_MASK shape, not the FlashInfer compact path. No-reverify direct commit is still not lossless on FA4 page16; the first diagnostic shows exact layer-0 K/V but a layer-0 hidden delta, so the residual is in the FA4 tree/custom-mask verify execution shape rather than DFlash draft KV materialization. Retained-reverify w7/b64 and w7/b128 are token-exact against the fresh FA4 page16 oracle.
 - Realignment Job 3 2026-06-28: canonical MT-bench rerun completed on the aligned FA4 page16 backend. Width=1 linear reached `763.948 tok/s` with accept length `4.07`; dense tree w7/b64 with retained reverify reached `199.983 tok/s` with accept length `3.695`, so tree is `0.26x` linear (`3.82x` slower). No-reverify was not landed.
+- Mask root-cause Job 1 2026-06-28: dense FA4 page16 w7/b64 attended-set dump found that DFlash's generated tree mask is ancestor-exact, but FA4 does not enter the custom-mask target-verify path. For the first failing accepted node `3`, DFlash's custom mask allows only tree cols `[0, 3]`, but FA4's effective `topk<=1` causal verifier attends `[0, 1, 2, 3]`, admitting non-ancestor sibling/cousin cols `[1, 2]` (logical KV positions `[7, 8]`, physical slots `[23, 24]`). Root cause: FA4 gates the cascade/custom-mask verifier on backend `self.topk`, initialized from `speculative_eagle_topk=1`, instead of DFlash's per-verify `DFlashVerifyInput.topk=7` / `custom_mask`.
+
+## Mask Root-Cause Job 1 - FA4 Page16 Attended Set
+
+Date/time: 2026-06-28 05:13-05:20 UTC.
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Backend: `--attention-backend fa4 --page-size 16`
+- Tree: `--speculative-dflash-tree-width 7 --speculative-dflash-tree-budget 64`
+- Diagnostic env: accepted-path reverify disabled, causal/layer/KV compare enabled, attended-set dump enabled.
+
+Artifacts:
+- Server log: `jetspec/logs/job1_maskdump_fa4p16_tree_w7_b64_31932_server.log`
+- Earlier confirming log: `jetspec/logs/job1_maskdump_fa4p16_tree_w7_b64_31931_server.log`
+
+Exact failing step:
+- Compare step: `prefix=[6]`, `commit_lens=[2]`, accepted local path `[[0, 3]]`, branch candidates `[[12095, 13]]`.
+- Tree and clean causal branch predicted the same next tokens: `tree_predict=[[13, 576]]`, `branch_predict=[[13, 576]]`.
+- Hidden divergence reproduced at layer 0: `first_layer_hidden_delta=(0, 0.1357421875)`.
+- Layer-0 K/V were still exact: `kv_max_abs=(0.0, 0.0)`.
+
+Attended-set diff for accepted node `3`:
+- Correct causal set: committed prefix positions `[0,6)` plus self/ancestor tree cols `[0, 3]`.
+- DFlash `custom_mask` row: `allowed_tree_cols=[0, 3]`, `extra_tree_cols=[]`, `missing_tree_cols=[]`.
+- Physical slots for the correct tree cols: `[22, 25]`.
+- FA4 effective path: `effective_mode=linear_causal_no_custom_mask`, `allowed_tree_cols=[0, 1, 2, 3]`.
+- Wrong extras admitted by FA4: tree cols `[1, 2]`, logical KV positions `[7, 8]`, physical slots `[23, 24]`.
+- Missing positions: none.
+
+Root cause:
+- DFlash creates an EAGLE-style ancestor-only mask with prefix attention, matching `TreeMaskMode.FULL_MASK` semantics at the Python mask level.
+- EAGLE reaches FA4's custom-mask cascade verifier because `server_args.speculative_eagle_topk > 1`.
+- DFlash passes `DFlashVerifyInput.topk=7` and a 64-node `custom_mask`, but `FlashAttentionBackend` only checks backend `self.topk`, initialized from `server_args.speculative_eagle_topk` (`1` in DFlash).
+- Therefore dense DFlash FA4 target verify falls into the `topk<=1` causal path. That path treats the first `--speculative-num-draft-tokens 16` BFS nodes as a contiguous causal chain and ignores the DFlash tree mask, so node `3` attends sibling/cousin cols `1` and `2`.
+- This is the mask/index-construction bug that makes the accepted-path reverify necessary.
 
 ## Realignment Job 1 - FA4 Page16 Linear Baseline
 

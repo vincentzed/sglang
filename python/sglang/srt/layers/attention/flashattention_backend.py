@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -38,6 +40,142 @@ from sglang.jit_kernel.flash_attention import (
     flash_attn_with_kvcache,
 )
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+
+
+logger = logging.getLogger(__name__)
+
+
+def _dflash_fa4_debug_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _maybe_log_dflash_fa4_attended_set(
+    *,
+    spec_info: Optional[SpecInput],
+    seq_lens: torch.Tensor,
+    mask: torch.Tensor,
+    tree_slots: torch.Tensor,
+    compressed_tree_slots: torch.Tensor,
+    context: str,
+) -> None:
+    if os.environ.get("SGLANG_DFLASH_FA4_DUMP_ATTENDED_SET") != "1":
+        return
+    if spec_info is None or spec_info.__class__.__name__ != "DFlashVerifyInput":
+        return
+
+    num_verify_tokens = int(mask.shape[1])
+    if num_verify_tokens <= 0:
+        return
+
+    rows_raw = os.environ.get("SGLANG_DFLASH_FA4_DUMP_ROWS")
+    if rows_raw:
+        rows = []
+        for item in rows_raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                rows.append(int(item))
+            except ValueError:
+                continue
+    else:
+        limit = _dflash_fa4_debug_int_env(
+            "SGLANG_DFLASH_FA4_DUMP_ROW_LIMIT", 16
+        )
+        rows = list(range(min(limit, int(mask.shape[0]))))
+
+    prefix_lens = seq_lens.detach().to("cpu", dtype=torch.int64).tolist()
+    mask_cpu = mask.detach().to("cpu")
+    tree_slots_cpu = tree_slots.detach().to("cpu", dtype=torch.int64)
+    compressed_cpu = compressed_tree_slots.detach().to("cpu", dtype=torch.int64)
+    cache_lens_cpu = mask.sum(dim=1).detach().to("cpu", dtype=torch.int64).tolist()
+
+    for q_row in rows:
+        if q_row < 0 or q_row >= int(mask.shape[0]):
+            continue
+        req = q_row // num_verify_tokens
+        node = q_row % num_verify_tokens
+        prefix_len = prefix_lens[req] if req < len(prefix_lens) else None
+        allowed_cols = torch.nonzero(mask_cpu[q_row], as_tuple=False).view(-1).tolist()
+        cache_len = int(cache_lens_cpu[q_row])
+        logger.info(
+            "DFLASH FA4 attended set context=%s q_row=%s req=%s node=%s "
+            "prefix_len=%s allowed_tree_cols=%s tree_slots_all=%s "
+            "compressed_tree_slots=%s cache_len=%s",
+            context,
+            q_row,
+            req,
+            node,
+            prefix_len,
+            allowed_cols,
+            tree_slots_cpu[q_row].tolist(),
+            compressed_cpu[q_row, :cache_len].tolist(),
+            cache_len,
+        )
+
+
+def _maybe_log_dflash_fa4_linear_verify_attended_set(
+    *,
+    spec_info: Optional[SpecInput],
+    seq_lens: torch.Tensor,
+    verify_token_num: int,
+    context: str,
+) -> None:
+    if os.environ.get("SGLANG_DFLASH_FA4_DUMP_ATTENDED_SET") != "1":
+        return
+    if (
+        spec_info is None
+        or spec_info.__class__.__name__ != "DFlashVerifyInput"
+        or getattr(spec_info, "custom_mask", None) is None
+    ):
+        return
+
+    rows_raw = os.environ.get("SGLANG_DFLASH_FA4_DUMP_ROWS")
+    if rows_raw:
+        rows = []
+        for item in rows_raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                rows.append(int(item))
+            except ValueError:
+                continue
+    else:
+        limit = _dflash_fa4_debug_int_env(
+            "SGLANG_DFLASH_FA4_DUMP_ROW_LIMIT", 16
+        )
+        rows = list(range(min(limit, verify_token_num)))
+
+    prefix_lens = seq_lens.detach().to("cpu", dtype=torch.int64).tolist()
+    for q_row in rows:
+        if q_row < 0:
+            continue
+        req = q_row // verify_token_num
+        node = q_row % verify_token_num
+        prefix_len = prefix_lens[req] if req < len(prefix_lens) else None
+        if prefix_len is None:
+            continue
+        # topk<=1 target verify uses one causal q segment. For query row `node`,
+        # FA allows committed prefix plus contiguous draft columns [0, node].
+        allowed_tree_cols = list(range(node + 1))
+        logger.info(
+            "DFLASH FA4 attended set context=%s q_row=%s req=%s node=%s "
+            "prefix_len=%s effective_mode=linear_causal_no_custom_mask "
+            "allowed_tree_cols=%s",
+            context,
+            q_row,
+            req,
+            node,
+            prefix_len,
+            allowed_tree_cols,
+        )
 
 
 @dataclass
@@ -519,6 +657,12 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+                _maybe_log_dflash_fa4_linear_verify_attended_set(
+                    spec_info=forward_batch.spec_info,
+                    seq_lens=forward_batch.seq_lens,
+                    verify_token_num=self.speculative_num_draft_tokens,
+                    context="init_forward_metadata_topk_le_1",
+                )
 
                 self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
             else:
@@ -612,6 +756,14 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata_expand.cache_seqlens_int32, dim=0, dtype=torch.int32
                     ),
                     (1, 0),
+                )
+                _maybe_log_dflash_fa4_attended_set(
+                    spec_info=forward_batch.spec_info,
+                    seq_lens=forward_batch.seq_lens,
+                    mask=mask,
+                    tree_slots=non_masked_page_table,
+                    compressed_tree_slots=metadata_expand.page_table,
+                    context="init_forward_metadata",
                 )
                 self.forward_metadata_spec_decode_expand = metadata_expand
 
@@ -2323,6 +2475,12 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 page_indices //= self.page_size
                 metadata.page_table[:, :max_seq_pages].copy_(page_indices)
+                _maybe_log_dflash_fa4_linear_verify_attended_set(
+                    spec_info=spec_info,
+                    seq_lens=seq_lens,
+                    verify_token_num=self.speculative_num_draft_tokens,
+                    context="apply_cuda_graph_metadata_topk_le_1",
+                )
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
                 # 1. The first half of metadata for prefix tokens
@@ -2404,6 +2562,14 @@ class FlashAttentionBackend(AttentionBackend):
                         dim=0,
                         dtype=torch.int32,
                     )
+                )
+                _maybe_log_dflash_fa4_attended_set(
+                    spec_info=spec_info,
+                    seq_lens=seq_lens,
+                    mask=mask,
+                    tree_slots=non_masked_page_table,
+                    compressed_tree_slots=metadata_expand.page_table,
+                    context="apply_cuda_graph_metadata",
                 )
                 if self.has_swa:
                     metadata_swa = self.target_verify_metadata_topk_swa[bs]
