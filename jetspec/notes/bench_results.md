@@ -52,6 +52,47 @@ Verdict:
 - Tree does not beat linear on throughput. Dense tree improves mean accept length from 3.7569 to 4.5441/5.2161, but the fixed-shape tree verify cost and accepted-path replay/commit work swamp that gain. MoE tree does not improve accept length at all under the current accepted-path linear replay fallback, so it only adds tree verify overhead.
 - The practical bottleneck is not CUDA graph correctness anymore. The next lever is acceptance and amortization: crossproduct draft scoring/width/budget needs to raise dense acceptance much closer to the paper's 7-9 range, and the MoE direct KV/GDN-state commit path would need to replace the current correctness fallback before tree can plausibly beat width=1 linear on tok/s.
 
+## Perf pass: dense replay removal attempt and width/budget sweep
+
+Date/time: 2026-06-28 00:05-00:26 UTC.
+
+Mode:
+- Normal greedy serving mode: no deterministic flags, harness `temperature=0`.
+- CUDA graph enabled: `--cuda-graph-max-bs-decode 1`, decode backend `full`.
+- Dense target: `Qwen/Qwen3-8B`, draft: `JetSpec/jetspec-qwen3-8b`, `--attention-backend flashinfer`.
+- Fresh oracle for this pass: `jetspec/runs/perf1_8b_linear_cudagraph_31610.json`.
+
+Lever 1 result:
+- Attempted change: disable the dense CUDA-graph accepted-path reverify and commit the accepted expanded-causal tree KV directly by gathering accepted tree slots. The code change was reverted.
+- Full 10-prompt result before revert: `jetspec/runs/perf1_8b_tree_w7_b64_direct_commit_cudagraph_31611.json` was faster than Job 3 w7/b64 (`158.50 tok/s` vs `131.52 tok/s`) but failed the losslessness gate (`5/10` prompts mismatched vs `perf1_8b_linear_cudagraph_31610.json`).
+- Diagnostic result: `jetspec/runs/perf1_debug_prompt4_tree_w7_b64_direct_commit_compare_31612.json` reproduced prompt 4 divergence at first diff `11`. The built-in causal compare logged `same_shape_hidden_max_abs=0.0` and `same_shape_kv_max_abs=0.0` for early steps, but nonzero causal-branch deltas such as `hidden_max_abs=4.0` and KV deltas through the stack. That means the expanded-causal tree state is internally reproducible, but it is not token-exact equivalent to the accepted causal replay branch.
+- Conclusion: direct dense commit is not safe with the current verifier. The accepted-path replay is not just redundant overhead; it is preserving the causal branch state required for token-exact output.
+
+Lever 2 dense CUDA-graph sweep:
+
+| width | budget | artifact | token exact vs `perf1_8b_linear_cudagraph_31610.json` | mean accept length | aggregate tok/s | speed vs linear | accept > linear |
+|---:|---:|---|---:|---:|---:|---:|---:|
+| 1 | 16 | `jetspec/runs/perf1_8b_linear_cudagraph_31610.json` | oracle | 3.7569 | 511.38 | 1.00x | oracle |
+| 2 | 8 | `jetspec/logs/perf1_sweep_8b_tree_w2_b8_cudagraph_31620_server.log` | invalid launch | - | - | - | - |
+| 4 | 8 | `jetspec/logs/perf1_sweep_8b_tree_w4_b8_cudagraph_31621_server.log` | invalid launch | - | - | - | - |
+| 7 | 8 | `jetspec/logs/perf1_sweep_8b_tree_w7_b8_cudagraph_31622_server.log` | invalid launch | - | - | - | - |
+| 2 | 16 | `jetspec/runs/perf1_sweep_8b_tree_w2_b16_cudagraph_31623.json` | PASS | 3.7477 | 173.77 | 0.34x | no |
+| 4 | 16 | `jetspec/runs/perf1_sweep_8b_tree_w4_b16_cudagraph_31624.json` | PASS | 3.2309 | 169.18 | 0.33x | no |
+| 7 | 16 | `jetspec/runs/perf1_sweep_8b_tree_w7_b16_cudagraph_31625.json` | PASS | 2.9500 | 159.22 | 0.31x | no |
+| 2 | 32 | `jetspec/runs/perf1_sweep_8b_tree_w2_b32_cudagraph_31626.json` | PASS | 4.4810 | 155.15 | 0.30x | yes |
+| 4 | 32 | `jetspec/runs/perf1_sweep_8b_tree_w4_b32_cudagraph_31627.json` | PASS | 4.1024 | 163.84 | 0.32x | yes |
+| 7 | 32 | `jetspec/runs/perf1_sweep_8b_tree_w7_b32_cudagraph_31628.json` | PASS | 3.4931 | 154.34 | 0.30x | no |
+| 2 | 64 | `jetspec/runs/perf1_sweep_8b_tree_w2_b64_cudagraph_31629.json` | PASS | 4.5582 | 111.86 | 0.22x | yes |
+| 4 | 64 | `jetspec/runs/perf1_sweep_8b_tree_w4_b64_cudagraph_31630.json` | PASS | 4.8405 | 127.94 | 0.25x | yes |
+| 7 | 64 | `jetspec/runs/perf1_sweep_8b_tree_w7_b64_cudagraph_31631.json` | PASS | 4.5441 | 130.57 | 0.26x | yes |
+
+Sweep notes:
+- `tree_budget=8` is invalid for this draft head because the server requires `--speculative-dflash-tree-budget >= block_size`; the DFlash block size is 16.
+- Best dense tree tok/s in the valid sweep: w2/b16 at `173.77 tok/s`, but its mean accept length `3.7477` is slightly below the width=1 linear oracle `3.7569`.
+- Best dense tok/s while beating linear accept: w4/b32 at `163.84 tok/s`, mean accept `4.1024`, only `0.32x` the linear oracle throughput.
+- Best dense acceptance in the valid sweep: w4/b64 at mean accept `4.8405`, but only `127.94 tok/s` (`0.25x` linear). The prior Job 3 w7/b128 run reached mean accept `5.2161` at `85.69 tok/s`.
+- Acceptance ceiling conclusion: no swept config pushes dense acceptance meaningfully above about 5 toward the paper's 7-9 range. With the current draft head and current correctness replay, tree remains throughput-limited by fixed-shape verify plus accepted-path replay/commit overhead.
+
 ## 8B smoke pair
 
 Models:
