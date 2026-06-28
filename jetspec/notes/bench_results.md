@@ -55,6 +55,57 @@ Verdict:
 - A1 landed the main efficiency lever for dense verify: the target verify graph is compact and lossless with branch reverify.
 - It is not enough by itself to beat linear on the short 96-token harness. The remaining measured cost is the extra 64-node tree verify, the 16-token branch reverify, and tree/draft bookkeeping overhead. Job B must use the canonical MT-bench to see whether longer outputs amortize this enough to close the gap.
 
+## Job B canonical MT-bench after compact verify
+
+Date/time: 2026-06-28 02:47-03:03 UTC.
+
+Mode:
+- Canonical SGLang spec-decode benchmark: `benchmark/mtbench/bench_sglang_eagle.py`, MT-bench 80 questions, `--parallel 1`, `max_new_tokens=2048`.
+- Normal greedy serving mode: the benchmark sends `temperature=0`.
+- CUDA graph enabled: `--cuda-graph-max-bs-decode 1`, decode backend `full`; dense prefill graph left at normal default `tc_piecewise`.
+- Dense target: `Qwen/Qwen3-8B`, draft: `JetSpec/jetspec-qwen3-8b`, `--attention-backend flashinfer`.
+- Server-side cache behavior is normal. The only benchmark-side adjustment was disabling `sglang.global_config.global_config.enable_precache_with_tracing` before calling the canonical driver, because tree mode correctly rejects the frontend cache-prefix warmup as non-greedy when it is sent without the benchmark's `temperature=0` params.
+
+Launch knobs:
+
+```bash
+--speculative-algorithm DFLASH \
+--speculative-draft-model-path JetSpec/jetspec-qwen3-8b \
+--speculative-num-draft-tokens 16 \
+--reasoning-parser qwen3 \
+--attention-backend flashinfer \
+--tp-size 1 --mem-fraction-static 0.8 --trust-remote-code \
+--max-running-requests 1 \
+--cuda-graph-max-bs-decode 1 \
+--cuda-graph-backend-decode full
+```
+
+Tree adds:
+
+```bash
+--speculative-dflash-tree-width 7 \
+--speculative-dflash-tree-budget 64
+```
+
+Canonical results:
+
+| run | result artifact | answers | accept length | throughput | latency | speed vs linear |
+|---|---|---:|---:|---:|---:|---:|
+| 8B linear width=1 | `jetspec/runs/mtbench_a1_linear_noprecache_31722_result.jsonl` | 80/80 | 4.11 | 774.91 tok/s | 332.93 s | 1.00x |
+| 8B compact tree w7/b64 + branch reverify | `jetspec/runs/mtbench_a1_tree_w7_b64_noprecache_31723_result.jsonl` | 80/80 | 5.08 | 283.90 tok/s | 909.50 s | 0.37x |
+
+Raw result lines:
+
+```json
+{"task": "mtbench", "backend": "srt", "num_gpus": 1, "latency": 332.933, "throughput": 774.908, "accept_length": 4.11, "num_requests": 80, "other": {"num_questions": 80, "parallel": 1}}
+{"task": "mtbench", "backend": "srt", "num_gpus": 1, "latency": 909.503, "throughput": 283.903, "accept_length": 5.08, "num_requests": 80, "other": {"num_questions": 80, "parallel": 1}}
+```
+
+Benchmark verdict:
+- Tree's accept length is real and better on the canonical benchmark: `5.08` vs linear `4.11`, a `1.24x` acceptance gain.
+- The compact verifier still does not make tree beat or match linear. Tree reaches only `0.37x` linear throughput, or `2.73x` slower wall-clock, despite the 12.8x verify-position reduction from A1.
+- The expanded-causal verify blowup is no longer the dominant measured cost for w7/b64. Remaining costs are the extra 64-node compact target verify, the 16-token causal accepted-branch reverify needed for token-exact commit, and tree/draft bookkeeping. The next real lever is removing or shrinking those residual costs without losing causal-branch equivalence; otherwise the current accept gain is not enough to pay for tree verification.
+
 ## Job 3 final CUDA graph perf
 
 Date/time: 2026-06-27 23:41-23:49 UTC.

@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-28 02:25 UTC
+Updated: 2026-06-28 03:10 UTC
 
 ## Done / Committed
 
@@ -13,7 +13,8 @@ Updated: 2026-06-28 02:25 UTC
 - `ff275594dd`: recorded Job 2 status and validation artifacts.
 - `e8d533a19c`: recorded Job 3 normal-mode CUDA graph performance results and verdict in `jetspec/notes/bench_results.md`.
 - Perf pass 2026-06-28: attempted dense direct accepted-path commit, reverted it after token-exactness failed, then swept dense CUDA-graph tree width/budget. Results are recorded in `jetspec/notes/bench_results.md`.
-- Job A1 2026-06-28: dense FlashInfer tree verify now defaults to the compact custom-mask verifier and uses a causal accepted-branch reverify/commit for losslessness. For w7/b64, target tree-verify graph shape drops from expanded `64 * 16 = 1024` positions/request to compact `64` positions/request plus a `16`-position branch reverify.
+- `dd1cc2947f`: Job A1 dense FlashInfer tree verify now defaults to the compact custom-mask verifier and uses a causal accepted-branch reverify/commit for losslessness. For w7/b64, target tree-verify graph shape drops from expanded `64 * 16 = 1024` positions/request to compact `64` positions/request plus a `16`-position branch reverify.
+- Job B 2026-06-28: canonical MT-bench rerun completed for width=1 linear and compact tree w7/b64. Tree raised accept length from `4.11` to `5.08`, but throughput fell from `774.91` to `283.90 tok/s`, so compact tree is still `0.37x` linear on the real benchmark.
 
 ## Job 0 Validation
 
@@ -43,10 +44,6 @@ Notes:
 
 ## In Progress
 
-- Job B canonical MT-bench measurement: rerun linear DFlash vs compact tree DFlash with `benchmark/mtbench/bench_sglang_eagle.py`.
-
-Exact next step:
-- Run the canonical MT-bench with the same normal-mode CUDA-graph settings for width=1 linear and compact tree w7/b64. The short fixed-prompt gate below shows the verify-position drop is real and lossless, but tree still trails linear on the 96-token harness.
 - MoE direct exact KV/GDN-state commit remains a follow-up. It was not attempted in this pass.
 
 ## Job A1 Efficient Dense Verify
@@ -80,6 +77,38 @@ Local checks after A1:
 - `PYTHONPATH=python python -m py_compile python/sglang/srt/speculative/dflash_worker_v2.py python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py`: PASS
 - `PYTHONPATH=python python test/registered/unit/spec/test_dflash_tree_construction.py`: PASS, 18 tests
 - `git diff --check`: PASS
+
+## Job B Canonical MT-bench
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Backend: `--attention-backend flashinfer`
+- Normal greedy mode: canonical driver sets `temperature=0`
+- CUDA graph enabled: `--cuda-graph-max-bs-decode 1`, decode backend `full`; prefill graph left in normal default `tc_piecewise` mode.
+- Harness: `benchmark/mtbench/bench_sglang_eagle.py`, 80 MT-bench questions, `--parallel 1`, `max_new_tokens=2048`.
+
+Canonical-driver note:
+- The unmodified driver succeeded for width=1 linear, but tree mode rejected the driver's frontend traced-prefix-cache warmup before generation because that warmup sends a cache-prefix request without the benchmark's greedy `temperature=0` sampling params.
+- The fair pair below disables only `sglang.global_config.global_config.enable_precache_with_tracing` before calling the canonical driver. Server-side radix cache remains enabled, and generation still uses the same canonical MT-bench request path.
+
+Artifacts:
+
+| run | artifact | num questions | accept length | throughput | latency | speed vs linear |
+|---|---|---:|---:|---:|---:|---:|
+| 8B linear width=1 | `jetspec/runs/mtbench_a1_linear_noprecache_31722_result.jsonl` | 80 | 4.11 | 774.91 tok/s | 332.93 s | 1.00x |
+| 8B compact tree w7/b64 + branch reverify | `jetspec/runs/mtbench_a1_tree_w7_b64_noprecache_31723_result.jsonl` | 80 | 5.08 | 283.90 tok/s | 909.50 s | 0.37x |
+
+Answer files:
+- `jetspec/runs/mtbench_a1_linear_noprecache_31722_answers.jsonl`: 80 rows
+- `jetspec/runs/mtbench_a1_tree_w7_b64_noprecache_31723_answers.jsonl`: 80 rows
+- `jetspec/runs/mtbench_question.jsonl`: 80 rows
+
+Verdict:
+- Longer canonical outputs do amortize some fixed overhead and improve tree's measured accept length to `5.08`, which is `1.24x` the linear accept length.
+- The efficient compact verify still does not make tree beat or match linear. Tree is `2.73x` slower end-to-end on MT-bench (`283.90` vs `774.91 tok/s`).
+- The remaining measured cost is no longer the expanded `tree_budget * block_size` verify blowup. For w7/b64 that is fixed from `1024` target positions/request to about `80`. The remaining cost is the extra 64-node compact target verify, the 16-token causal accepted-branch reverify required for lossless commit, and tree/draft bookkeeping that still dominates the accept-length gain.
 
 ## Job 1 Validation
 
