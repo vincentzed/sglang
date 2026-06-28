@@ -75,6 +75,65 @@ Verdict:
 - Dense accepted-path reverify is gone in the compact FA4 dense path and the fresh flushed oracle gates pass for both required budgets.
 - Short fixed-prompt throughput is still well below linear because compact tree verify is eager and performs a ragged prefix+ancestor gather for every tree node. Job 3 must measure the real MT-bench tradeoff.
 
+## Mask root-cause Job 3 FA4 page16 canonical MT-bench, no dense reverify
+
+Date/time: 2026-06-28 06:14-06:41 UTC.
+
+Mode:
+- Canonical SGLang spec-decode benchmark: `benchmark/mtbench/bench_sglang_eagle.py`, MT-bench 80 questions, `--parallel 1`, `max_new_tokens=2048`.
+- Normal greedy serving mode: the benchmark sends `temperature=0`.
+- CUDA graph enabled for normal decode: `--cuda-graph-max-bs-decode 1`, decode backend `full`; dense prefill graph left at normal default `tc_piecewise`.
+- Dense target: `Qwen/Qwen3-8B`, draft: `JetSpec/jetspec-qwen3-8b`.
+- Canonical backend/page: `--attention-backend fa4 --page-size 16`.
+- Tree configuration: `--speculative-dflash-tree-width 7 --speculative-dflash-tree-budget 64`.
+- Tree correctness mode: dense accepted-path reverify removed; accepted tree KV is committed directly.
+- The tree benchmark process disabled only `sglang.global_config.global_config.enable_precache_with_tracing`, matching the prior tree MT-bench methodology.
+
+Launch knobs:
+
+```bash
+--speculative-algorithm DFLASH \
+--speculative-draft-model-path JetSpec/jetspec-qwen3-8b \
+--speculative-num-draft-tokens 16 \
+--reasoning-parser qwen3 \
+--attention-backend fa4 \
+--page-size 16 \
+--tp-size 1 --mem-fraction-static 0.8 --trust-remote-code \
+--max-running-requests 1 \
+--cuda-graph-max-bs-decode 1 \
+--cuda-graph-backend-decode full
+```
+
+Tree adds:
+
+```bash
+--speculative-dflash-tree-width 7 \
+--speculative-dflash-tree-budget 64
+```
+
+Canonical results:
+
+| run | result artifact | answers | accept length | throughput | latency | speed vs linear |
+|---|---|---:|---:|---:|---:|---:|
+| 8B linear width=1 | `jetspec/runs/mtbench_maskfix_fa4p16_linear_31945_result.jsonl` | 80/80 | 4.070 | 764.540 tok/s | 334.626 s | 1.00x |
+| 8B tree w7/b64, no dense accepted-path reverify | `jetspec/runs/mtbench_maskfix_fa4p16_tree_w7_b64_noreverify_noprecache_31946_result.jsonl` | 80/80 | 5.053 | 243.000 tok/s | 1052.817 s | 0.32x |
+
+Answer equality:
+- Linear and tree answer `choices` match exactly: 0/80 mismatches.
+
+Raw result lines:
+
+```json
+{"task": "mtbench", "backend": "srt", "num_gpus": 1, "latency": 334.626, "throughput": 764.54, "accept_length": 4.07, "num_requests": 80, "other": {"num_questions": 80, "parallel": 1}}
+{"task": "mtbench", "backend": "srt", "num_gpus": 1, "latency": 1052.817, "throughput": 243.0, "accept_length": 5.053, "num_requests": 80, "other": {"num_questions": 80, "parallel": 1}}
+```
+
+Benchmark verdict:
+- Removing dense accepted-path reverify is a real improvement over the prior FA4 page16 tree+reverify result: `243.000` vs `199.983 tok/s`, or `1.22x` faster.
+- Dense tree still does not beat or match width=1 linear: `243.000` vs `764.540 tok/s`, so tree is `0.32x` linear throughput and `3.15x` slower wall-clock.
+- The acceptance gain is real (`5.053` vs `4.070`, `1.24x`), but it is not enough to pay for the ragged compact FA4 tree verify and DFlash tree/draft overhead.
+- MoE remains unchanged.
+
 ## Caveats
 
 - `--attention-backend fa3` is not usable on this B300/SM100 host in this checkout: launch fails with `FlashAttention v3 Backend requires SM>=80 and SM<=90. Please use --attention-backend flashinfer.` The 8B smoke pair was therefore run with `--attention-backend flashinfer`.

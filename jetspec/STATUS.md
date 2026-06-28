@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-28 06:12 UTC
+Updated: 2026-06-28 06:42 UTC
 
 ## Done / Committed
 
@@ -21,6 +21,46 @@ Updated: 2026-06-28 06:12 UTC
 - Realignment Job 3 2026-06-28: canonical MT-bench rerun completed on the aligned FA4 page16 backend. Width=1 linear reached `763.948 tok/s` with accept length `4.07`; dense tree w7/b64 with retained reverify reached `199.983 tok/s` with accept length `3.695`, so tree is `0.26x` linear (`3.82x` slower). No-reverify was not landed.
 - Mask root-cause Job 1 2026-06-28: dense FA4 page16 w7/b64 attended-set dump found that DFlash's generated tree mask is ancestor-exact, but FA4 does not enter the custom-mask target-verify path. For the first failing accepted node `3`, DFlash's custom mask allows only tree cols `[0, 3]`, but FA4's effective `topk<=1` causal verifier attends `[0, 1, 2, 3]`, admitting non-ancestor sibling/cousin cols `[1, 2]` (logical KV positions `[7, 8]`, physical slots `[23, 24]`). Root cause: FA4 gates the cascade/custom-mask verifier on backend `self.topk`, initialized from `speculative_eagle_topk=1`, instead of DFlash's per-verify `DFlashVerifyInput.topk=7` / `custom_mask`.
 - Mask root-cause Job 2 2026-06-28: dense FA4 page16 tree verify now uses an exact compact KV index list for each query row, so every accepted node reads exactly committed prefix plus self/ancestors. The dense accepted-path reverify is removed for compact dense target verify, and accepted KV is committed directly by copying accepted tree slots into the canonical next-prefix slots. Fresh flushed FA4 page16 width=1 oracle gates passed for w7/b64 and w7/b128 with zero token mismatches.
+- Mask root-cause Job 3 2026-06-28: canonical MT-bench rerun completed with the dense reverify removed. FA4 page16 width=1 linear reached `764.540 tok/s` with accept length `4.070`; dense tree w7/b64 no-reverify reached `243.000 tok/s` with accept length `5.053`. Tree improves over the old retained-reverify tree (`199.983 tok/s`) but is still only `0.32x` linear (`3.15x` slower), so dense tree does not beat or match linear yet.
+
+## Mask Root-Cause Job 3 - FA4 Page16 MT-bench, No Dense Reverify
+
+Date/time: 2026-06-28 06:14-06:41 UTC.
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Backend: `--attention-backend fa4 --page-size 16`
+- Normal decode graph settings: `--cuda-graph-max-bs-decode 1 --cuda-graph-backend-decode full`
+- Harness: `benchmark/mtbench/bench_sglang_eagle.py`, 80 MT-bench questions, `--parallel 1`, `max_new_tokens=2048`
+- Tree pass: dense w7/b64 with accepted-path reverify removed. The benchmark process disabled only `sglang.global_config.global_config.enable_precache_with_tracing`.
+
+Artifacts:
+
+| run | result artifact | answers | accept length | throughput | latency | speed vs linear |
+|---|---|---:|---:|---:|---:|---:|
+| 8B linear width=1 | `jetspec/runs/mtbench_maskfix_fa4p16_linear_31945_result.jsonl` | 80/80 | 4.070 | 764.540 tok/s | 334.626 s | 1.00x |
+| 8B tree w7/b64, no dense accepted-path reverify | `jetspec/runs/mtbench_maskfix_fa4p16_tree_w7_b64_noreverify_noprecache_31946_result.jsonl` | 80/80 | 5.053 | 243.000 tok/s | 1052.817 s | 0.32x |
+
+Answer files:
+- `jetspec/runs/mtbench_maskfix_fa4p16_linear_31945_answers.jsonl`: 80 rows
+- `jetspec/runs/mtbench_maskfix_fa4p16_tree_w7_b64_noreverify_noprecache_31946_answers.jsonl`: 80 rows
+- `jetspec/runs/mtbench_question.jsonl`: 80 rows
+- Linear and tree answer `choices` match exactly: 0/80 mismatches.
+
+Raw result lines:
+
+```json
+{"task": "mtbench", "backend": "srt", "num_gpus": 1, "latency": 334.626, "throughput": 764.54, "accept_length": 4.07, "num_requests": 80, "other": {"num_questions": 80, "parallel": 1}}
+{"task": "mtbench", "backend": "srt", "num_gpus": 1, "latency": 1052.817, "throughput": 243.0, "accept_length": 5.053, "num_requests": 80, "other": {"num_questions": 80, "parallel": 1}}
+```
+
+Verdict:
+- Removing the dense accepted-path reverify improves tree throughput versus the prior FA4 page16 retained-reverify tree run: `243.000` vs `199.983 tok/s` (`1.22x`).
+- Dense tree still does not beat or match width=1 linear: `243.000` vs `764.540 tok/s`, or `0.32x` linear throughput (`3.15x` slower).
+- Tree acceptance is higher than linear (`5.053` vs `4.070`, `1.24x`), but the ragged compact FA4 tree verify and tree/draft bookkeeping still dominate the saved target forwards.
+- MoE was not changed.
 
 ## Mask Root-Cause Job 2 - FA4 Page16 Compact Exact Verify, No Dense Reverify
 

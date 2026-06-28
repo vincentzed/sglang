@@ -1,0 +1,1 @@
+{"task": "mtbench", "backend": "srt", "num_gpus": 1, "latency": 334.626, "throughput": 764.54, "accept_length": 4.07, "num_requests": 80, "other": {"num_questions": 80, "parallel": 1}}
