@@ -18,6 +18,38 @@ Hardware/env:
 - The MoE server accepts `--attention-backend trtllm_mha` for the target, but the DFlash draft worker logs: `DFLASH draft worker does not support 'trtllm_mha' because the draft path requires per-layer DFlash attention. Falling back to 'flashinfer'.`
 - `z-lab/Qwen3.6-35B-A3B-DFlash` config was fetched under `jetspec/_hf_configs/` and confirmed `architectures: ["DFlashDraftModel"]`.
 
+## Realignment Job 1 FA4 page16 linear baseline
+
+Date/time: 2026-06-28 04:11-04:13 UTC.
+
+Mode:
+- Normal greedy serving mode: no deterministic flags, harness `temperature=0`.
+- CUDA graph enabled: `--cuda-graph-max-bs-decode 1`, decode backend `full`; prefill graph left at the normal `tc_piecewise` default.
+- Dense target: `Qwen/Qwen3-8B`, draft: `JetSpec/jetspec-qwen3-8b`.
+- Canonical backend/page: `--attention-backend fa4 --page-size 16`.
+- Harness: `jetspec/run_fixed_prompts.py`, 10 prompts, `max_new_tokens=96`, `--flush-cache-before-run --flush-cache-between-prompts`.
+
+Launch correction:
+- A pre-patch foreground launch proved the existing FA4 non-MLA guard rewrote `--page-size 16` to runtime `page_size=128`, which would have recreated the non-canonical baseline problem.
+- `python/sglang/srt/server_args.py` now keeps explicit DFlash FA4 page16 while leaving the generic FA4 non-MLA page128 rewrite in place.
+- The accepted launch log `jetspec/logs/job1_fa4p16_linear_w1_31811_server.log` shows `page_size=16`, `attention_backend='fa4'`, DFlash block size `16`, and target verify graph capture with `num_tokens_per_bs=16`.
+
+Fixed-prompt result:
+
+| run | artifact | backend/page | mean accept length | aggregate tok/s | mean prompt tok/s |
+|---|---|---|---:|---:|---:|
+| 8B linear width=1 flushed oracle | `jetspec/runs/job1_fa4p16_linear_w1_flush_31811.json` | `fa4`, `page_size=16` | 3.5827 | 561.04 | 687.74 |
+
+Raw summary:
+
+```json
+{"aggregate_tok_per_s": 561.0427603854891, "mean_accept_length": 3.5827345795966488, "mean_per_prompt_tok_per_s": 687.7366106441112, "num_prompts": 10, "total_completion_tokens": 952, "total_e2e_latency": 1.696840360877104}
+```
+
+Verdict:
+- Linear DFlash is healthy on the aligned FA4 page16 backend.
+- This fresh flushed oracle replaces the old flashinfer/page_size=1 oracles for the dense tree losslessness gates in the realignment pass.
+
 ## Job A1 compact dense verify
 
 Date/time: 2026-06-28 02:16-02:24 UTC.

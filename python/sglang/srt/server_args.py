@@ -4879,15 +4879,19 @@ class ServerArgs:
             )
             and not self.use_mla_backend()
             and is_sm100_supported()
-            # EAGLE topk>1 spec runs the two-pass page-tree cascade, which the FA4
-            # CUTLASS kernel aborts on at page_size>1. That path only works at
-            # page_size==1, so skip the 128 auto-force for it and keep the default.
-            and (self.speculative_eagle_topk or 0) <= 1
         ):
-            logger.warning(
-                f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {self.page_size} to 128."
+            # DFlash's Blackwell verify path is validated with FA4 page_size=16.
+            # Keep the generic FA4 non-MLA page_size=128 default for everything
+            # else, including ordinary topk=1 decode.
+            keep_fa4_page_size = (
+                str(self.speculative_algorithm).upper() == "DFLASH"
+                and self.page_size == 16
             )
-            self.page_size = 128
+            if not keep_fa4_page_size and (self.speculative_eagle_topk or 0) <= 1:
+                logger.warning(
+                    f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {self.page_size} to 128."
+                )
+                self.page_size = 128
 
         # AMD platforms backends
         if self.attention_backend == "aiter":

@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-28 03:57 UTC
+Updated: 2026-06-28 04:15 UTC
 
 ## Done / Committed
 
@@ -16,6 +16,34 @@ Updated: 2026-06-28 03:57 UTC
 - `dd1cc2947f`: Job A1 dense FlashInfer tree verify now defaults to the compact custom-mask verifier and uses a causal accepted-branch reverify/commit for losslessness. For w7/b64, target tree-verify graph shape drops from expanded `64 * 16 = 1024` positions/request to compact `64` positions/request plus a `16`-position branch reverify.
 - Job B 2026-06-28: canonical MT-bench rerun completed for width=1 linear and compact tree w7/b64. Tree raised accept length from `4.11` to `5.08`, but throughput fell from `774.91` to `283.90 tok/s`, so compact tree is still `0.37x` linear on the real benchmark.
 - Direct-commit causal-equivalence probe 2026-06-28: dense no-reverify direct commit remains blocked. The fresh flushed w7/b64 gate failed `6/10` prompts, and per-layer diagnostics show the first accepted-path discrepancy at layer-0 attention output while layer-0 K/V are still identical to the clean causal branch.
+- Realignment Job 1 2026-06-28: linear DFlash on dense Qwen3-8B now runs on the canonical FA4 target backend with `page_size=16`. The first unmodified launch rewrote `--page-size 16` to `128`; `python/sglang/srt/server_args.py` now keeps explicit FA4 page16 for DFlash while preserving the generic FA4 page128 auto-force. Fresh flushed width=1 oracle: `jetspec/runs/job1_fa4p16_linear_w1_flush_31811.json`, mean accept `3.5827`, aggregate `561.04 tok/s`.
+
+## Realignment Job 1 - FA4 Page16 Linear Baseline
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Backend: `--attention-backend fa4 --page-size 16`
+- Normal greedy mode: no deterministic flags, harness `temperature=0`
+- CUDA graph enabled: `--cuda-graph-max-bs-decode 1`, decode backend `full`; prefill graph left at the normal `tc_piecewise` default.
+- Harness: `PYTHONPATH=python python jetspec/run_fixed_prompts.py`, 10 fixed prompts, `max_new_tokens=96`, `--flush-cache-before-run --flush-cache-between-prompts`
+
+Launch correction:
+- Before this pass, FA4 non-MLA server-arg normalization rewrote DFlash `--page-size 16` to `128`, so the requested canonical baseline could not actually run as page16.
+- The guard now exempts explicit DFlash FA4 page16 from that rewrite. Generic FA4 non-MLA topk=1 decode still keeps the existing page128 auto-force.
+- Evidence: server log `jetspec/logs/job1_fa4p16_linear_w1_31811_server.log` shows `page_size=16`, `attention_backend='fa4'`, DFlash block size `16`, and target verify graph capture with `num_tokens_per_bs=16`.
+
+Artifact:
+
+| run | artifact | server backend/page | token exact | mean accept length | aggregate tok/s |
+|---|---|---|---:|---:|---:|
+| 8B linear width=1 fresh flushed oracle | `jetspec/runs/job1_fa4p16_linear_w1_flush_31811.json` | `fa4`, `page_size=16` | oracle | 3.5827 | 561.04 |
+
+Notes:
+- A background `nohup` launch on port `31810` died with a zero-byte log, so the server was relaunched in a foreground tool session with output also saved through `tee`.
+- A foreground pre-patch launch confirmed the failure mode: SGLang accepted `--attention-backend fa4 --page-size 16` but rewrote runtime `page_size` to `128`. No oracle from that misaligned launch is used.
+- This FA4 page16 oracle is the baseline for the dense tree losslessness gates in Job 2.
 
 ## Job 0 Validation
 
