@@ -2367,6 +2367,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             if use_flashinfer_expanded_causal_tree
             else (1 if use_compact_tree_verify else tree_budget)
         )
+        compact_fa4_can_try_cuda_graph = bool(
+            use_compact_tree_verify
+            and target_model_runner.decode_cuda_graph_runner
+            and getattr(
+                target_model_runner.decode_cuda_graph_runner,
+                "dflash_tree_compact_fa4_graph",
+                False,
+            )
+        )
         verify_input = DFlashVerifyInput(
             draft_token=verify_draft_token,
             positions=verify_positions,
@@ -2402,7 +2411,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             max_tree_depth=block_size,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            allow_cuda_graph=not use_compact_tree_verify,
+            allow_cuda_graph=(
+                compact_fa4_can_try_cuda_graph
+                if use_compact_tree_verify
+                else True
+            ),
             compact_kv_indices=compact_kv_indices,
             compact_kv_indptr=compact_kv_indptr,
             compact_qo_indptr=compact_qo_indptr,
@@ -2583,10 +2596,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                             verify_forward_batch.mrope_positions = (
                                 verify_positions.unsqueeze(0).repeat(3, 1)
                             )
-                        verify_forward_batch.allow_cuda_graph = False
-                        target_model_runner.attn_backend.init_forward_metadata(
-                            verify_forward_batch
+                        verify_forward_batch.allow_cuda_graph = (
+                            verify_input.allow_cuda_graph
                         )
+                        compact_can_run_cuda_graph = bool(
+                            verify_forward_batch.allow_cuda_graph
+                            and target_model_runner.decode_cuda_graph_runner
+                            and target_model_runner.decode_cuda_graph_runner.can_run_graph(
+                                verify_forward_batch
+                            )
+                        )
+                        if compact_can_run_cuda_graph:
+                            skip_attn_backend_init = None
+                        else:
+                            verify_forward_batch.allow_cuda_graph = False
+                            target_model_runner.attn_backend.init_forward_metadata(
+                                verify_forward_batch
+                            )
                     else:
                         if draft_input.planning_seq_lens_cpu is not None:
                             model_worker_batch.seq_lens_cpu = (

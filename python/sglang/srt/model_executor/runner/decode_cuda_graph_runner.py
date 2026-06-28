@@ -233,10 +233,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
         self.dflash_tree_expanded_causal_graph = False
+        self.dflash_tree_compact_fa4_graph = False
         self.dflash_tree_graph_rows_per_request = 1
         self.dflash_tree_graph_uses_full_attn_replacement = False
         self.dflash_tree_graph_full_attn_backend = None
         self.dflash_tree_graph_original_full_attn_backend = None
+        self.dflash_tree_compact_kv_buckets: list[int] = []
+        self.dflash_tree_compact_kv_indices_buffers: dict[int, torch.Tensor] = {}
+        self.dflash_tree_compact_kv_indptr_buffers: dict[int, torch.Tensor] = {}
+        self.dflash_tree_compact_qo_indptr_buffers: dict[int, torch.Tensor] = {}
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
@@ -259,6 +264,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     is not None
                 ):
                     active_attn_backend = active_attn_backend.full_attn_backend
+                self.dflash_tree_compact_fa4_graph = (
+                    type(active_attn_backend).__name__ == "FlashAttentionBackend"
+                    and getattr(active_attn_backend, "fa_impl_ver", None) == 4
+                    and os.environ.get(
+                        "SGLANG_DFLASH_TREE_COMPACT_FA4_CUDA_GRAPH", "1"
+                    )
+                    != "0"
+                )
                 self.dflash_tree_expanded_causal_graph = (
                     type(active_attn_backend).__name__ == "FlashInferAttnBackend"
                     and os.environ.get("SGLANG_DFLASH_TREE_VERIFY_BACKEND") is None
@@ -267,7 +280,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     and os.environ.get("SGLANG_DFLASH_TREE_EXPANDED_CAUSAL", "0")
                     == "1"
                 )
-                if self.dflash_tree_expanded_causal_graph:
+                if self.dflash_tree_compact_fa4_graph:
+                    # Compact FA4 verify already has one query row per tree
+                    # node. Capture that exact row-shaped verifier with one
+                    # token per row; replay only pads rows and K/V gather
+                    # buffers, not attention math on real entries.
+                    self.num_tokens_per_bs = 1
+                    self.dflash_tree_graph_rows_per_request = int(
+                        model_runner.server_args.speculative_dflash_tree_budget
+                    )
+                elif self.dflash_tree_expanded_causal_graph:
                     # FlashInfer's exact tree verifier expands each tree node
                     # into one causal row of block_size tokens. The graph shape
                     # is therefore (request_bs * tree_budget) rows by
@@ -305,7 +327,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # startup graph capture plan tens of thousands of verify tokens. Cap
             # tree verify capture to realistic request buckets and roughly the
             # same total-token scale as EAGLE topk>1.
-            if self.dflash_tree_expanded_causal_graph:
+            if (
+                self.dflash_tree_expanded_causal_graph
+                or self.dflash_tree_compact_fa4_graph
+            ):
                 row_multiplier = self.dflash_tree_graph_rows_per_request
                 self.capture_bs = sorted(
                     {int(bs) * row_multiplier for bs in self.capture_bs}
@@ -467,6 +492,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             dp_size=self.dp_size,
             source=self.buffers,
         )
+        if self.dflash_tree_compact_fa4_graph:
+            self._init_dflash_tree_compact_graph_buffers()
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
@@ -526,6 +553,132 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
+    @staticmethod
+    def _dflash_compact_variant_label(bucket: int) -> str:
+        return f"dflash_compact_kv{int(bucket)}"
+
+    @staticmethod
+    def _dflash_compact_bucket_from_variant(
+        variant_label: Optional[str],
+    ) -> Optional[int]:
+        prefix = "dflash_compact_kv"
+        if variant_label is None or not variant_label.startswith(prefix):
+            return None
+        return int(variant_label[len(prefix) :])
+
+    def _init_dflash_tree_compact_graph_buffers(self) -> None:
+        raw = os.environ.get(
+            "SGLANG_DFLASH_TREE_COMPACT_KV_BUCKETS",
+            "96,128,160,192,224,256,320,384,448,512,640,768,896,1024,1280,1536,1792,2048",
+        )
+        buckets = sorted({int(piece) for piece in raw.split(",") if piece.strip()})
+        if not buckets:
+            raise ValueError("SGLANG_DFLASH_TREE_COMPACT_KV_BUCKETS is empty")
+        self.dflash_tree_compact_kv_buckets = buckets
+        with torch.device(self.device):
+            self.dflash_tree_compact_qo_indptr_buffers = {
+                bucket: torch.arange(
+                    0, self.max_bs + 1, dtype=torch.int32, device=self.device
+                )
+                for bucket in buckets
+            }
+            for bucket in buckets:
+                capacity = self.max_bs * bucket
+                self.dflash_tree_compact_kv_indices_buffers[bucket] = torch.zeros(
+                    capacity, dtype=torch.long, device=self.device
+                )
+                self.dflash_tree_compact_kv_indptr_buffers[bucket] = torch.arange(
+                    0,
+                    (self.max_bs + 1) * bucket,
+                    step=bucket,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+        logger.info(
+            "DFLASH compact FA4 target verify CUDA graph KV-span buckets: %s",
+            buckets,
+        )
+
+    def _dflash_compact_kv_bucket_for_forward_batch(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[int]:
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if (
+            not self.dflash_tree_compact_fa4_graph
+            or spec_info is None
+            or spec_info.__class__.__name__ != "DFlashVerifyInput"
+            or getattr(spec_info, "compact_kv_indices", None) is None
+        ):
+            return None
+        if forward_batch.seq_lens_cpu is None:
+            return None
+        max_kv_span = int(forward_batch.seq_lens_cpu.max().item())
+        for bucket in self.dflash_tree_compact_kv_buckets:
+            if max_kv_span <= bucket:
+                return bucket
+        return None
+
+    def _fill_dflash_compact_graph_buffers(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        raw_bs: int,
+        padded_bs: int,
+        bucket: int,
+    ) -> None:
+        spec_info = forward_batch.spec_info
+        compact_indices = spec_info.compact_kv_indices
+        compact_indptr = spec_info.compact_kv_indptr
+        if compact_indices is None or compact_indptr is None:
+            raise RuntimeError("DFlash compact graph replay missing compact KV metadata")
+
+        index_buf = self.dflash_tree_compact_kv_indices_buffers[bucket]
+        indptr_buf = self.dflash_tree_compact_kv_indptr_buffers[bucket]
+        qo_indptr_buf = self.dflash_tree_compact_qo_indptr_buffers[bucket]
+
+        raw_kv_numel = int(compact_indices.numel())
+        padded_capacity = padded_bs * bucket
+        padded_kv_numel = raw_kv_numel + max(0, padded_bs - raw_bs)
+        if raw_kv_numel > padded_capacity:
+            raise RuntimeError(
+                "DFlash compact graph KV metadata exceeds selected bucket: "
+                f"raw_kv_numel={raw_kv_numel}, capacity={padded_capacity}, "
+                f"bucket={bucket}, padded_bs={padded_bs}."
+            )
+        if padded_kv_numel > padded_capacity:
+            raise RuntimeError(
+                "DFlash compact graph padded KV metadata exceeds selected bucket: "
+                f"padded_kv_numel={padded_kv_numel}, capacity={padded_capacity}, "
+                f"bucket={bucket}, padded_bs={padded_bs}."
+            )
+
+        # Keep the exact compact FA4 layout for real rows: copy the contiguous
+        # KV list and the real row offsets into static graph buffers.  The
+        # static tensor capacity pads graph shape only; FA4 still sees real
+        # cu_seqlens values, so padding is not part of attention math.
+        index_buf[:raw_kv_numel].copy_(compact_indices.to(dtype=torch.long))
+        indptr_buf[: raw_bs + 1].copy_(compact_indptr.to(dtype=torch.int32))
+
+        if padded_bs > raw_bs:
+            pad_rows = padded_bs - raw_bs
+            # Give padded query rows a harmless one-token KV span at slot 0 so
+            # the captured varlen kernel never sees an empty sequence.  Outputs
+            # for padded rows are sliced away after replay.
+            pad_start = raw_kv_numel
+            pad_end = raw_kv_numel + pad_rows
+            index_buf[pad_start:pad_end].zero_()
+            pad_offsets = torch.arange(
+                1, pad_rows + 1, dtype=torch.int32, device=self.device
+            )
+            indptr_buf[raw_bs + 1 : padded_bs + 1].copy_(
+                compact_indptr[-1].to(dtype=torch.int32) + pad_offsets
+            )
+
+        spec_info.compact_kv_indices = index_buf[:padded_capacity]
+        spec_info.compact_kv_indptr = indptr_buf[: padded_bs + 1]
+        spec_info.compact_qo_indptr = qo_indptr_buf[: padded_bs + 1]
+        spec_info.compact_kv_max_seq_len = int(bucket)
+
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(
             size=bs,
@@ -541,6 +694,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return "lora"
         return "nolora"
+
+    def _resolve_graph_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
+        bucket = self._dflash_compact_kv_bucket_for_forward_batch(forward_batch)
+        if bucket is not None:
+            return self._dflash_compact_variant_label(bucket)
+        return self._resolve_lora_variant(forward_batch)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
@@ -605,12 +764,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else True
         )
 
+        is_dflash_compact_supported = True
+        if (
+            self.dflash_tree_compact_fa4_graph
+            and forward_batch.forward_mode.is_target_verify()
+            and getattr(forward_batch.spec_info, "compact_kv_indices", None)
+            is not None
+        ):
+            is_dflash_compact_supported = (
+                forward_batch.input_ids.numel() == forward_batch.batch_size
+                and self._dflash_compact_kv_bucket_for_forward_batch(forward_batch)
+                is not None
+            )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_dflash_compact_supported
         )
 
     def _init_profile_context_and_memory_record(self):
@@ -651,6 +824,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self,
         size: int,
         stream_idx: Optional[int] = None,
+        variant_label: Optional[str] = None,
     ):
         """Build the dummy decode ForwardBatch for capture at size (=bs),
         populate static input buffers, choose the active attn backend, and
@@ -727,7 +901,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             global_dp_buffer_len = None
 
-        spec_info = self.get_spec_info(num_tokens)
+        spec_info = self.get_spec_info(num_tokens, variant_label=variant_label)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
@@ -879,13 +1053,32 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             for variant_label, _variant_has_lora in lora_variants:
                 _set_capture_lora_variant(variant_label)
-                with torch_compile_decoration.patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_bs,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                graph_variants = self._capture_graph_variants(variant_label)
+                for graph_variant_label in graph_variants:
+                    with torch_compile_decoration.patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=bs * self.num_tokens_per_bs,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        self.capture_one_shape(
+                            bs, forward, stream_idx, graph_variant_label
+                        )
+
+    def _capture_graph_variants(
+        self, lora_variant_label: Optional[str]
+    ) -> list[Optional[str]]:
+        if not self.dflash_tree_compact_fa4_graph:
+            return [lora_variant_label]
+        if lora_variant_label is not None:
+            raise RuntimeError(
+                "DFlash compact FA4 CUDA graph variants are not combined with LoRA "
+                f"variants (got {lora_variant_label!r})."
+            )
+        return [
+            self._dflash_compact_variant_label(bucket)
+            for bucket in self.dflash_tree_compact_kv_buckets
+        ]
 
     def capture_one_shape(
         self,
@@ -904,7 +1097,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ), "Breakable CUDA graph is required for --debug-cuda-graph"
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
-            size, stream_idx=stream_idx
+            size, stream_idx=stream_idx, variant_label=variant_label
         )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
@@ -1028,7 +1221,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
-            variant_label = self._resolve_lora_variant(forward_batch)
+            variant_label = self._resolve_graph_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
                 self.bs, stream_idx, variant_label
@@ -1079,6 +1272,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
+        dflash_compact_bucket = self._dflash_compact_kv_bucket_for_forward_batch(
+            forward_batch
+        )
+        if dflash_compact_bucket is not None:
+            self._fill_dflash_compact_graph_buffers(
+                forward_batch,
+                raw_bs=raw_bs,
+                padded_bs=bs,
+                bucket=dflash_compact_bucket,
+            )
         if self.enable_pdmux:
             stream_idx = get_current_stream_idx()
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
@@ -1104,7 +1307,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
-        variant_label = self._resolve_lora_variant(forward_batch)
+        variant_label = self._resolve_graph_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             self.bs, stream_idx, variant_label
@@ -1167,7 +1370,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
-    def get_spec_info(self, num_tokens: int):
+    def get_spec_info(self, num_tokens: int, variant_label: Optional[str] = None):
         spec_info = None
         if (
             self.model_runner.spec_algorithm.is_eagle()
@@ -1231,6 +1434,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     )
                     else None
                 )
+            compact_bucket = self._dflash_compact_bucket_from_variant(variant_label)
+            compact_kv_indices = None
+            compact_kv_indptr = None
+            compact_qo_indptr = None
+            compact_kv_max_seq_len = -1
+            if compact_bucket is not None:
+                bs = num_tokens
+                capacity = bs * compact_bucket
+                compact_kv_indices = self.dflash_tree_compact_kv_indices_buffers[
+                    compact_bucket
+                ][:capacity]
+                compact_kv_indptr = self.dflash_tree_compact_kv_indptr_buffers[
+                    compact_bucket
+                ][: bs + 1]
+                compact_qo_indptr = self.dflash_tree_compact_qo_indptr_buffers[
+                    compact_bucket
+                ][: bs + 1]
+                compact_kv_max_seq_len = int(compact_bucket)
+                custom_mask = None
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
@@ -1242,6 +1464,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if self.model_runner.is_draft_worker
                     else CaptureHiddenMode.FULL
                 ),
+                compact_kv_indices=compact_kv_indices,
+                compact_kv_indptr=compact_kv_indptr,
+                compact_qo_indptr=compact_qo_indptr,
+                compact_kv_max_seq_len=compact_kv_max_seq_len,
                 force_causal=self.dflash_tree_expanded_causal_graph,
                 num_tokens_per_batch=self.num_tokens_per_bs,
             )

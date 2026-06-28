@@ -281,6 +281,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
+        self.target_verify_compact_metadata = {}
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -427,6 +428,17 @@ class FlashAttentionBackend(AttentionBackend):
             and getattr(spec_info, "compact_kv_indices", None) is not None
         )
 
+    def _dflash_compact_kv_bucket(
+        self, spec_info: SpecInput, batch_size: int
+    ) -> int:
+        bucket = int(getattr(spec_info, "compact_kv_max_seq_len", -1) or -1)
+        if bucket > 0:
+            return bucket
+        compact_kv_indices = getattr(spec_info, "compact_kv_indices", None)
+        if compact_kv_indices is None:
+            return 0
+        return int(compact_kv_indices.numel() // max(1, batch_size))
+
     def _target_verify_num_tokens(self, spec_info: Optional[SpecInput]) -> int:
         return (
             self._dflash_custom_mask_verify_num_tokens(spec_info)
@@ -507,6 +519,22 @@ class FlashAttentionBackend(AttentionBackend):
                 self.forward_metadata = self.draft_decode_metadata_topk_normal[bs]
                 self.forward_metadata_spec_decode_expand = (
                     self.draft_decode_metadata_topk_expand[bs]
+                )
+                return
+
+            if forward_mode.is_target_verify() and self._dflash_compact_tree_verify(
+                spec_info
+            ):
+                self._apply_cuda_graph_metadata(
+                    bs=bs,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    seq_lens_sum=None,
+                    encoder_lens=encoder_lens,
+                    forward_mode=forward_mode,
+                    spec_info=spec_info,
+                    seq_lens_cpu=seq_lens_cpu,
+                    out_cache_loc=out_cache_loc,
                 )
                 return
 
@@ -2251,7 +2279,19 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             verify_num_tokens = self._target_verify_num_tokens(spec_info)
-            if not self._use_target_verify_custom_mask(spec_info):
+            if self._dflash_compact_tree_verify(spec_info):
+                bucket = self._dflash_compact_kv_bucket(spec_info, bs)
+                metadata.cache_seqlens_int32 = self.target_verify_metadata[
+                    "cache_seqlens"
+                ][:bs]
+                metadata.max_seq_len_q = 1
+                metadata.max_seq_len_k = bucket
+                metadata.cu_seqlens_q = spec_info.compact_qo_indptr
+                metadata.cu_seqlens_k = spec_info.compact_kv_indptr
+                metadata.dflash_compact_tree = True
+                metadata.dflash_compact_kv_indices = spec_info.compact_kv_indices
+                self.target_verify_compact_metadata[(bs, bucket)] = metadata
+            elif not self._use_target_verify_custom_mask(spec_info):
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
                 ][:bs]
@@ -2539,7 +2579,13 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             verify_num_tokens = self._target_verify_num_tokens(spec_info)
-            if not self._use_target_verify_custom_mask(spec_info):
+            if self._dflash_compact_tree_verify(spec_info):
+                bucket = self._dflash_compact_kv_bucket(spec_info, bs)
+                metadata = self.target_verify_compact_metadata[(bs, bucket)]
+                metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+                metadata.max_seq_len_q = 1
+                metadata.max_seq_len_k = bucket
+            elif not self._use_target_verify_custom_mask(spec_info):
                 metadata = self.target_verify_metadata[bs]
                 metadata.cache_seqlens_int32.copy_((seq_lens + verify_num_tokens))
 
