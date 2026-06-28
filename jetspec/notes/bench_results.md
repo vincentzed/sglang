@@ -9,6 +9,50 @@ Hardware/env:
 - Decode settings: BF16/default dtype, greedy `temperature=0`, `--tp-size 1`, `max_new_tokens=96`
 - Harness: `jetspec/run_fixed_prompts.py`, 10 fixed prompts including GSM-style arithmetic, sequence, code, translation, and summary prompts.
 
+## Final DFlash tree verify optimization rebench
+
+Date/time: 2026-06-28 20:25-20:58 UTC.
+
+Landed commits:
+- Job 1: `b101fa1846` - CUDA graph compact FA4 tree verify with fixed-shape target-verify graph buffers for b64/b128. This keeps the existing compact FA4 verifier and does not introduce a replacement attention kernel.
+- Job 2: `06f498d04c` - fix b255 losslessness by chunking high-budget compact target forward rows at the full-model level. This intentionally disables compact target-verify graph replay for budgets above the stable chunk row cap.
+- Job 3: attempted and reverted. The opt-in FA4 paged compact path was token-exact on the short b128 gate but slower than the landed compact-graph path, so it was not committed.
+
+Method:
+- Same driver and model setup as the paper-dataset section below: `jetspec/bench_paper_sglang.py`, first 80 prompts from GSM8K and MATH-500, greedy sampling, one request at a time.
+- Servers used `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`, `--attention-backend fa4 --page-size 16`, `--cuda-graph-max-bs-decode 1`, `--cuda-graph-backend-decode full`, and `--max-running-requests 1`.
+- Losslessness gates were fresh flushed FA4 page16 width=1 oracle checks. b64/b128 passed on Job 1; b255 failed before Job 2 and passed after Job 2.
+- Decode logs show `cuda graph: True` for tree b64/b128 decode after Job 1. b255 decode logs show `cuda graph: False`, expected because the correctness fix chunks high-budget compact target forward and disables graph replay for that path.
+
+Final results:
+
+| Dataset | Config | Lossless gate | Accept len | Tok/s | Speedup vs AR | Speedup vs linear | Steps/s | ms/step | Artifact |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| GSM8K | AR-greedy | n/a | 1.00 | 271.09 | 1.00x | 0.24x | 271.09 | 3.69 | `jetspec/runs/final_gsm8k_ar_31960.json` |
+| GSM8K | Linear DFlash | n/a | 5.85 | 1152.85 | 4.25x | 1.00x | 197.10 | 5.07 | `jetspec/runs/final_gsm8k_linear_31961.json` |
+| GSM8K | Tree w7/b64 | pass 5/5 | 6.46 | 438.48 | 1.62x | 0.38x | 67.88 | 14.73 | `jetspec/runs/final_gsm8k_tree_w7_b64_31962.json` |
+| GSM8K | Tree w7/b128 | pass 5/5 | 7.76 | 325.25 | 1.20x | 0.28x | 41.89 | 23.87 | `jetspec/runs/final_gsm8k_tree_w7_b128_31963.json` |
+| GSM8K | Tree w7/b255 | pass 5/5 (Job 2) | 8.20 | 175.01 | 0.65x | 0.15x | 21.34 | 46.86 | `jetspec/runs/final_gsm8k_tree_w7_b255_31964.json` |
+| MATH-500 | AR-greedy | n/a | 1.00 | 264.33 | 1.00x | 0.18x | 264.33 | 3.78 | `jetspec/runs/final_math500_ar_31960.json` |
+| MATH-500 | Linear DFlash | n/a | 7.62 | 1505.24 | 5.69x | 1.00x | 197.42 | 5.07 | `jetspec/runs/final_math500_linear_31961.json` |
+| MATH-500 | Tree w7/b64 | pass 5/5 | 7.42 | 465.24 | 1.76x | 0.31x | 62.74 | 15.94 | `jetspec/runs/final_math500_tree_w7_b64_31962.json` |
+| MATH-500 | Tree w7/b128 | pass 5/5 | 9.56 | 366.37 | 1.39x | 0.24x | 38.34 | 26.09 | `jetspec/runs/final_math500_tree_w7_b128_31963.json` |
+| MATH-500 | Tree w7/b255 | pass 5/5 (Job 2) | 10.06 | 193.63 | 0.73x | 0.13x | 19.25 | 51.96 | `jetspec/runs/final_math500_tree_w7_b255_31964.json` |
+
+Job outcome details:
+
+| Job | Result | Commit | Gate | Before ms/step | After ms/step | Notes |
+|---|---|---|---|---:|---:|---|
+| 1 - graph existing compact FA4 verifier | landed | `b101fa1846` | b64/b128 token-exact vs fresh flushed oracle | GSM8K b128 `23.55`; MATH-500 b128 `25.64` | Job 1 b128 full: GSM8K `23.02`; MATH-500 `25.70` | `cuda graph: True` for tree b64/b128. b64 improved materially (`17.17 -> 14.73` GSM8K, `17.46 -> 15.94` MATH-500 in final rebench). b128 was effectively flat; graph replay works, but end-to-end cost remains dominated by compact metadata construction and synchronization. |
+| 2 - fix b255 losslessness | landed | `06f498d04c` | b255 token-exact 5/5 on GSM8K and MATH-500 | invalid b255: GSM8K `39.65`; MATH-500 `45.02` | corrected b255 final: GSM8K `46.86`; MATH-500 `51.96` | b255 now reaches the expected high accept length (`8.20` GSM8K, `10.06` MATH-500), but it is slower because high-budget compact forward is chunked for numeric stability and decode stays eager. |
+| 3 - FA4-exact paged tree kernel | reverted | none | opt-in b128 GSM8K gate was token-exact | Job 1 b128 gate `22.73` | opt-in paged compact b128 gate `26.15` | The experiment preserved FA4 math by using FA4 with one-token page-table metadata, but it was slower while eager and would need a separate static graphable metadata-buffer family or an FA4-native paged tree kernel to be useful. |
+
+Verdict:
+- Job 1 banked the safe graphability win for the existing compact FA4 verifier, but the throughput gain is modest. The final b64 rows improved versus the old baseline, while b128 stayed near the prior cost despite `cuda graph: True`.
+- Job 2 fixed b255 correctness. It should now be considered a valid lossless row, but not a performance win.
+- Tree does not beat or match linear DFlash. Best tree throughput is b64: `438.48 tok/s` on GSM8K and `465.24 tok/s` on MATH-500, or `0.38x` and `0.31x` of linear. The paper-acceptance b128 path is `325.25 tok/s` and `366.37 tok/s`, only `0.28x` and `0.24x` of linear.
+- Remaining bottleneck: compact tree verify still pays heavy host-side tree metadata construction, K/V gather/index setup, and synchronization cost. CUDA graph replay removes part of target-verify launch overhead but does not remove the per-step compact metadata work. A faster path likely needs an FA4-identical paged-tree verifier with static graphable metadata buffers, including the same softcap and fp32 probability accumulation semantics as compact FA4.
+
 ## Paper-dataset benchmark - GSM8K and MATH-500
 
 Date/time: 2026-06-28 16:24-17:02 UTC.
