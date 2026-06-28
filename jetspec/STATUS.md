@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-28 06:42 UTC
+Updated: 2026-06-28 17:05 UTC
 
 ## Done / Committed
 
@@ -22,6 +22,42 @@ Updated: 2026-06-28 06:42 UTC
 - Mask root-cause Job 1 2026-06-28: dense FA4 page16 w7/b64 attended-set dump found that DFlash's generated tree mask is ancestor-exact, but FA4 does not enter the custom-mask target-verify path. For the first failing accepted node `3`, DFlash's custom mask allows only tree cols `[0, 3]`, but FA4's effective `topk<=1` causal verifier attends `[0, 1, 2, 3]`, admitting non-ancestor sibling/cousin cols `[1, 2]` (logical KV positions `[7, 8]`, physical slots `[23, 24]`). Root cause: FA4 gates the cascade/custom-mask verifier on backend `self.topk`, initialized from `speculative_eagle_topk=1`, instead of DFlash's per-verify `DFlashVerifyInput.topk=7` / `custom_mask`.
 - Mask root-cause Job 2 2026-06-28: dense FA4 page16 tree verify now uses an exact compact KV index list for each query row, so every accepted node reads exactly committed prefix plus self/ancestors. The dense accepted-path reverify is removed for compact dense target verify, and accepted KV is committed directly by copying accepted tree slots into the canonical next-prefix slots. Fresh flushed FA4 page16 width=1 oracle gates passed for w7/b64 and w7/b128 with zero token mismatches.
 - Mask root-cause Job 3 2026-06-28: canonical MT-bench rerun completed with the dense reverify removed. FA4 page16 width=1 linear reached `764.540 tok/s` with accept length `4.070`; dense tree w7/b64 no-reverify reached `243.000 tok/s` with accept length `5.053`. Tree improves over the old retained-reverify tree (`199.983 tok/s`) but is still only `0.32x` linear (`3.15x` slower), so dense tree does not beat or match linear yet.
+- Paper-dataset benchmark 2026-06-28: added `jetspec/bench_paper_sglang.py` and measured first-80 GSM8K/MATH-500 prompts with JetSpec prompt formatting. Valid tree b128 reaches paper-level acceptance (`7.77` GSM8K vs paper `7.94`; `9.55` MATH-500 vs paper `9.56`) but is verify-cost-limited (`23.55/25.64 ms/step`, `329.91/372.49 tok/s`). b255 is not lossless (`3/5` GSM8K oracle mismatches, `2/5` MATH oracle mismatches) and is diagnostic only.
+
+## Paper Dataset Benchmark - GSM8K and MATH-500
+
+Date/time: 2026-06-28 16:24-17:02 UTC.
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Backend for DFlash rows: `--attention-backend fa4 --page-size 16`
+- Decode graph flags: `--cuda-graph-max-bs-decode 1 --cuda-graph-backend-decode full`
+- Harness: `jetspec/bench_paper_sglang.py`, first 80 samples per dataset, greedy `temperature=0`, `top_p=1.0`, `max_new_tokens=2048`
+- Prompt format matches JetSpec's `tps_walltime.py`: problem text plus `Please reason step by step, and put your final answer within \boxed{}.` through the Qwen chat template with thinking disabled.
+- AR-greedy caveat: target-only FA4 used `--speculative-num-draft-tokens 1` to avoid a current startup guard crash when the value is `None`; `speculative_algorithm=None`, so no speculation. Runtime page size was rewritten to 128 for AR only by the non-spec FA4 guard. DFlash rows retained page size 16.
+
+Results:
+
+| dataset | config | lossless gate | accept len | tok/s | vs AR | vs linear | ms/step | artifact |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| GSM8K | AR-greedy | n/a | 1.00 | 269.57 | 1.00x | 0.23x | 3.71 | `jetspec/runs/paper_gsm8k_ar_31980.json` |
+| GSM8K | Linear DFlash | n/a | 5.85 | 1159.90 | 4.30x | 1.00x | 5.04 | `jetspec/runs/paper_gsm8k_linear_31981.json` |
+| GSM8K | Tree w7/b64 | pass 5/5 | 6.46 | 376.50 | 1.40x | 0.32x | 17.17 | `jetspec/runs/paper_gsm8k_tree_w7_b64_31985.json` |
+| GSM8K | Tree w7/b128 | pass 5/5 | 7.77 | 329.91 | 1.22x | 0.28x | 23.55 | `jetspec/runs/paper_gsm8k_tree_w7_b128_31986.json` |
+| GSM8K | Tree w7/b255 | FAIL 3/5 | 8.20 | 206.76 | 0.77x | 0.18x | 39.65 | `jetspec/runs/paper_gsm8k_tree_w7_b255_31982.json` |
+| MATH-500 | AR-greedy | n/a | 1.00 | 262.87 | 1.00x | 0.17x | 3.80 | `jetspec/runs/paper_math500_ar_31993.json` |
+| MATH-500 | Linear DFlash | n/a | 7.62 | 1503.36 | 5.72x | 1.00x | 5.07 | `jetspec/runs/paper_math500_linear_31984.json` |
+| MATH-500 | Tree w7/b64 | pass 5/5 | 7.41 | 424.60 | 1.62x | 0.28x | 17.46 | `jetspec/runs/paper_math500_tree_w7_b64_31985.json` |
+| MATH-500 | Tree w7/b128 | pass 5/5 | 9.55 | 372.49 | 1.42x | 0.25x | 25.64 | `jetspec/runs/paper_math500_tree_w7_b128_31986.json` |
+| MATH-500 | Tree w7/b255 | FAIL 2/5 | 10.10 | 224.23 | 0.85x | 0.15x | 45.02 | `jetspec/runs/paper_math500_tree_w7_b255_31987.json` |
+
+Verdict:
+- Valid b128 acceptance reaches the paper's 7-9 range. Acceptance is not the primary blocker on these datasets.
+- b255 has higher acceptance but breaks losslessness and should not be optimized as the first valid target.
+- The gap is verify per-step cost. Paper implied step time is about `8.07 ms` on GSM8K and `8.31 ms` on MATH-500; valid b128 is `23.55 ms` and `25.64 ms`.
+- Tree decode logs show eager target verify (`cuda graph: False`) while linear DFlash decode logs show CUDA graph use (`cuda graph: True`). The current ragged compact FA4 varlen verifier is the immediate optimization target; it needs a paged-tree/kernel-shaped verifier closer to the paper's `optimus_cutedsl.flash_attn_varlen_tree_paged_sm90`.
 
 ## Mask Root-Cause Job 3 - FA4 Page16 MT-bench, No Dense Reverify
 

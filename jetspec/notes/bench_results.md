@@ -1,6 +1,6 @@
 # JetSpec DFlash live GPU validation
 
-Date: 2026-06-27 UTC
+Date: 2026-06-28 UTC
 
 Hardware/env:
 - GPU: `CUDA_VISIBLE_DEVICES=7` (`NVIDIA B300 SXM6 AC`, SM100, 275 GB)
@@ -8,6 +8,75 @@ Hardware/env:
 - Repo/env: local develop install, `python -m sglang.launch_server`, `PYTHONPATH=python`
 - Decode settings: BF16/default dtype, greedy `temperature=0`, `--tp-size 1`, `max_new_tokens=96`
 - Harness: `jetspec/run_fixed_prompts.py`, 10 fixed prompts including GSM-style arithmetic, sequence, code, translation, and summary prompts.
+
+## Paper-dataset benchmark - GSM8K and MATH-500
+
+Date/time: 2026-06-28 16:24-17:02 UTC.
+
+Purpose:
+- Prior MT-bench numbers used the wrong dataset and did not sweep the paper budget.
+- This pass follows JetSpec's benchmark data sources and prompt format for GSM8K and MATH-500, then compares SGLang AR-greedy, linear DFlash, and tree DFlash under the same Qwen3-8B setup.
+
+Method:
+- Driver: `jetspec/bench_paper_sglang.py`.
+- Dataset loaders matching `jetspec/_ref/JetSpec/bench/engine/tps_walltime.py`:
+  - GSM8K: `openai/gsm8k`, config `main`, split `test`, field `question`.
+  - MATH-500: `HuggingFaceH4/MATH-500`, split `test`, field `problem`.
+- Prompt body: `{problem}\nPlease reason step by step, and put your final answer within \boxed{}.` with the Qwen chat template and `enable_thinking=False`.
+- Sampling: greedy `temperature=0`, `top_p=1.0`, `max_new_tokens=2048`.
+- Sample count/order: first 80 examples from each dataset, one request at a time.
+- Target: `Qwen/Qwen3-8B`; draft: `JetSpec/jetspec-qwen3-8b`.
+- Spec servers: `--attention-backend fa4 --page-size 16 --cuda-graph-max-bs-decode 1 --cuda-graph-backend-decode full --max-running-requests 1`.
+- AR-greedy caveat: target-only FA4 launch needed `--speculative-num-draft-tokens 1` to avoid the current FA4 startup guard crash when `speculative_num_draft_tokens=None`; `server_args` still had `speculative_algorithm=None`. The non-spec FA4 guard rewrote AR runtime page size from requested 16 to 128. All DFlash rows retained runtime `page_size=16`.
+- Losslessness gates: each tree budget was checked against a fresh flushed width=1 linear oracle on the first 5 prompts of the same dataset before the full timing row.
+
+Main results:
+
+| Dataset | Config | Lossless gate | Accept len | Tok/s | Speedup vs AR | Speedup vs linear | Steps/s | ms/step | Artifact |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| GSM8K | AR-greedy | n/a | 1.00 | 269.57 | 1.00x | 0.23x | 269.57 | 3.71 | `jetspec/runs/paper_gsm8k_ar_31980.json` |
+| GSM8K | Linear DFlash | n/a | 5.85 | 1159.90 | 4.30x | 1.00x | 198.32 | 5.04 | `jetspec/runs/paper_gsm8k_linear_31981.json` |
+| GSM8K | Tree w7/b64 | pass 5/5 | 6.46 | 376.50 | 1.40x | 0.32x | 58.24 | 17.17 | `jetspec/runs/paper_gsm8k_tree_w7_b64_31985.json` |
+| GSM8K | Tree w7/b128 | pass 5/5 | 7.77 | 329.91 | 1.22x | 0.28x | 42.45 | 23.55 | `jetspec/runs/paper_gsm8k_tree_w7_b128_31986.json` |
+| GSM8K | Tree w7/b255 | FAIL 3/5 mismatch | 8.20 | 206.76 | 0.77x | 0.18x | 25.22 | 39.65 | `jetspec/runs/paper_gsm8k_tree_w7_b255_31982.json` |
+| MATH-500 | AR-greedy | n/a | 1.00 | 262.87 | 1.00x | 0.17x | 262.87 | 3.80 | `jetspec/runs/paper_math500_ar_31993.json` |
+| MATH-500 | Linear DFlash | n/a | 7.62 | 1503.36 | 5.72x | 1.00x | 197.32 | 5.07 | `jetspec/runs/paper_math500_linear_31984.json` |
+| MATH-500 | Tree w7/b64 | pass 5/5 | 7.41 | 424.60 | 1.62x | 0.28x | 57.29 | 17.46 | `jetspec/runs/paper_math500_tree_w7_b64_31985.json` |
+| MATH-500 | Tree w7/b128 | pass 5/5 | 9.55 | 372.49 | 1.42x | 0.25x | 39.00 | 25.64 | `jetspec/runs/paper_math500_tree_w7_b128_31986.json` |
+| MATH-500 | Tree w7/b255 | FAIL 2/5 mismatch | 10.10 | 224.23 | 0.85x | 0.15x | 22.21 | 45.02 | `jetspec/runs/paper_math500_tree_w7_b255_31987.json` |
+
+Paper-reported reference numbers:
+
+| Dataset | Paper accept len | Paper tok/s | Paper implied steps/s | Paper implied ms/step |
+|---|---:|---:|---:|---:|
+| GSM8K | 7.94 | 984 | 123.93 | 8.07 |
+| MATH-500 | 9.56 | 1150 | 120.29 | 8.31 |
+| HumanEval | 6.92 | 867 | 125.29 | 7.98 |
+
+Losslessness details:
+- w7/b64: token-exact 5/5 on GSM8K and MATH-500.
+- w7/b128: token-exact 5/5 on GSM8K and MATH-500.
+- w7/b255 is not lossless in this SGLang path and should not be treated as a valid speed row:
+  - GSM8K oracle artifact `jetspec/runs/paper_gsm8k_tree_w7_b255_oracle5_31982.json`: 3/5 mismatches, sample indices 0, 1, and 4.
+  - MATH-500 oracle artifact `jetspec/runs/paper_math500_tree_w7_b255_oracle5_31987.json`: 2/5 mismatches, sample indices 0 and 4.
+- The full b255 rows are kept only to show the high-budget acceptance and verify-cost trend.
+
+Empirical notes:
+- The earlier "head-limited" concern is mostly wrong for the paper datasets. At b128, the valid tree row reaches `7.77` accept length on GSM8K versus the paper's `7.94`, and reaches `9.55` on MATH-500 versus the paper's `9.56`.
+- b255 pushes acceptance higher (`8.20` GSM8K, `10.10` MATH-500), but it breaks token-exactness. The optimization target should be the valid b128 path first, not b255.
+- The gap to both the paper and linear DFlash is dominated by per-step verify cost, not acceptance:
+  - GSM8K linear is `5.04 ms/step`; valid tree b64 is `17.17 ms/step`; valid tree b128 is `23.55 ms/step`; invalid tree b255 is `39.65 ms/step`.
+  - MATH-500 linear is `5.07 ms/step`; valid tree b64 is `17.46 ms/step`; valid tree b128 is `25.64 ms/step`; invalid tree b255 is `45.02 ms/step`.
+  - The paper implies about `8.07 ms/step` on GSM8K and `8.31 ms/step` on MATH-500.
+- With current b128 acceptance, matching the paper requires lowering tree cost to about `7.90 ms/step` on GSM8K and `8.31 ms/step` on MATH-500. Beating our fresh linear DFlash baseline requires roughly `6.70 ms/step` on GSM8K and `6.35 ms/step` on MATH-500.
+- Therefore, even paper-level acceptance does not make this implementation competitive until tree verify is about 3x faster than the current valid b128 path.
+
+Optimization leads from logs and per-step math:
+- Linear DFlash decode used CUDA graph: `jetspec/logs/paper_math500_linear_31984_server.log` has 180 `Decode batch ... cuda graph: True` lines.
+- Tree decode fell back to eager across all budgets: b64 has 292, b128 has 232, and b255 has 141 `Decode batch ... cuda graph: False` lines in the paper-run server logs.
+- The current dense tree verifier is the ragged compact FA4 varlen path: one query row per tree node, with a compact K/V list built from committed prefix plus the node's ancestor chain. This keeps correctness for b64/b128 but creates graph-incompatible ragged work and heavy per-step target verify cost.
+- The JetSpec paper's paged-tree kernel (`optimus_cutedsl.flash_attn_varlen_tree_paged_sm90`) is the right shape to chase: avoid one-row ragged gathers per node, keep the tree verify in a paged representation, and make the tree verify graphable or otherwise launch-efficient.
+- Concrete next instrumentation should add benchmark-only per-phase timers around DFlash draft tree build/top-k expansion, compact index construction/gather, target verify forward, acceptance, and KV commit. `py-spy` is installed on the host, but a Python-only sample was not captured in this pass because the measured gap is already visible in GPU-facing server logs and the derived ms/step; a later profile should run while a short b128 MATH batch is active.
 
 ## Mask root-cause Job 1 FA4 page16 attended-set dump
 
