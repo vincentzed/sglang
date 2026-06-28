@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-28 04:15 UTC
+Updated: 2026-06-28 04:31 UTC
 
 ## Done / Committed
 
@@ -17,6 +17,7 @@ Updated: 2026-06-28 04:15 UTC
 - Job B 2026-06-28: canonical MT-bench rerun completed for width=1 linear and compact tree w7/b64. Tree raised accept length from `4.11` to `5.08`, but throughput fell from `774.91` to `283.90 tok/s`, so compact tree is still `0.37x` linear on the real benchmark.
 - Direct-commit causal-equivalence probe 2026-06-28: dense no-reverify direct commit remains blocked. The fresh flushed w7/b64 gate failed `6/10` prompts, and per-layer diagnostics show the first accepted-path discrepancy at layer-0 attention output while layer-0 K/V are still identical to the clean causal branch.
 - Realignment Job 1 2026-06-28: linear DFlash on dense Qwen3-8B now runs on the canonical FA4 target backend with `page_size=16`. The first unmodified launch rewrote `--page-size 16` to `128`; `python/sglang/srt/server_args.py` now keeps explicit FA4 page16 for DFlash while preserving the generic FA4 page128 auto-force. Fresh flushed width=1 oracle: `jetspec/runs/job1_fa4p16_linear_w1_flush_31811.json`, mean accept `3.5827`, aggregate `561.04 tok/s`.
+- Realignment Job 2 2026-06-28: dense FA4 page16 tree verify already routes through the multi-token custom-mask/FULL_MASK shape, not the FlashInfer compact path. No-reverify direct commit is still not lossless on FA4 page16; the first diagnostic shows exact layer-0 K/V but a layer-0 hidden delta, so the residual is in the FA4 tree/custom-mask verify execution shape rather than DFlash draft KV materialization. Retained-reverify w7/b64 and w7/b128 are token-exact against the fresh FA4 page16 oracle.
 
 ## Realignment Job 1 - FA4 Page16 Linear Baseline
 
@@ -44,6 +45,56 @@ Notes:
 - A background `nohup` launch on port `31810` died with a zero-byte log, so the server was relaunched in a foreground tool session with output also saved through `tee`.
 - A foreground pre-patch launch confirmed the failure mode: SGLang accepted `--attention-backend fa4 --page-size 16` but rewrote runtime `page_size` to `128`. No oracle from that misaligned launch is used.
 - This FA4 page16 oracle is the baseline for the dense tree losslessness gates in Job 2.
+
+## Realignment Job 2 - FA4 Page16 Tree Verify
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Backend: `--attention-backend fa4 --page-size 16`
+- Normal greedy mode: no deterministic flags, harness `temperature=0`
+- CUDA graph enabled: `--cuda-graph-max-bs-decode 1`, decode backend `full`; prefill graph left at the normal `tc_piecewise` default.
+- Harness: `PYTHONPATH=python python jetspec/run_fixed_prompts.py`, 10 fixed prompts, `max_new_tokens=96`, `--flush-cache-before-run --flush-cache-between-prompts`
+- Fresh flushed oracle: `jetspec/runs/job1_fa4p16_linear_w1_flush_31811.json`
+
+Shape check:
+- No extra DFlash-worker reroute was needed for FA4. The old compact/expanded branches in `dflash_worker_v2.py` are gated to `FlashInferAttnBackend`; with `--attention-backend fa4`, the active backend is `FlashAttentionBackend`, so dense tree verify uses the generic multi-token custom-mask path.
+- That path builds an ancestor-only tree mask with prefix attention in `build_tree_custom_mask`, matching the EAGLE FULL_MASK contract at the Python mask level.
+- Evidence: `jetspec/logs/job2_fa4p16_tree_w7_b64_reverify_31814_server.log` captured target verify with `num_tokens_per_bs=64`, and `jetspec/logs/job2_fa4p16_tree_w7_b128_reverify_31815_server.log` captured target verify with `num_tokens_per_bs=128`; both are compact multi-token tree verifies on `fa4`, `page_size=16`.
+
+No-reverify direct-commit gate:
+
+| run | artifact | token exact vs FA4 page16 oracle | mismatches | mean accept length | aggregate tok/s |
+|---|---|---:|---:|---:|---:|
+| 8B tree w7/b64, dense accepted-path reverify disabled | `jetspec/runs/job2_fa4p16_tree_w7_b64_noreverify_flush_31812.json` | FAIL | 10/10 | 2.9558 | 281.32 |
+
+Diagnostic:
+- Diagnostic server log: `jetspec/logs/job2_fa4p16_tree_w7_b64_noreverify_compare_31813_server.log`.
+- Representative first compare: prefix `[6]`, commit length `[2]`, accepted local nodes `[[0,3]]`, branch candidates `[[12095,13]]`.
+- Tree and clean causal branch predictions agreed on that step: `tree_predict=[[13,576]]`, `branch_predict=[[13,576]]`.
+- Accepted-path hidden still diverged: `hidden_max_abs=40.0`.
+- First per-layer hidden discrepancy was at layer 0: `first_layer_hidden_delta=(0, 0.1357421875)`.
+- Layer-0 K/V were exact: layer-0 `kv_max_abs=(0.0, 0.0)`.
+- Later layer K/V diverged after the layer-0 hidden delta propagated; for example layer 1 had `kv_max_abs=(2.75, 0.03076171875)`.
+- The diagnostic process hit a CUDA error after logging this compare during the debug replay cleanup, so this log is evidence for causal-equivalence triage only, not a successful serving gate.
+
+Conclusion:
+- The no-reverify EAGLE-style direct commit cannot be landed on dense FA4 page16 yet.
+- The residual does not point at positions, RoPE, or DFlash draft K/V materialization; those are still consistent through layer-0 K/V.
+- The residual is in the FA4 tree/custom-mask target-verify execution shape: the first mismatch is the layer-0 attention output for the accepted path.
+- Therefore the dense accepted-path reverify remains required. MoE was not changed.
+
+Retained-reverify gates:
+
+| run | artifact | token exact vs FA4 page16 oracle | mean accept length | aggregate tok/s |
+|---|---|---:|---:|---:|
+| 8B tree w7/b64 + accepted-path reverify | `jetspec/runs/job2_fa4p16_tree_w7_b64_reverify_flush_31814.json` | PASS, 10/10 | 3.2339 | 138.73 |
+| 8B tree w7/b128 + accepted-path reverify | `jetspec/runs/job2_fa4p16_tree_w7_b128_reverify_flush_31815.json` | PASS, 10/10 | 3.2728 | 138.04 |
+
+Notes:
+- The no-reverify speed number is invalid as a benchmark because the output is not lossless and includes token-0 divergence in several prompts.
+- The retained-reverify gates are intentionally slower than linear; they are correctness checks on the canonical backend before Job 3 MT-bench, not the final benchmark verdict.
 
 ## Job 0 Validation
 

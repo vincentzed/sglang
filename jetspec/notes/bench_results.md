@@ -50,6 +50,53 @@ Verdict:
 - Linear DFlash is healthy on the aligned FA4 page16 backend.
 - This fresh flushed oracle replaces the old flashinfer/page_size=1 oracles for the dense tree losslessness gates in the realignment pass.
 
+## Realignment Job 2 FA4 page16 dense tree verify
+
+Date/time: 2026-06-28 04:18-04:27 UTC.
+
+Mode:
+- Normal greedy serving mode: no deterministic flags, harness `temperature=0`.
+- CUDA graph enabled: `--cuda-graph-max-bs-decode 1`, decode backend `full`; prefill graph left at the normal `tc_piecewise` default.
+- Dense target: `Qwen/Qwen3-8B`, draft: `JetSpec/jetspec-qwen3-8b`.
+- Canonical backend/page: `--attention-backend fa4 --page-size 16`.
+- Harness: `jetspec/run_fixed_prompts.py`, 10 prompts, `max_new_tokens=96`, `--flush-cache-before-run --flush-cache-between-prompts`.
+- Fresh flushed oracle: `jetspec/runs/job1_fa4p16_linear_w1_flush_31811.json`.
+
+Shape result:
+- The dense FA4 tree path is already the multi-token custom-mask path. The FlashInfer compact/expanded branches are only active for `FlashInferAttnBackend`; `fa4` uses `FlashAttentionBackend`.
+- The target verify graph captures confirm the aligned shape:
+  - `w7/b64`: `num_tokens_per_bs=64`, `rows_per_request=1`, log `jetspec/logs/job2_fa4p16_tree_w7_b64_reverify_31814_server.log`.
+  - `w7/b128`: `num_tokens_per_bs=128`, `rows_per_request=1`, log `jetspec/logs/job2_fa4p16_tree_w7_b128_reverify_31815_server.log`.
+
+No-reverify direct-commit result:
+
+| run | artifact | token exact vs FA4 page16 oracle | mismatches | mean accept length | aggregate tok/s |
+|---|---|---:|---:|---:|---:|
+| 8B tree w7/b64, accepted-path reverify disabled | `jetspec/runs/job2_fa4p16_tree_w7_b64_noreverify_flush_31812.json` | FAIL | 10/10 | 2.9558 | 281.32 |
+
+Per-layer diagnostic:
+- Diagnostic artifact: `jetspec/logs/job2_fa4p16_tree_w7_b64_noreverify_compare_31813_server.log`.
+- Representative compare: prefix `[6]`, commit length `[2]`, accepted local nodes `[[0,3]]`, branch candidates `[[12095,13]]`.
+- Tree and clean causal branch predictions agreed at that step: `tree_predict=[[13,576]]`, `branch_predict=[[13,576]]`.
+- Accepted-path hidden diverged: `hidden_max_abs=40.0`.
+- First per-layer hidden mismatch was layer 0: `first_layer_hidden_delta=(0, 0.1357421875)`.
+- Layer-0 K/V were exact: layer-0 `kv_max_abs=(0.0, 0.0)`.
+- Layer-1 K/V then diverged, for example `(2.75, 0.03076171875)`, after the layer-0 hidden delta propagated.
+
+Retained-reverify correctness gates:
+
+| run | artifact | token exact vs FA4 page16 oracle | mean accept length | aggregate tok/s | speed vs FA4 page16 linear |
+|---|---|---:|---:|---:|---:|
+| 8B linear width=1 flushed oracle | `jetspec/runs/job1_fa4p16_linear_w1_flush_31811.json` | oracle | 3.5827 | 561.04 | 1.00x |
+| 8B tree w7/b64 + accepted-path reverify | `jetspec/runs/job2_fa4p16_tree_w7_b64_reverify_flush_31814.json` | PASS | 3.2339 | 138.73 | 0.25x |
+| 8B tree w7/b128 + accepted-path reverify | `jetspec/runs/job2_fa4p16_tree_w7_b128_reverify_flush_31815.json` | PASS | 3.2728 | 138.04 | 0.25x |
+
+Job 2 verdict:
+- FA4 page16 tree verify did not make the accepted-path state causal-exact. The accepted-path reverify cannot be dropped.
+- The residual is not DFlash draft K/V materialization, positions, or RoPE: layer-0 K/V are exact, and the first mismatch is the layer-0 attention output.
+- The remaining correctness issue is the FA4 tree/custom-mask target-verify execution shape for this DFlash tree path.
+- The retained-reverify path remains lossless on the canonical backend for both w7/b64 and w7/b128, but it is roughly `0.25x` the fixed-prompt linear throughput. Job 3 must therefore benchmark the honest aligned configuration: FA4 page16 tree with retained reverify.
+
 ## Job A1 compact dense verify
 
 Date/time: 2026-06-28 02:16-02:24 UTC.
