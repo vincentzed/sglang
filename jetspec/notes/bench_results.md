@@ -35,6 +35,46 @@ Root cause:
 - EAGLE works because its server-side `speculative_eagle_topk` drives the FA4 FULL_MASK path.
 - DFlash therefore falls through to FA4's `topk<=1` causal verifier, which ignores the custom mask and treats the first `--speculative-num-draft-tokens 16` BFS nodes as a linear causal chain.
 
+## Mask root-cause Job 2 FA4 page16 mask fix and no dense reverify
+
+Date/time: 2026-06-28 05:36-06:02 UTC.
+
+Mode:
+- Dense target: `Qwen/Qwen3-8B`, draft: `JetSpec/jetspec-qwen3-8b`.
+- Canonical backend/page: `--attention-backend fa4 --page-size 16`.
+- Tree configurations: w7/b64 and w7/b128.
+- Normal greedy serving mode: no deterministic flags, harness `temperature=0`.
+- CUDA graph enabled for normal decode: `--cuda-graph-max-bs-decode 1`, decode backend `full`; prefill graph left at the normal `tc_piecewise` default.
+- Fresh flushed oracle: `jetspec/runs/job1_fa4p16_linear_w1_flush_31811.json`.
+
+Fix:
+- The Job 1 bug was not in DFlash's Python tree mask: DFlash's row for accepted node `3` already allowed only `[0, 3]`.
+- The first fix is to make FA4 target verify consult DFlash's per-verify tree shape rather than backend `self.topk`, which is `1` for DFlash.
+- FA4 page16 still cannot consume a sparse ancestor set by treating token IDs as page IDs; page-size conversion turns sparse slots into contiguous physical pages.
+- Dense FA4 DFlash therefore now supplies exact per-query `compact_kv_indices`: prefix slots followed by the accepted node's ancestor chain ending at self. FA4 reads those gathered K/V rows through varlen attention.
+- Dense accepted-path reverify is removed for this compact dense path. Accepted tree KV is committed directly by copying accepted source slots into the canonical next-prefix slots. MoE was left on its current lossless path.
+
+Diagnostic evidence:
+- Diagnostic log: `jetspec/logs/job2_compact_direct_diag_nograph_fa4p16_tree_w7_b64_31940_server.log`.
+- Original failing node after the fix: `prefix=[6]`, `commit_lens=[2]`, accepted local path `[[0, 3]]`, branch candidates `[[12095, 13]]`.
+- Correct causal set: prefix `[0,6)` plus tree cols `[0, 3]`.
+- Compact verifier set: allowed tree cols `[0, 3]`, extras `[]`, missing `[]`, physical tree slots `[22, 25]`.
+- Layer-0 signature: `first_layer_hidden_delta=(0, 0.001953125)` and layer-0 `kv_max_abs=(0.0, 0.0)`. This removes the prior mask-scale layer-0 delta `0.1357421875`.
+- The later-layer hook/KV list is not a clean bf16 equivalence proof because compact FA4 varlen and the clean paged causal replay use different kernel shapes; token-exact flushed serving is the losslessness gate for this milestone.
+
+Fixed-prompt losslessness gates:
+
+| run | artifact | token exact vs FA4 page16 oracle | mismatches | mean accept length | aggregate tok/s | speed vs oracle |
+|---|---|---:|---:|---:|---:|---:|
+| 8B linear width=1 flushed oracle | `jetspec/runs/job1_fa4p16_linear_w1_flush_31811.json` | oracle | 0 | 3.5827 | 561.04 | 1.00x |
+| 8B tree w7/b64, no dense accepted-path reverify | `jetspec/runs/job2_maskfix_noreverify_fa4p16_tree_w7_b64_flush_31941.json` | PASS | 0/10 | 4.2004 | 217.44 | 0.39x |
+| 8B tree w7/b128, no dense accepted-path reverify | `jetspec/runs/job2_maskfix_noreverify_fa4p16_tree_w7_b128_flush_31942.json` | PASS | 0/10 | 4.7738 | 181.38 | 0.32x |
+
+Verdict:
+- The attended-set root cause is fixed for dense FA4 page16: accepted nodes no longer see sibling/cousin KV positions.
+- Dense accepted-path reverify is gone in the compact FA4 dense path and the fresh flushed oracle gates pass for both required budgets.
+- Short fixed-prompt throughput is still well below linear because compact tree verify is eager and performs a ragged prefix+ancestor gather for every tree node. Job 3 must measure the real MT-bench tradeoff.
+
 ## Caveats
 
 - `--attention-backend fa3` is not usable on this B300/SM100 host in this checkout: launch fails with `FlashAttention v3 Backend requires SM>=80 and SM<=90. Please use --attention-backend flashinfer.` The 8B smoke pair was therefore run with `--attention-backend flashinfer`.

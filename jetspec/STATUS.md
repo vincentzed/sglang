@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-28 05:22 UTC
+Updated: 2026-06-28 06:12 UTC
 
 ## Done / Committed
 
@@ -20,6 +20,44 @@ Updated: 2026-06-28 05:22 UTC
 - Realignment Job 2 2026-06-28: dense FA4 page16 tree verify already routes through the multi-token custom-mask/FULL_MASK shape, not the FlashInfer compact path. No-reverify direct commit is still not lossless on FA4 page16; the first diagnostic shows exact layer-0 K/V but a layer-0 hidden delta, so the residual is in the FA4 tree/custom-mask verify execution shape rather than DFlash draft KV materialization. Retained-reverify w7/b64 and w7/b128 are token-exact against the fresh FA4 page16 oracle.
 - Realignment Job 3 2026-06-28: canonical MT-bench rerun completed on the aligned FA4 page16 backend. Width=1 linear reached `763.948 tok/s` with accept length `4.07`; dense tree w7/b64 with retained reverify reached `199.983 tok/s` with accept length `3.695`, so tree is `0.26x` linear (`3.82x` slower). No-reverify was not landed.
 - Mask root-cause Job 1 2026-06-28: dense FA4 page16 w7/b64 attended-set dump found that DFlash's generated tree mask is ancestor-exact, but FA4 does not enter the custom-mask target-verify path. For the first failing accepted node `3`, DFlash's custom mask allows only tree cols `[0, 3]`, but FA4's effective `topk<=1` causal verifier attends `[0, 1, 2, 3]`, admitting non-ancestor sibling/cousin cols `[1, 2]` (logical KV positions `[7, 8]`, physical slots `[23, 24]`). Root cause: FA4 gates the cascade/custom-mask verifier on backend `self.topk`, initialized from `speculative_eagle_topk=1`, instead of DFlash's per-verify `DFlashVerifyInput.topk=7` / `custom_mask`.
+- Mask root-cause Job 2 2026-06-28: dense FA4 page16 tree verify now uses an exact compact KV index list for each query row, so every accepted node reads exactly committed prefix plus self/ancestors. The dense accepted-path reverify is removed for compact dense target verify, and accepted KV is committed directly by copying accepted tree slots into the canonical next-prefix slots. Fresh flushed FA4 page16 width=1 oracle gates passed for w7/b64 and w7/b128 with zero token mismatches.
+
+## Mask Root-Cause Job 2 - FA4 Page16 Compact Exact Verify, No Dense Reverify
+
+Date/time: 2026-06-28 05:36-06:02 UTC.
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Backend: `--attention-backend fa4 --page-size 16`
+- Tree gates: `--speculative-dflash-tree-width 7`, budgets `64` and `128`
+- Fresh flushed oracle: `jetspec/runs/job1_fa4p16_linear_w1_flush_31811.json`
+
+Fix:
+- `FlashAttentionBackend` no longer relies only on backend `self.topk` for DFlash target verify. DFlash custom-mask and compact-tree metadata now use the per-request DFlash verify shape.
+- FA4 page16 cannot represent DFlash's sparse ancestor set by treating raw token IDs as page IDs. Dense DFlash FA4 therefore builds `compact_kv_indices` for every tree query row: the committed prefix slots followed by the query's ancestor chain ending at self.
+- The compact verifier gathers exactly those K/V rows and calls FA4 varlen attention with `max_seq_len_q=1`, `causal=False`, and per-query `cu_seqlens_k`. This bypasses the bad page-table interpretation that admitted sibling/cousin slots or missed sparse ancestors.
+- Dense compact direct commit skips `_reverify_accepted_tree_path_for_commit`: accepted tree KV slots are copied into the canonical contiguous prefix slots with `move_kv_cache_overlap_safe`. MoE remains on its existing lossless path.
+
+Accepted-set and layer-0 diagnostic:
+- Diagnostic log: `jetspec/logs/job2_compact_direct_diag_nograph_fa4p16_tree_w7_b64_31940_server.log`
+- Original failing node repro after the fix: `prefix=[6]`, `commit_lens=[2]`, accepted local path `[[0, 3]]`, branch candidates `[[12095, 13]]`.
+- Correct set: prefix `[0,6)` plus tree cols `[0, 3]`; compact allowed set: `[0, 3]`; extras `[]`; missing `[]`; tree slots `[22, 25]`.
+- The original mask-scale layer-0 hidden delta is gone: `first_layer_hidden_delta=(0, 0.001953125)` instead of `0.1357421875`, with layer-0 K/V still exact `(0.0, 0.0)`.
+- The debug hook list is not a clean all-layer bf16-equivalence proof because the compact FA4 verifier and the paged clean-causal replay use different FA4 kernel shapes; later-layer K/V deltas grow from the layer-0 bf16 difference. The losslessness gate below is therefore the commit criterion for this milestone.
+
+Fresh flushed losslessness gates:
+
+| run | artifact | token exact vs FA4 page16 oracle | mismatches | mean accept length | aggregate tok/s |
+|---|---|---:|---:|---:|---:|
+| 8B tree w7/b64, no dense accepted-path reverify | `jetspec/runs/job2_maskfix_noreverify_fa4p16_tree_w7_b64_flush_31941.json` | PASS | 0/10 | 4.2004 | 217.44 |
+| 8B tree w7/b128, no dense accepted-path reverify | `jetspec/runs/job2_maskfix_noreverify_fa4p16_tree_w7_b128_flush_31942.json` | PASS | 0/10 | 4.7738 | 181.38 |
+
+Notes:
+- Both servers used normal decode graph settings: `--cuda-graph-max-bs-decode 1 --cuda-graph-backend-decode full`.
+- Compact FA4 tree verify itself currently runs eager because each query row has a ragged compact K/V list; this is expected to matter in Job 3 performance.
+- Two exploratory gated experiments that tried to force the compact set through FA4 `with_kvcache` did not improve all-layer agreement and were not kept.
 
 ## Mask Root-Cause Job 1 - FA4 Page16 Attended Set
 

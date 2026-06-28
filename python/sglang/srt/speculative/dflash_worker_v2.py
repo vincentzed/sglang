@@ -1939,7 +1939,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         block_ids = self._draft_block_ids_buf[:bs]
         linear_draft_tokens = self._draft_block_tokens_buf[:bs]
-        prefix_lens = model_worker_batch.seq_lens
+        prefix_lens = model_worker_batch.seq_lens.clone()
         positions_2d = self._draft_block_positions_buf[:bs]
         verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
         if self._use_triton_prepare_block:
@@ -2133,14 +2133,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         active_target_attn_backend = target_model_runner.attn_backend
         while getattr(active_target_attn_backend, "full_attn_backend", None) is not None:
             active_target_attn_backend = active_target_attn_backend.full_attn_backend
-        use_flashinfer_compact_tree = (
+        use_compact_tree_verify = (
             type(active_target_attn_backend).__name__ == "FlashInferAttnBackend"
             and os.environ.get("SGLANG_DFLASH_TREE_COMPACT_FLASHINFER", "0") == "1"
+        ) or (
+            type(active_target_attn_backend).__name__ == "FlashAttentionBackend"
+            and getattr(active_target_attn_backend, "fa_impl_ver", None) == 4
         )
         use_flashinfer_expanded_causal_tree = (
             type(active_target_attn_backend).__name__ == "FlashInferAttnBackend"
             and self._tree_verify_attn_backend is None
-            and not use_flashinfer_compact_tree
+            and not use_compact_tree_verify
             and os.environ.get("SGLANG_DFLASH_TREE_EXPANDED_CAUSAL", "0") == "1"
         )
 
@@ -2304,7 +2307,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         ].copy_(
                             expanded_cache_loc_3d[row, node].to(req_to_token.dtype)
                         )
-        elif use_flashinfer_compact_tree:
+        elif use_compact_tree_verify:
             req_to_token = self.model_runner.req_to_token_pool.req_to_token
             compact_parts: list[torch.Tensor] = []
             compact_lens: list[int] = []
@@ -2362,7 +2365,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_draft_token_num = (
             block_size
             if use_flashinfer_expanded_causal_tree
-            else (1 if use_flashinfer_compact_tree else tree_budget)
+            else (1 if use_compact_tree_verify else tree_budget)
         )
         verify_input = DFlashVerifyInput(
             draft_token=verify_draft_token,
@@ -2376,7 +2379,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             custom_mask=(
                 None
-                if (use_flashinfer_compact_tree or use_flashinfer_expanded_causal_tree)
+                if (use_compact_tree_verify or use_flashinfer_expanded_causal_tree)
                 else custom_mask
             ),
             retrieve_index=(
@@ -2399,7 +2402,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             max_tree_depth=block_size,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            allow_cuda_graph=not use_flashinfer_compact_tree,
+            allow_cuda_graph=not use_compact_tree_verify,
             compact_kv_indices=compact_kv_indices,
             compact_kv_indptr=compact_kv_indptr,
             compact_qo_indptr=compact_qo_indptr,
@@ -2416,8 +2419,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if compare_layer_hidden:
             verify_input.allow_cuda_graph = False
+        dense_compact_direct_commit = (
+            use_compact_tree_verify
+            and target_model_runner.mambaish_config is None
+        )
         use_reverify_commit = (
             not use_flashinfer_expanded_causal_tree
+            and not dense_compact_direct_commit
             and os.environ.get("SGLANG_DFLASH_TREE_REVERIFY_ACCEPTED_COMMIT", "1")
             != "0"
         )
@@ -2549,7 +2557,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                             target_model_runner.attn_backend.init_forward_metadata(
                                 verify_forward_batch
                             )
-                    elif use_flashinfer_compact_tree:
+                    elif use_compact_tree_verify:
                         assert compact_req_pool_indices is not None
                         assert compact_seq_lens is not None
                         assert compact_seq_lens_cpu is not None
@@ -2871,12 +2879,54 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if os.environ.get("SGLANG_DFLASH_TREE_COMPARE_CAUSAL"):
             branch_cache_alloc = None
+            branch_kv_backup = None
             compare_branch_len = block_size
             if os.environ.get("SGLANG_DFLASH_TREE_COMPARE_EXACT_BRANCH_LEN"):
                 compare_branch_len = max(1, int(commit_lens.max().item()))
             compare_accept_index_local = accept_index_local[:, :compare_branch_len]
             scratch_start = tree_budget - compare_branch_len
-            if scratch_start >= compare_branch_len:
+            active_page_size = int(getattr(active_target_attn_backend, "page_size", 1))
+            use_page_contiguous_branch_compare = (
+                use_compact_tree_verify
+                and active_page_size > 1
+                and not use_flashinfer_expanded_causal_tree
+            )
+            if use_page_contiguous_branch_compare:
+                scratch_nodes = torch.arange(
+                    compare_branch_len,
+                    dtype=torch.long,
+                    device=device,
+                )
+                branch_cache_loc_2d = tree_cache_loc_2d[:, scratch_nodes].to(
+                    torch.long
+                )
+                kv_pool_for_backup = (
+                    model_worker_batch.token_to_kv_pool_allocator.get_kvcache()
+                )
+                if hasattr(kv_pool_for_backup, "full_attention_layer_id_mapping"):
+                    backup_layer_ids = sorted(
+                        kv_pool_for_backup.full_attention_layer_id_mapping
+                    )
+                else:
+                    backup_layer_ids = range(
+                        int(getattr(kv_pool_for_backup, "layer_num", 0))
+                    )
+                backup_locs = branch_cache_loc_2d.reshape(-1).to(torch.long)
+                branch_kv_backup = []
+                for layer_id in backup_layer_ids:
+                    try:
+                        k_buffer = kv_pool_for_backup.get_key_buffer(layer_id)
+                        v_buffer = kv_pool_for_backup.get_value_buffer(layer_id)
+                    except Exception:
+                        continue
+                    branch_kv_backup.append(
+                        (
+                            layer_id,
+                            k_buffer[backup_locs].clone(),
+                            v_buffer[backup_locs].clone(),
+                        )
+                    )
+            elif scratch_start >= compare_branch_len:
                 scratch_nodes = torch.arange(
                     scratch_start,
                     tree_budget,
@@ -2920,7 +2970,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             ).any()
             if branch_cache_alloc is None and scratch_nodes[0].item() < 0:
                 pass
-            elif bool(overlaps_scratch.item()):
+            elif (
+                not use_page_contiguous_branch_compare
+                and bool(overlaps_scratch.item())
+            ):
                 logger.info(
                     "DFLASH tree causal compare skipped: accepted path overlaps scratch tail slots local=%s scratch=%s",
                     compare_accept_index_local.detach().cpu().tolist(),
@@ -3025,6 +3078,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_forward_mode_backup = model_worker_batch.forward_mode
                 batch_capture_hidden_mode_backup = model_worker_batch.capture_hidden_mode
                 batch_out_cache_loc_backup = model_worker_batch.out_cache_loc
+                batch_seq_lens_backup = model_worker_batch.seq_lens
                 seq_lens_cpu_backup = model_worker_batch.seq_lens_cpu
                 seq_lens_sum_backup = model_worker_batch.seq_lens_sum
                 req_to_token = self.model_runner.req_to_token_pool.req_to_token
@@ -3100,6 +3154,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         batch_capture_hidden_mode_backup
                     )
                     model_worker_batch.out_cache_loc = batch_out_cache_loc_backup
+                    model_worker_batch.seq_lens = batch_seq_lens_backup
                     model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
                     model_worker_batch.seq_lens_sum = seq_lens_sum_backup
                     _restore_compare_persistent_mamba_state()
@@ -3627,6 +3682,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                     conv_max_abs,
                 )
                 torch.get_device_module(device).synchronize()
+                if branch_kv_backup is not None:
+                    kv_pool_restore = (
+                        model_worker_batch.token_to_kv_pool_allocator.get_kvcache()
+                    )
+                    restore_locs = branch_cache_loc_2d.reshape(-1).to(torch.long)
+                    for layer_id, k_backup, v_backup in branch_kv_backup:
+                        try:
+                            kv_pool_restore.get_key_buffer(layer_id)[
+                                restore_locs
+                            ] = k_backup
+                            kv_pool_restore.get_value_buffer(layer_id)[
+                                restore_locs
+                            ] = v_backup
+                        except Exception:
+                            logger.exception(
+                                "DFLASH tree causal compare failed to restore "
+                                "KV backup for layer %s",
+                                layer_id,
+                            )
+                    branch_kv_backup = None
                 if same_shape_req_pool_indices is not None:
                     self.model_runner.req_to_token_pool.free_slots.extend(
                         same_shape_req_pool_indices.detach().cpu().tolist()
@@ -3757,6 +3832,21 @@ class DFlashWorkerV2(BaseSpecWorker):
                 prefix_lens.to(torch.int64) + block_size,
                 accepted_cache_loc_2d.reshape(-1),
                 bs,
+            )
+        elif use_compact_tree_verify:
+            source_cache_loc_2d = torch.gather(
+                tree_cache_loc_2d,
+                1,
+                accept_index_local,
+            ).to(torch.int64)
+            accepted_cache_loc_2d = tree_cache_loc_2d[:, :block_size].to(torch.int64)
+            valid_offsets = (
+                accepted_offsets_2d < commit_lens.to(torch.int64).unsqueeze(1)
+            )
+            move_kv_cache_overlap_safe(
+                model_worker_batch.token_to_kv_pool_allocator.get_kvcache(),
+                accepted_cache_loc_2d[valid_offsets],
+                source_cache_loc_2d[valid_offsets],
             )
         elif use_flashinfer_expanded_causal_tree:
             assert expanded_cache_loc_3d is not None
