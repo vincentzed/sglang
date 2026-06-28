@@ -242,6 +242,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.dflash_tree_compact_kv_indices_buffers: dict[int, torch.Tensor] = {}
         self.dflash_tree_compact_kv_indptr_buffers: dict[int, torch.Tensor] = {}
         self.dflash_tree_compact_qo_indptr_buffers: dict[int, torch.Tensor] = {}
+        self.dflash_tree_compact_fa4_graph_max_rows = max(
+            1,
+            int(
+                os.environ.get(
+                    "SGLANG_DFLASH_TREE_COMPACT_FORWARD_CHUNK_ROWS", "128"
+                )
+            ),
+        )
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
@@ -280,6 +288,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     and os.environ.get("SGLANG_DFLASH_TREE_EXPANDED_CAUSAL", "0")
                     == "1"
                 )
+                if (
+                    self.dflash_tree_compact_fa4_graph
+                    and int(model_runner.server_args.speculative_dflash_tree_budget)
+                    > self.dflash_tree_compact_fa4_graph_max_rows
+                ):
+                    self.dflash_tree_compact_fa4_graph = False
+                    logger.info(
+                        "Disable DFLASH compact FA4 target verify CUDA graph for "
+                        "tree budget %s above full-forward chunk row cap %s",
+                        model_runner.server_args.speculative_dflash_tree_budget,
+                        self.dflash_tree_compact_fa4_graph_max_rows,
+                    )
                 if self.dflash_tree_compact_fa4_graph:
                     # Compact FA4 verify already has one query row per tree
                     # node. Capture that exact row-shaped verifier with one
@@ -773,6 +793,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             is_dflash_compact_supported = (
                 forward_batch.input_ids.numel() == forward_batch.batch_size
+                and forward_batch.batch_size
+                <= self.dflash_tree_compact_fa4_graph_max_rows
                 and self._dflash_compact_kv_bucket_for_forward_batch(forward_batch)
                 is not None
             )

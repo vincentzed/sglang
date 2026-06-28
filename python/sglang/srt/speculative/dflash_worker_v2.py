@@ -2443,6 +2443,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             != "0"
         )
         expanded_can_run_cuda_graph = False
+        compact_forward_chunk_rows = 0
+        if use_compact_tree_verify and bs == 1 and tree_budget > 128:
+            compact_forward_chunk_rows = max(
+                1,
+                int(
+                    os.environ.get(
+                        "SGLANG_DFLASH_TREE_COMPACT_FORWARD_CHUNK_ROWS", "128"
+                    )
+                ),
+            )
+            verify_input.allow_cuda_graph = False
 
         target_attn_backend_backup = None
         if self._tree_verify_attn_backend is not None:
@@ -2510,6 +2521,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         target_forward_ok = False
         skip_attn_backend_init = True
+        target_out = None
         try:
             with verify_context:
                 with self._maybe_use_tree_verify_full_attn_backend(
@@ -2574,45 +2586,169 @@ class DFlashWorkerV2(BaseSpecWorker):
                         assert compact_req_pool_indices is not None
                         assert compact_seq_lens is not None
                         assert compact_seq_lens_cpu is not None
-                        verify_forward_batch = ForwardBatch(
-                            forward_mode=ForwardMode.TARGET_VERIFY,
-                            batch_size=bs * tree_budget,
-                            input_ids=verify_draft_token,
-                            req_pool_indices=compact_req_pool_indices,
-                            seq_lens=compact_seq_lens,
-                            out_cache_loc=(
-                                expanded_cache_loc
-                                if use_flashinfer_expanded_causal_tree
-                                else tree_cache_loc
-                            ),
-                            seq_lens_sum=int(compact_seq_lens_cpu.sum().item()),
-                            seq_lens_cpu=compact_seq_lens_cpu,
-                            positions=verify_positions,
-                            spec_algorithm=SpeculativeAlgorithm.DFLASH,
-                            spec_info=verify_input,
-                            capture_hidden_mode=CaptureHiddenMode.FULL,
-                        )
-                        if target_model_runner.model_is_mrope:
-                            verify_forward_batch.mrope_positions = (
-                                verify_positions.unsqueeze(0).repeat(3, 1)
+                        if (
+                            compact_forward_chunk_rows > 0
+                            and tree_budget > compact_forward_chunk_rows
+                        ):
+                            assert compact_kv_indices is not None
+                            assert compact_kv_indptr is not None
+                            assert compact_qo_indptr is not None
+                            chunk_logits = []
+                            chunk_hidden = []
+                            for chunk_start in range(
+                                0, tree_budget, compact_forward_chunk_rows
+                            ):
+                                chunk_end = min(
+                                    chunk_start + compact_forward_chunk_rows,
+                                    tree_budget,
+                                )
+                                chunk_rows = chunk_end - chunk_start
+                                kv_start = int(
+                                    compact_kv_indptr[chunk_start].item()
+                                )
+                                kv_end = int(compact_kv_indptr[chunk_end].item())
+                                chunk_compact_kv_indices = compact_kv_indices[
+                                    kv_start:kv_end
+                                ]
+                                chunk_compact_kv_indptr = (
+                                    compact_kv_indptr[chunk_start : chunk_end + 1]
+                                    - kv_start
+                                )
+                                chunk_compact_qo_indptr = torch.arange(
+                                    0,
+                                    chunk_rows + 1,
+                                    dtype=torch.int32,
+                                    device=device,
+                                )
+                                chunk_verify_input = DFlashVerifyInput(
+                                    draft_token=tree_tokens[
+                                        :, chunk_start:chunk_end
+                                    ].reshape(-1),
+                                    positions=tree_positions_2d[
+                                        :, chunk_start:chunk_end
+                                    ].reshape(-1),
+                                    draft_token_num=1,
+                                    topk=tree_width,
+                                    custom_mask=None,
+                                    retrieve_index=retrieve_index[
+                                        :, chunk_start:chunk_end
+                                    ],
+                                    retrieve_next_token=retrieve_next_token[
+                                        :, chunk_start:chunk_end
+                                    ],
+                                    retrieve_next_sibling=retrieve_next_sibling[
+                                        :, chunk_start:chunk_end
+                                    ],
+                                    max_tree_depth=block_size,
+                                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                                    allow_cuda_graph=False,
+                                    compact_kv_indices=chunk_compact_kv_indices,
+                                    compact_kv_indptr=chunk_compact_kv_indptr,
+                                    compact_qo_indptr=chunk_compact_qo_indptr,
+                                    num_tokens_per_batch=1,
+                                )
+                                chunk_seq_lens = compact_seq_lens[
+                                    chunk_start:chunk_end
+                                ]
+                                chunk_seq_lens_cpu = compact_seq_lens_cpu[
+                                    chunk_start:chunk_end
+                                ]
+                                chunk_forward_batch = ForwardBatch(
+                                    forward_mode=ForwardMode.TARGET_VERIFY,
+                                    batch_size=chunk_rows,
+                                    input_ids=chunk_verify_input.draft_token,
+                                    req_pool_indices=model_worker_batch.req_pool_indices.repeat_interleave(
+                                        chunk_rows
+                                    ),
+                                    seq_lens=chunk_seq_lens,
+                                    out_cache_loc=tree_cache_loc_2d[
+                                        :, chunk_start:chunk_end
+                                    ].reshape(-1),
+                                    seq_lens_sum=int(
+                                        chunk_seq_lens_cpu.sum().item()
+                                    ),
+                                    seq_lens_cpu=chunk_seq_lens_cpu,
+                                    positions=chunk_verify_input.positions,
+                                    spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                                    spec_info=chunk_verify_input,
+                                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                                )
+                                if target_model_runner.model_is_mrope:
+                                    chunk_forward_batch.mrope_positions = (
+                                        chunk_verify_input.positions.unsqueeze(0).repeat(
+                                            3, 1
+                                        )
+                                    )
+                                chunk_forward_batch.allow_cuda_graph = False
+                                target_model_runner.attn_backend.init_forward_metadata(
+                                    chunk_forward_batch
+                                )
+                                target_out = self.target_worker.forward_batch_generation(
+                                    batch=None,
+                                    forward_batch=chunk_forward_batch,
+                                    is_verify=True,
+                                    skip_attn_backend_init=True,
+                                )
+                                chunk_logits.append(
+                                    target_out.logits_output.next_token_logits
+                                )
+                                if target_out.logits_output.hidden_states is not None:
+                                    chunk_hidden.append(
+                                        target_out.logits_output.hidden_states
+                                    )
+
+                            if target_out is None:
+                                raise RuntimeError(
+                                    "DFLASH compact tree chunked verify produced no output."
+                                )
+                            target_out.logits_output.next_token_logits = torch.cat(
+                                chunk_logits, dim=0
                             )
-                        verify_forward_batch.allow_cuda_graph = (
-                            verify_input.allow_cuda_graph
-                        )
-                        compact_can_run_cuda_graph = bool(
-                            verify_forward_batch.allow_cuda_graph
-                            and target_model_runner.decode_cuda_graph_runner
-                            and target_model_runner.decode_cuda_graph_runner.can_run_graph(
-                                verify_forward_batch
-                            )
-                        )
-                        if compact_can_run_cuda_graph:
-                            skip_attn_backend_init = None
+                            if chunk_hidden:
+                                target_out.logits_output.hidden_states = torch.cat(
+                                    chunk_hidden, dim=0
+                                )
+                            skip_attn_backend_init = True
                         else:
-                            verify_forward_batch.allow_cuda_graph = False
-                            target_model_runner.attn_backend.init_forward_metadata(
-                                verify_forward_batch
+                            verify_forward_batch = ForwardBatch(
+                                forward_mode=ForwardMode.TARGET_VERIFY,
+                                batch_size=bs * tree_budget,
+                                input_ids=verify_draft_token,
+                                req_pool_indices=compact_req_pool_indices,
+                                seq_lens=compact_seq_lens,
+                                out_cache_loc=(
+                                    expanded_cache_loc
+                                    if use_flashinfer_expanded_causal_tree
+                                    else tree_cache_loc
+                                ),
+                                seq_lens_sum=int(compact_seq_lens_cpu.sum().item()),
+                                seq_lens_cpu=compact_seq_lens_cpu,
+                                positions=verify_positions,
+                                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                                spec_info=verify_input,
+                                capture_hidden_mode=CaptureHiddenMode.FULL,
                             )
+                            if target_model_runner.model_is_mrope:
+                                verify_forward_batch.mrope_positions = (
+                                    verify_positions.unsqueeze(0).repeat(3, 1)
+                                )
+                            verify_forward_batch.allow_cuda_graph = (
+                                verify_input.allow_cuda_graph
+                            )
+                            compact_can_run_cuda_graph = bool(
+                                verify_forward_batch.allow_cuda_graph
+                                and target_model_runner.decode_cuda_graph_runner
+                                and target_model_runner.decode_cuda_graph_runner.can_run_graph(
+                                    verify_forward_batch
+                                )
+                            )
+                            if compact_can_run_cuda_graph:
+                                skip_attn_backend_init = None
+                            else:
+                                verify_forward_batch.allow_cuda_graph = False
+                                target_model_runner.attn_backend.init_forward_metadata(
+                                    verify_forward_batch
+                                )
                     else:
                         if draft_input.planning_seq_lens_cpu is not None:
                             model_worker_batch.seq_lens_cpu = (
@@ -2638,12 +2774,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                     with self._capture_decoder_layer_hidden(
                         compare_layer_hidden
                     ) as tree_layer_hidden:
-                        target_out = self.target_worker.forward_batch_generation(
-                            batch=None,
-                            forward_batch=verify_forward_batch,
-                            is_verify=True,
-                            skip_attn_backend_init=skip_attn_backend_init,
-                        )
+                        if target_out is None:
+                            target_out = self.target_worker.forward_batch_generation(
+                                batch=None,
+                                forward_batch=verify_forward_batch,
+                                is_verify=True,
+                                skip_attn_backend_init=skip_attn_backend_init,
+                            )
                     target_forward_ok = True
         finally:
             if target_attn_backend_backup is not None:
