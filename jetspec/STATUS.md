@@ -1,6 +1,17 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-29 17:10 UTC
+Updated: 2026-06-29 22:35 UTC
+
+## Urgent Paged-Tree A/B Result
+
+- Branch/head under investigation: `jetspec-tree-draft` at `d495bcc5b4`.
+- Required GPU range `4-7` became unusable from this namespace: each reported roughly `248-256 GiB` allocated with no visible compute-app owner; `lsof` showed no owner and targeted `nvidia-smi --gpu-reset -i 4` was refused as "in use by another client". The follow-up A/B probe used idle GPU 0, same B300 class, to avoid losing the window.
+- Serving A/B against the lossless compact verifier found the first target-logit argmax divergence at GSM8K sample 0, decode step 4, row 0, tree node 11. Compact argmax was token `21`; paged argmax was token `19`; max logit delta was `0.125`.
+- For that divergent node, compact and paged read the same logical positions and physical KV slots: positions `[0, 1, 3, 12]`, slots `[16, 17, 19, 28]`, allowed tree nodes `[0, 2, 11]`, no slot mismatches. This rules out the page-table suffix overlay and KV publish-order hypotheses.
+- Graph replay is not the root cause: setting `SGLANG_DFLASH_TREE_PAGED_FA4_CUDA_GRAPH=0` reproduced the same step-4 node-11 argmax divergence.
+- A lower-level attention A/B showed the paged serving path can diverge before logits even when the compact visible slot list is identical. The diagnostic startup probe hit layer 1, row 0, node 12 with `attn_max_abs=2.384185791015625e-07`, slots `[16, 17, 18, 19, 20, 21, 22, 24, 34]`, and allowed tree nodes `[0, 2, 12]`.
+- A small isolated fixture check still matched compact exactly for `softcap=5.0`, `softcap=0.0`, and `softcap=None`, so the serving-only failure is not explained by the softcap flag alone.
+- No code fix was committed for the paged verifier. Losslessness remains sacred: `SGLANG_DFLASH_TREE_PAGED_FA4_VERIFY` stays default-off, and the invalid paged path must not be counted as a win or shipped as an enabled default.
 
 ## Done / Committed
 

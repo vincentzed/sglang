@@ -2,6 +2,34 @@
 
 Date: 2026-06-29 UTC
 
+## Urgent paged FA4 A/B against compact verify
+
+Date/time: 2026-06-29 22:01-22:35 UTC.
+
+Question:
+- The paged FA4 tree verifier is fast in isolation but fails serving losslessness. Compare paged and compact target verify on the same serving tree and find the exact first disagreement instead of guessing at page-table or KV-publish fixes.
+
+Mode:
+- Branch/head: `jetspec-tree-draft` at `d495bcc5b4`.
+- Initial required GPUs `4-7` were unusable from this namespace: each showed roughly `248-256 GiB` allocated, no visible compute-app owner, no `lsof` owner, and `nvidia-smi --gpu-reset -i 4` was refused as "in use by another client". The final diagnostic server used idle GPU 0, same B300 class.
+- Server path: `Qwen/Qwen3-8B`, `JetSpec/jetspec-qwen3-8b`, FA4 page16, top2gap `width=8`, `budget=16`, `beta=1.0`, `g0=1.0`, no replay. Paged graph was tested both on and off.
+
+A/B finding:
+- First target-logit argmax divergence on the failing GSM8K sample 0 path: decode step 4, row 0, tree node 11.
+- Compact verifier: argmax token `21`, top logits `[(21, 21.0), (23, 20.875), (19, 20.875), (20, 20.875)]`.
+- Paged verifier: argmax token `19`, top logits `[(21, 20.875), (19, 20.875), (20, 20.75), (23, 20.75)]`.
+- Max logit delta: `0.125`; hidden max delta at final logits output: `3.0`.
+- The compact and paged attended slot lists for the divergent node were identical: logical positions `[0, 1, 3, 12]`, physical slots `[16, 17, 19, 28]`, allowed tree nodes `[0, 2, 11]`, prefix len `1`, tree budget `16`, page size `16`, no slot mismatches.
+- Disabling the paged FA4 verify CUDA graph reproduced the same step-4 node-11 argmax divergence, so stale graph metadata is not the root cause.
+- Lower-level attention A/B showed paged serving attention can diverge before logits even with identical compact visible slots. The startup diagnostic hit layer 1, row 0, node 12 with `attn_max_abs=2.384185791015625e-07`, slots `[16, 17, 18, 19, 20, 21, 22, 24, 34]`, allowed tree nodes `[0, 2, 12]`.
+
+Additional check:
+- Re-ran the isolated paged-tree fixture on GPU 0 for `softcap=5.0`, `softcap=0.0`, and `softcap=None`; all three still matched compact exactly (`max=0.0`, `mean=0.0`, `nonzero=0`). The serving-only failure is therefore not just the no-softcap variant missing from the original unit test.
+
+Verdict:
+- The exact serving discrepancy found by A/B is not a wrong slot, wrong page-table suffix, missing ancestor, prefix boundary, KV-write ordering, or CUDA-graph metadata replay issue. The paged FA4 serving kernel path reads the same visible KV slots as compact but does not preserve compact's lossless numerics in serving; small attention/logit deltas can flip tied or near-tied target argmax choices.
+- No paged fix was landed. Losslessness remains the gate: `SGLANG_DFLASH_TREE_PAGED_FA4_VERIFY` stays default-off, and the existing paged-on GSM8K result remains invalid.
+
 Hardware/env:
 - GPU: `CUDA_VISIBLE_DEVICES=7` (`NVIDIA B300 SXM6 AC`, SM100, 275 GB)
 - Required env used for every server: `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
