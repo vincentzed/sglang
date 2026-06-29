@@ -9,6 +9,49 @@ Hardware/env:
 - Decode settings: BF16/default dtype, greedy `temperature=0`, `--tp-size 1`, `max_new_tokens=96`
 - Harness: `jetspec/run_fixed_prompts.py`, 10 fixed prompts including GSM-style arithmetic, sequence, code, translation, and summary prompts.
 
+## Lean top2gap sweep - paper datasets
+
+Date/time: 2026-06-29 04:09-04:43 UTC.
+
+Question:
+- Does a lean top2gap DFlash tree, with mean node count near linear's 16-node verify cost, match or beat linear DFlash throughput on GSM8K and MATH-500?
+
+Mode:
+- Top2gap only; no accum_logp baseline rerun.
+- Servers used `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`, `PYTHONPATH=python`, `--attention-backend fa4 --page-size 16`, `--max-running-requests 1`, `--cuda-graph-max-bs-decode 1`, and `--cuda-graph-backend-decode full`.
+- Target `Qwen/Qwen3-8B`, draft `JetSpec/jetspec-qwen3-8b`, greedy `temperature=0`, `top_p=1.0`, `max_new_tokens=2048`.
+- Harness: `jetspec/bench_paper_sglang.py`, first 80 prompts per dataset, compared token-exactly against the existing linear DFlash artifacts.
+- Linear comparison bars were the existing paper-dataset measurements: GSM8K `1152.85 tok/s`, accept `5.85`; MATH-500 `1505.24 tok/s`, accept `7.62`.
+- Sweep driver/result summary: `jetspec/runs/top2gap_lean_20260629/summary.ndjson`.
+
+Results:
+
+| Dataset | beta | g0 | budget | Accept len | Tok/s | ms/step | Mean nodes | Exact | vs linear | Artifact |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---|
+| GSM8K | 1.0 | 1.0 | 24 | 6.89 | 551.39 | 12.50 | 23.68 | PASS | 0.48x | `jetspec/runs/top2gap_lean_20260629/gsm8k_top2gap_w8_b24_beta1p0_g01p0_31840.json` |
+| MATH-500 | 1.0 | 1.0 | 24 | 8.61 | 653.04 | 13.18 | 23.10 | PASS | 0.43x | `jetspec/runs/top2gap_lean_20260629/math500_top2gap_w8_b24_beta1p0_g01p0_31840.json` |
+| GSM8K | 1.0 | 1.0 | 16 | 6.45 | 570.64 | 11.30 | 16.00 | PASS | 0.49x | `jetspec/runs/top2gap_lean_20260629/gsm8k_top2gap_w8_b16_beta1p0_g01p0_31841.json` |
+| MATH-500 | 1.0 | 1.0 | 16 | 7.90 | 674.74 | 11.71 | 16.00 | PASS | 0.45x | `jetspec/runs/top2gap_lean_20260629/math500_top2gap_w8_b16_beta1p0_g01p0_31841.json` |
+| GSM8K | 1.0 | 1.0 | 32 | 7.11 | 524.98 | 13.54 | 31.20 | PASS | 0.46x | `jetspec/runs/top2gap_lean_20260629/gsm8k_top2gap_w8_b32_beta1p0_g01p0_31842.json` |
+| MATH-500 | 1.0 | 1.0 | 32 | 8.89 | 617.16 | 14.40 | 29.99 | PASS | 0.41x | `jetspec/runs/top2gap_lean_20260629/math500_top2gap_w8_b32_beta1p0_g01p0_31842.json` |
+| GSM8K | 1.0 | 1.0 | 48 | 7.34 | 466.21 | 15.74 | 45.96 | PASS | 0.40x | `jetspec/runs/top2gap_lean_20260629/gsm8k_top2gap_w8_b48_beta1p0_g01p0_31843.json` |
+| MATH-500 | 1.0 | 1.0 | 48 | 9.25 | 544.24 | 16.99 | 43.40 | PASS | 0.36x | `jetspec/runs/top2gap_lean_20260629/math500_top2gap_w8_b48_beta1p0_g01p0_31843.json` |
+| GSM8K | 2.0 | 0.5 | 24 | 6.77 | 538.51 | 12.58 | 23.28 | PASS | 0.47x | `jetspec/runs/top2gap_lean_20260629/gsm8k_top2gap_w8_b24_beta2p0_g00p5_31844.json` |
+| MATH-500 | 2.0 | 0.5 | 24 | 8.60 | 646.45 | 13.31 | 22.60 | PASS | 0.43x | `jetspec/runs/top2gap_lean_20260629/math500_top2gap_w8_b24_beta2p0_g00p5_31844.json` |
+| GSM8K | 2.0 | 0.5 | 16 | 6.49 | 552.35 | 11.76 | 16.00 | PASS | 0.48x | `jetspec/runs/top2gap_lean_20260629/gsm8k_top2gap_w8_b16_beta2p0_g00p5_31845.json` |
+| MATH-500 | 2.0 | 0.5 | 16 | 8.11 | 679.60 | 11.93 | 16.00 | PASS | 0.45x | `jetspec/runs/top2gap_lean_20260629/math500_top2gap_w8_b16_beta2p0_g00p5_31845.json` |
+| GSM8K | 2.0 | 0.5 | 32 | 6.91 | 509.96 | 13.56 | 30.38 | PASS | 0.44x | `jetspec/runs/top2gap_lean_20260629/gsm8k_top2gap_w8_b32_beta2p0_g00p5_31846.json` |
+| MATH-500 | 2.0 | 0.5 | 32 | 8.84 | 590.52 | 14.97 | 28.98 | PASS | 0.39x | `jetspec/runs/top2gap_lean_20260629/math500_top2gap_w8_b32_beta2p0_g00p5_31846.json` |
+| GSM8K | 2.0 | 0.5 | 48 | 7.03 | 438.17 | 16.05 | 44.19 | PASS | 0.38x | `jetspec/runs/top2gap_lean_20260629/gsm8k_top2gap_w8_b48_beta2p0_g00p5_31847.json` |
+| MATH-500 | 2.0 | 0.5 | 48 | 9.05 | 535.78 | 16.89 | 41.05 | PASS | 0.36x | `jetspec/runs/top2gap_lean_20260629/math500_top2gap_w8_b48_beta2p0_g00p5_31847.json` |
+
+Verdict:
+- FAIL for matching or beating linear throughput. Every lean top2gap row is token-exact and every best-throughput row has accept length above the linear bar, but throughput remains far below linear.
+- Best paired config across both datasets: `width=8`, `budget=16`, `beta=1.0`, `g0=1.0`. It reaches GSM8K `570.64 tok/s`, accept `6.45`, nodes `16.00` (`0.49x` linear), and MATH-500 `674.74 tok/s`, accept `7.90`, nodes `16.00` (`0.45x` linear).
+- Best single-dataset rows: GSM8K `budget=16`, `beta=1.0`, `g0=1.0` at `570.64 tok/s`; MATH-500 `budget=16`, `beta=2.0`, `g0=0.5` at `679.60 tok/s`.
+- Gaps to linear for the best single-dataset rows are `582.21 tok/s` on GSM8K and `825.64 tok/s` on MATH-500.
+- Trend: smaller budgets improve throughput down to the current `budget=16` floor; larger budgets improve accept but lose speed. Sharper `(beta=2.0,g0=0.5)` does not improve the overall paired config and only gives a small MATH-500-only gain at `budget=16`. Pushing below 16 would require changing the current block-size/budget floor rather than another top2gap parameter sweep.
+
 ## Top2gap construction Job 1 - fresh oracle losslessness gate
 
 Date/time: 2026-06-29 03:16-03:22 UTC.

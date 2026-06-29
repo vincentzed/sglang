@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-29 03:25 UTC
+Updated: 2026-06-29 04:45 UTC
 
 ## Done / Committed
 
@@ -24,6 +24,50 @@ Updated: 2026-06-29 03:25 UTC
 - Mask root-cause Job 3 2026-06-28: canonical MT-bench rerun completed with the dense reverify removed. FA4 page16 width=1 linear reached `764.540 tok/s` with accept length `4.070`; dense tree w7/b64 no-reverify reached `243.000 tok/s` with accept length `5.053`. Tree improves over the old retained-reverify tree (`199.983 tok/s`) but is still only `0.32x` linear (`3.15x` slower), so dense tree does not beat or match linear yet.
 - Paper-dataset benchmark 2026-06-28: added `jetspec/bench_paper_sglang.py` and measured first-80 GSM8K/MATH-500 prompts with JetSpec prompt formatting. Valid tree b128 reaches paper-level acceptance (`7.77` GSM8K vs paper `7.94`; `9.55` MATH-500 vs paper `9.56`) but is verify-cost-limited (`23.55/25.64 ms/step`, `329.91/372.49 tok/s`). b255 is not lossless (`3/5` GSM8K oracle mismatches, `2/5` MATH oracle mismatches) and is diagnostic only.
 - Top2gap construction Job 1 2026-06-29: added `speculative_dflash_tree_draft=top2gap`, per-depth top-2-gap sigmoid fanout caps, and measured tree node-count counters. Fresh flushed FA4 page16 width=1 oracle gates passed for top2gap w4/b64 beta=1.0 g0=1.0 on GSM8K and MATH-500 with zero token mismatches. First-5 accept length improved from `5.33 -> 6.56` on GSM8K and `7.71 -> 9.18` on MATH-500; mean root-inclusive tree nodes were `57.54` and `50.45`.
+- Lean top2gap sweep 2026-06-29: swept top2gap-only `width=8`, budgets `16/24/32/48`, `(beta,g0)=(1.0,1.0)` and `(2.0,0.5)` on first-80 GSM8K/MATH-500 with FA4 page16 and normal decode graphs. All 16 dataset rows were token-exact, but none matched linear throughput. Best paired config is `budget=16`, `beta=1.0`, `g0=1.0`: GSM8K `570.64 tok/s`, accept `6.45`, nodes `16.00` (`0.49x` linear); MATH-500 `674.74 tok/s`, accept `7.90`, nodes `16.00` (`0.45x` linear). Best single MATH row is `budget=16`, `beta=2.0`, `g0=0.5` at `679.60 tok/s`, but still only `0.45x` linear. Verdict: lean top2gap raises accept over linear at the node floor but remains verify/host-overhead limited.
+
+## Lean Top2gap Sweep - Paper Datasets
+
+Date/time: 2026-06-29 04:09-04:43 UTC.
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Backend for DFlash rows: `--attention-backend fa4 --page-size 16`
+- Decode graph flags: `--cuda-graph-max-bs-decode 1 --cuda-graph-backend-decode full`
+- Harness: `jetspec/bench_paper_sglang.py`, first 80 samples per dataset, greedy `temperature=0`, `top_p=1.0`, `max_new_tokens=2048`
+- Summary artifact: `jetspec/runs/top2gap_lean_20260629/summary.ndjson`
+
+Comparison bars:
+- GSM8K linear DFlash: `1152.85 tok/s`, accept `5.85`
+- MATH-500 linear DFlash: `1505.24 tok/s`, accept `7.62`
+
+Results:
+
+| dataset | beta | g0 | budget | exact | accept | tok/s | ms/step | mean nodes | vs linear |
+|---|---:|---:|---:|---|---:|---:|---:|---:|---:|
+| GSM8K | 1.0 | 1.0 | 24 | PASS | 6.89 | 551.39 | 12.50 | 23.68 | 0.48x |
+| MATH-500 | 1.0 | 1.0 | 24 | PASS | 8.61 | 653.04 | 13.18 | 23.10 | 0.43x |
+| GSM8K | 1.0 | 1.0 | 16 | PASS | 6.45 | 570.64 | 11.30 | 16.00 | 0.49x |
+| MATH-500 | 1.0 | 1.0 | 16 | PASS | 7.90 | 674.74 | 11.71 | 16.00 | 0.45x |
+| GSM8K | 1.0 | 1.0 | 32 | PASS | 7.11 | 524.98 | 13.54 | 31.20 | 0.46x |
+| MATH-500 | 1.0 | 1.0 | 32 | PASS | 8.89 | 617.16 | 14.40 | 29.99 | 0.41x |
+| GSM8K | 1.0 | 1.0 | 48 | PASS | 7.34 | 466.21 | 15.74 | 45.96 | 0.40x |
+| MATH-500 | 1.0 | 1.0 | 48 | PASS | 9.25 | 544.24 | 16.99 | 43.40 | 0.36x |
+| GSM8K | 2.0 | 0.5 | 24 | PASS | 6.77 | 538.51 | 12.58 | 23.28 | 0.47x |
+| MATH-500 | 2.0 | 0.5 | 24 | PASS | 8.60 | 646.45 | 13.31 | 22.60 | 0.43x |
+| GSM8K | 2.0 | 0.5 | 16 | PASS | 6.49 | 552.35 | 11.76 | 16.00 | 0.48x |
+| MATH-500 | 2.0 | 0.5 | 16 | PASS | 8.11 | 679.60 | 11.93 | 16.00 | 0.45x |
+| GSM8K | 2.0 | 0.5 | 32 | PASS | 6.91 | 509.96 | 13.56 | 30.38 | 0.44x |
+| MATH-500 | 2.0 | 0.5 | 32 | PASS | 8.84 | 590.52 | 14.97 | 28.98 | 0.39x |
+| GSM8K | 2.0 | 0.5 | 48 | PASS | 7.03 | 438.17 | 16.05 | 44.19 | 0.38x |
+| MATH-500 | 2.0 | 0.5 | 48 | PASS | 9.05 | 535.78 | 16.89 | 41.05 | 0.36x |
+
+Verdict:
+- No lean top2gap config matches or beats linear throughput while keeping accept above linear.
+- The closest paired config is `width=8`, `budget=16`, `beta=1.0`, `g0=1.0`; it exceeds linear accept on both datasets but remains `0.49x` and `0.45x` linear throughput.
+- The trend says lower budget improves speed down to the current `budget=16` floor; bigger budgets improve accept but lose throughput. Sharper `(beta=2.0,g0=0.5)` is not an overall win, with only a small MATH-500-only throughput bump at `budget=16`.
 
 ## Top2gap Construction Job 1 - Losslessness Gate
 
