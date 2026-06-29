@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-29 06:04 UTC
+Updated: 2026-06-29 17:10 UTC
 
 ## Done / Committed
 
@@ -28,6 +28,43 @@ Updated: 2026-06-29 06:04 UTC
 - Tree decode machinery pass 2026-06-29: landed a bounded Component B/C pass for metadata and accepted-path KV commit. B vectorizes batched retrieve-link construction and skips unused custom-mask/retrieve metadata on dense compact FA4 verify. C adds an ordered fused all-layer KV commit for accepted tree paths. Fresh flushed FA4 page16 oracle gate passed for top2gap w8/b16 beta=1.0 g0=1.0 on GSM8K and MATH-500 with zero mismatches. Compared with the prior lean b16 row, GSM8K improved `570.64 -> 775.72 tok/s` and `11.30 -> 8.31 ms/step`; MATH-500 improved `674.74 -> 908.35 tok/s` and `11.71 -> 8.70 ms/step`. Tree is still below same-run linear (`938.62/1206.93 tok/s`) and the prior linear bars (`1152.85/1505.24 tok/s`), so Component A paged-tree verify remains the main blocker.
 - Compact metadata follow-up 2026-06-29: landed a second Component B reduction in the compact FA4 path. Tree construction now bulk-copies draft top-k/tree rows instead of per-row `.item()`/`.tolist()` syncs, keeps compact sequence lengths on CPU without a device-to-host round trip, and fills one preallocated compact KV-index tensor instead of per-node tensor/cat materialization. Fresh flushed FA4 page16 oracle gate passed for top2gap w8/b16 beta=1.0 g0=1.0 on GSM8K and MATH-500 with zero mismatches. Compared with the B/C commit, GSM8K improved `775.72 -> 803.95 tok/s` and `8.31 -> 8.02 ms/step`; MATH-500 improved `908.35 -> 937.56 tok/s` and `8.70 -> 8.43 ms/step`. Tree is still below same-run linear (`936.66/1204.29 tok/s`) and prior linear bars (`1152.85/1505.24 tok/s`).
 - Accept-kernel follow-up 2026-06-29: compact FA4 tree acceptance now reuses SGLang's CUDA `verify_tree_greedy` kernel with later-first retrieve links to preserve JetSpec duplicate-sibling semantics, replacing the torch tensor-algebra accept walk on the dense compact path. Fresh flushed FA4 page16 oracle gate passed for top2gap w8/b16 beta=1.0 g0=1.0 on GSM8K and MATH-500 with zero mismatches. Compared with the compact metadata commit, GSM8K improved `803.95 -> 817.61 tok/s` and `8.02 -> 7.89 ms/step`; MATH-500 improved `937.56 -> 954.60 tok/s` and `8.43 -> 8.28 ms/step`. Tree remains below same-run linear (`937.49/1205.79 tok/s`) and prior linear bars (`1152.85/1505.24 tok/s`).
+- Final paged-verify serving confirmation 2026-06-29: ran the end-to-end paged FA4 tree verifier with `SGLANG_DFLASH_TREE_PAGED_FA4_VERIFY=1` on GPU 0, FA4 page16, normal decode CUDA graph, and fresh flushed oracle/bench flow. Same-run linear bars completed: GSM8K `1140.66 tok/s`, accept `5.849`, `5.13 ms/step`; MATH-500 `1483.76 tok/s`, accept `7.624`, `5.14 ms/step`. The paged tree failed the first serving losslessness gate on GSM8K: top2gap w8/b16 reported `token_exact=false` with `3/5` mismatches against the fresh linear oracle, so no valid full tree benchmark or MATH-500 tree gate was run. The captured invalid GSM8K tree gate was `835.50 tok/s`, accept `6.183`, `7.40 ms/step`, mean nodes `16.00`, but it is diagnostic only and cannot be compared to linear or the paged-off b16 bars. Verdict: tree-with-paged-kernel does not match or beat linear because the serving path is not lossless.
+
+## Final Paged FA4 Verify Serving Gate
+
+Date/time: 2026-06-29 17:03-17:08 UTC.
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=0`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Paged verifier env: `SGLANG_DFLASH_TREE_PAGED_FA4_VERIFY=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Backend for DFlash rows: `--attention-backend fa4 --page-size 16`
+- Decode graph flags: `--cuda-graph-max-bs-decode 1 --cuda-graph-backend-decode full`
+- Harness: `jetspec/run_dflash_gate_bench.sh all` with `RUN_STAMP=final_paged_fa4_20260629_1704`, fresh flushed oracle gates, and first-80 benchmark prompts for the linear bars.
+- Artifact dir: `jetspec/runs/final_paged_fa4_20260629_1704`
+
+Results:
+
+| dataset | config | exact | accept | tok/s | ms/step | mean nodes | vs linear | paged-off b16 delta | artifact |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| GSM8K | linear w1 FA4 page16 | PASS | 5.849 | 1140.66 | 5.13 | n/a | 1.00x | n/a | `jetspec/runs/final_paged_fa4_20260629_1704/bench_gsm8k_linear_w1_fa4p16.json` |
+| GSM8K | top2gap w8/b16 paged FA4 | FAIL 3/5 | 6.183 | 835.50 | 7.40 | 16.00 | invalid | invalid | `jetspec/runs/final_paged_fa4_20260629_1704/gate_gsm8k_top2gap_w8_b16_beta1p0_g01p0.json` |
+| MATH-500 | linear w1 FA4 page16 | PASS | 7.624 | 1483.76 | 5.14 | n/a | 1.00x | n/a | `jetspec/runs/final_paged_fa4_20260629_1704/bench_math500_linear_w1_fa4p16.json` |
+| MATH-500 | top2gap w8/b16 paged FA4 | not run | n/a | n/a | n/a | n/a | invalid | invalid | blocked by GSM8K serving mismatch |
+
+Mismatch details from the GSM8K gate:
+
+| sample | first diff | expected len | actual len |
+|---:|---:|---:|---:|
+| 0 | 8 | 326 | 275 |
+| 1 | 49 | 139 | 138 |
+| 4 | 22 | 328 | 327 |
+
+Status:
+- Losslessness gate: FAIL. The paged verifier is not token-exact in serving despite the isolated bit-exact kernel result.
+- Performance verdict: no valid tree throughput comparison is available. The only tree row is a failed first-5 GSM8K gate, so its `7.40 ms/step` cannot be used as the requested full-run delta versus the paged-off b16 rows (`7.89` GSM8K / `8.28` MATH-500).
+- Final answer to the benchmark question: NO. With the paged kernel enabled, dense top2gap w8/b16 does not match or beat linear DFlash end-to-end, because the serving losslessness gate fails before a valid benchmark can be accepted.
 
 ## Tree Decode Machinery Pass - Components B/C
 

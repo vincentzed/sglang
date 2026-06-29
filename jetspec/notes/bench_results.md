@@ -9,6 +9,44 @@ Hardware/env:
 - Decode settings: BF16/default dtype, greedy `temperature=0`, `--tp-size 1`, `max_new_tokens=96`
 - Harness: `jetspec/run_fixed_prompts.py`, 10 fixed prompts including GSM-style arithmetic, sequence, code, translation, and summary prompts.
 
+## Final paged FA4 tree verify serving confirmation
+
+Date/time: 2026-06-29 17:03-17:08 UTC.
+
+Question:
+- With `SGLANG_DFLASH_TREE_PAGED_FA4_VERIFY=1`, does dense top2gap tree w8/b16 on FA4 page16 and decode CUDA graph now match or beat linear DFlash on GSM8K and MATH-500?
+
+Mode:
+- Branch/head: `jetspec-tree-draft` at `00b126f162`.
+- Server env: `CUDA_VISIBLE_DEVICES=0`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`, `SGLANG_DFLASH_TREE_PAGED_FA4_VERIFY=1`, `PYTHONPATH=python`.
+- Servers used `--attention-backend fa4 --page-size 16`, `--max-running-requests 1`, `--cuda-graph-max-bs-decode 1`, and `--cuda-graph-backend-decode full`.
+- Target `Qwen/Qwen3-8B`, draft `JetSpec/jetspec-qwen3-8b`, greedy `temperature=0`, `top_p=1.0`, `max_new_tokens=2048`.
+- Harness: `jetspec/run_dflash_gate_bench.sh all` with `RUN_STAMP=final_paged_fa4_20260629_1704`.
+- Flow completed the fresh flushed linear oracle gates and full linear GSM8K/MATH-500 benches, then launched the paged tree server and ran the GSM8K gate. The harness stopped after the required GSM8K losslessness gate failed, so no invalid full tree bench was run.
+- The tree server log confirms the paged path and graph buffers: `DFLASH paged FA4 target verify CUDA graph buffers: max_req_bs=1, tree_budget=16`.
+
+Fresh same-run results:
+
+| Dataset | Config | Accept len | Tok/s | ms/step | Mean nodes | Exact | vs linear | Paged-off b16 delta | Artifact |
+|---|---|---:|---:|---:|---:|---|---:|---:|---|
+| GSM8K | linear w1 FA4 page16 | 5.849 | 1140.66 | 5.13 | n/a | PASS | 1.00x | n/a | `jetspec/runs/final_paged_fa4_20260629_1704/bench_gsm8k_linear_w1_fa4p16.json` |
+| GSM8K | top2gap w8/b16 paged FA4 | 6.183 | 835.50 | 7.40 | 16.00 | FAIL 3/5 | invalid | invalid | `jetspec/runs/final_paged_fa4_20260629_1704/gate_gsm8k_top2gap_w8_b16_beta1p0_g01p0.json` |
+| MATH-500 | linear w1 FA4 page16 | 7.624 | 1483.76 | 5.14 | n/a | PASS | 1.00x | n/a | `jetspec/runs/final_paged_fa4_20260629_1704/bench_math500_linear_w1_fa4p16.json` |
+| MATH-500 | top2gap w8/b16 paged FA4 | n/a | n/a | n/a | n/a | not run | invalid | invalid | blocked by GSM8K serving mismatch |
+
+GSM8K losslessness failure:
+
+| Sample index | First diff | Expected len | Actual len | Expected window | Actual window |
+|---:|---:|---:|---:|---|---|
+| 0 | 8 | 326 | 275 | `[419, 1495, 3019, 553, 3019, 311, 1477, 700, 1246, 1753]` | `[419, 1495, 3019, 553, 3019, 1447, 44364, 14374, 3070, 8304]` |
+| 1 | 49 | 139 | 138 | `[279, 3311, 315, 4158, 23788, 4362, 374, 1447, 14085, 198]` | `[279, 3311, 315, 4158, 23788, 374, 1447, 14085, 198, 59]` |
+| 4 | 22 | 328 | 327 | `[25374, 315, 5395, 817, 1899, 97219, 304, 3070, 27856, 8651]` | `[25374, 315, 5395, 817, 1899, 334, 624, 12, 2932, 6696]` |
+
+Verdict:
+- FAIL for final goal. The paged FA4 tree verifier does not currently produce a valid end-to-end tree benchmark because the serving gate is not token-exact against the fresh flushed width=1 oracle.
+- The captured tree gate is diagnostic only. Its `7.40 ms/step` is a failed first-5 GSM8K gate, not the requested first-80 full benchmark, so it is not a valid delta versus the paged-off b16 full rows (`7.89 ms/step` GSM8K, `8.28 ms/step` MATH-500).
+- Linear bars for this same run were strong (`1140.66` GSM8K and `1483.76` MATH-500 tok/s), but tree-with-paged-kernel cannot be counted as match/beat until serving losslessness is restored.
+
 ## Tree decode machinery pass - Components B/C
 
 Date/time: 2026-06-29 05:10-05:16 UTC.
