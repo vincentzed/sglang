@@ -9,6 +9,51 @@ Hardware/env:
 - Decode settings: BF16/default dtype, greedy `temperature=0`, `--tp-size 1`, `max_new_tokens=96`
 - Harness: `jetspec/run_fixed_prompts.py`, 10 fixed prompts including GSM-style arithmetic, sequence, code, translation, and summary prompts.
 
+## Profile-guided Job 1 - decode baseline hotspots
+
+Date/time: 2026-06-29 01:39-02:20 UTC.
+
+Purpose:
+- Establish a profiler-grounded baseline before touching the tree decode path.
+- Compare linear DFlash width=1 against tree DFlash w7/b64 under the same FA4 page16 decode setup.
+
+Mode:
+- Profiler: `/root/.claude/skills/llm-torch-profiler-analysis/scripts/analyze_llm_torch_profile.py`.
+- Workload: live SGLang decode capture, `--profile-workload decode --warmup-steps 10 --num-steps 5`.
+- Linear mapping server: width=1 DFlash on port 31910.
+- Tree formal server: width=7, budget=64 DFlash on port 31911.
+- Both profile servers used `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`, `PYTHONPATH=python`, `--attention-backend fa4 --page-size 16`, `--max-running-requests 1`, `--cuda-graph-max-bs-decode 1`, and `--cuda-graph-backend-decode full`.
+- `--mem-fraction-static 0.35` was used only to co-resident profile both servers on the same B300; paper benchmark rows below used the normal single-server launch.
+
+Artifacts:
+- Hotspot note: `jetspec/profiles/job1_profile_guided_20260629_0139/hotspot_breakdown.md`
+- Two-trace tables: `jetspec/profiles/job1_profile_guided_20260629_0139/two_trace_decode_analysis.txt`
+- Linear single-trace tables: `jetspec/profiles/job1_profile_guided_20260629_0139/linear_w1_single_trace_analysis.txt`
+- Tree single-trace tables: `jetspec/profiles/job1_profile_guided_20260629_0139/tree_w7_b64_single_trace_analysis.txt`
+- Linear trace: `jetspec/profiles/job1_profile_guided_20260629_0139/linear_w1_decode/decode/1782697483.114899/linear_w1_decode-decode-1782697483.1781414-TP-0.trace.json.gz`
+- Tree trace: `jetspec/profiles/job1_profile_guided_20260629_0139/tree_w7_b64_decode/decode/1782697503.2490833/tree_w7_b64_decode-decode-1782697503.3644614-TP-0.trace.json.gz`
+
+Baseline profile breakdown:
+
+| Area | Linear width=1 | Tree w7/b64 | Delta / finding |
+|---|---:|---:|---|
+| GPU-visible decode-window total from kernel shares | about `31.6 ms` | about `48.6 ms` | Tree adds about `17.0 ms` over the profiler window, roughly `3.4 ms` per active profiled step. |
+| DFlash `forward_batch_generation` CPU/Python span | `28.309 ms / 5` (`5.66 ms/call`) | `109.933 ms / 5` | Tree has a much larger host-side critical path. |
+| Tree `_forward_batch_generation_tree` CPU/Python span | n/a | `92.063 ms / 4` (`23.02 ms/tree call`) | This is the primary profiling target. |
+| FA4 attention kernels | `2.59 ms` main attention | `5.38 ms` compact tree attention | Tree attention is heavier, but it is not the whole gap. |
+| Compact gather/index kernels | small in linear trace | `vectorized_gather_kernel 1.85 ms`, `index_copy_ 1.17 ms`, `index_select 1.14 ms`, D2D memcpy `1.07 ms` | Compact K/V gather and commit are visible serialized costs. |
+
+Top tree-only sinks:
+- Host-to-GPU tensor construction and pageable copies in `_forward_batch_generation_tree`: `aten::copy_ 42.843 ms`, `aten::to 34.835 ms`, `aten::_to_copy 34.276 ms`, with `cudaStreamSynchronize 36.524 ms / 972 calls`. The top four syncs account for about `26.6 ms` in the captured trace window.
+- Tree metadata builders: `build_tree_custom_mask 7.452 ms / 4`, `build_ancestor_matrix_from_parents 7.008 ms / 4`, and `build_retrieve_links_from_parents 4.348 ms / 4`. These are hot because they mix `.tolist()`/CPU loops with tiny CUDA tensor construction.
+- Compact K/V movement and gather/index setup: `move_kv_cache_overlap_safe 7.025 ms / 4`, plus the gather/index kernels listed above.
+- Scalar syncs are smaller but still measurable: `aten::item 2.142 ms`, `_local_scalar_dense 2.100 ms`, and `.item()` Python sites `2.178 ms / 46 calls`.
+- Draft top-k/tree build is present but lower priority: `_topk_from_vocab_parallel_head 1.705 ms / 4`, `build_tree_from_topk_cpu 1.025 ms / 4`, and `topk 0.379 ms / 4`.
+
+Verdict:
+- The profile confirms the prior diagnosis: the tree path is dominated by host-side tree metadata/index construction, GPU tensor construction from Python lists, compact K/V gather/index setup, and synchronization. The ragged compact FA4 verifier contributes real cost, but FA4 math alone is not the first hotspot.
+- First optimization target: remove per-step list-to-CUDA tensor construction and avoid building any dense tree mask metadata not consumed by the compact FA4 verifier. Every landed change must re-pass a fresh flushed FA4 page16 width=1 oracle.
+
 ## Final DFlash tree verify optimization rebench
 
 Date/time: 2026-06-28 20:25-20:58 UTC.
