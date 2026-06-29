@@ -580,6 +580,7 @@ def build_batched_retrieve_links_from_parents(
     *,
     num_verify_tokens: Optional[int] = None,
     num_real_nodes: Optional[torch.Tensor | Iterable[int]] = None,
+    prefer_later_sibling: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if parent_indices.dim() != 2:
         raise ValueError(
@@ -621,29 +622,54 @@ def build_batched_retrieve_links_from_parents(
     )
 
     child_of_parent = (parents[:, None, :] == parent_ids) & valid_child[:, None, :]
-    first_child = torch.where(
-        child_of_parent,
-        candidate_ids,
-        torch.full_like(candidate_ids, width),
-    ).min(dim=2).values
-    retrieve_next_token = torch.where(
-        first_child < width,
-        first_child,
-        torch.full_like(first_child, -1),
-    )
+    if prefer_later_sibling:
+        child = torch.where(
+            child_of_parent,
+            candidate_ids,
+            torch.full_like(candidate_ids, -1),
+        ).max(dim=2).values
+        retrieve_next_token = torch.where(
+            child >= 0,
+            child,
+            torch.full_like(child, -1),
+        )
 
-    later = nodes.view(1, 1, width) > nodes.view(1, width, 1)
-    valid_pair = valid_child[:, :, None] & valid_child[:, None, :]
-    next_sibling = torch.where(
-        (parents[:, :, None] == parents[:, None, :]) & later & valid_pair,
-        candidate_ids,
-        torch.full_like(candidate_ids, width),
-    ).min(dim=2).values
-    retrieve_next_sibling = torch.where(
-        next_sibling < width,
-        next_sibling,
-        torch.full_like(next_sibling, -1),
-    )
+        earlier = nodes.view(1, 1, width) < nodes.view(1, width, 1)
+        valid_pair = valid_child[:, :, None] & valid_child[:, None, :]
+        next_sibling = torch.where(
+            (parents[:, :, None] == parents[:, None, :]) & earlier & valid_pair,
+            candidate_ids,
+            torch.full_like(candidate_ids, -1),
+        ).max(dim=2).values
+        retrieve_next_sibling = torch.where(
+            next_sibling >= 0,
+            next_sibling,
+            torch.full_like(next_sibling, -1),
+        )
+    else:
+        first_child = torch.where(
+            child_of_parent,
+            candidate_ids,
+            torch.full_like(candidate_ids, width),
+        ).min(dim=2).values
+        retrieve_next_token = torch.where(
+            first_child < width,
+            first_child,
+            torch.full_like(first_child, -1),
+        )
+
+        later = nodes.view(1, 1, width) > nodes.view(1, width, 1)
+        valid_pair = valid_child[:, :, None] & valid_child[:, None, :]
+        next_sibling = torch.where(
+            (parents[:, :, None] == parents[:, None, :]) & later & valid_pair,
+            candidate_ids,
+            torch.full_like(candidate_ids, width),
+        ).min(dim=2).values
+        retrieve_next_sibling = torch.where(
+            next_sibling < width,
+            next_sibling,
+            torch.full_like(next_sibling, -1),
+        )
 
     retrieve_index = torch.arange(bs * width, dtype=torch.long, device=device).view(
         bs, width

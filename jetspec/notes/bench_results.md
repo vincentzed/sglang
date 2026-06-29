@@ -93,6 +93,47 @@ Verdict:
 - FAIL for final goal: tree is still below linear. Same-run ratios are `0.86x` GSM8K and `0.78x` MATH-500; against the prior faster linear bars, tree is `0.70x` and `0.62x`.
 - The remaining gap needs the Component A paged-tree verifier or an equivalent way to stop repeated compact-prefix K/V gathers without changing FA4 softcap/probability math.
 
+## Accept-kernel follow-up
+
+Date/time: 2026-06-29 05:56-06:02 UTC.
+
+Question:
+- Can the residual torch tensor-algebra tree accept walk be replaced by existing SGLang CUDA machinery without changing JetSpec acceptance semantics?
+
+Mode:
+- Component B follow-up only; no attention-kernel, KV-commit, or draft-construction change.
+- Added a later-first retrieve-link mode so the SGLang `verify_tree_greedy` kernel preserves JetSpec's duplicate-child rule: among same-parent siblings with the same draft token, the later node wins.
+- Dense compact FA4 tree acceptance uses the CUDA kernel path; non-compact/non-CUDA paths keep the tensor implementation.
+- Servers used `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`, `PYTHONPATH=python`, `--attention-backend fa4 --page-size 16`, `--max-running-requests 1`, `--cuda-graph-max-bs-decode 1`, and `--cuda-graph-backend-decode full`.
+- Target `Qwen/Qwen3-8B`, draft `JetSpec/jetspec-qwen3-8b`, greedy `temperature=0`, `top_p=1.0`, `max_new_tokens=2048`.
+- Harness: `jetspec/run_dflash_gate_bench.sh all`.
+- Summary artifact: `jetspec/runs/dflash_gate_bench_component_accept_kernel2_20260629_055615/summary.ndjson`.
+
+Fresh same-run results:
+
+| Dataset | Config | Accept len | Tok/s | ms/step | Mean nodes | Exact | vs same-run linear | vs prior linear bar | Artifact |
+|---|---|---:|---:|---:|---:|---|---:|---:|---|
+| GSM8K | linear w1 FA4 page16 | 5.85 | 937.49 | 6.24 | n/a | PASS | 1.00x | 0.81x | `jetspec/runs/dflash_gate_bench_component_accept_kernel2_20260629_055615/bench_gsm8k_linear_w1_fa4p16.json` |
+| GSM8K | top2gap w8/b16 beta=1.0 g0=1.0 | 6.45 | 817.61 | 7.89 | 16.00 | PASS | 0.87x | 0.71x | `jetspec/runs/dflash_gate_bench_component_accept_kernel2_20260629_055615/bench_gsm8k_top2gap_w8_b16_beta1p0_g01p0.json` |
+| MATH-500 | linear w1 FA4 page16 | 7.62 | 1205.79 | 6.32 | n/a | PASS | 1.00x | 0.80x | `jetspec/runs/dflash_gate_bench_component_accept_kernel2_20260629_055615/bench_math500_linear_w1_fa4p16.json` |
+| MATH-500 | top2gap w8/b16 beta=1.0 g0=1.0 | 7.90 | 954.60 | 8.28 | 16.00 | PASS | 0.79x | 0.63x | `jetspec/runs/dflash_gate_bench_component_accept_kernel2_20260629_055615/bench_math500_top2gap_w8_b16_beta1p0_g01p0.json` |
+
+Before/after against the compact metadata commit:
+
+| Dataset | Metadata tok/s | New tok/s | Metadata ms/step | New ms/step | Step-time delta | Prior artifact |
+|---|---:|---:|---:|---:|---:|---|
+| GSM8K | 803.95 | 817.61 | 8.02 | 7.89 | -1.7% | `jetspec/runs/dflash_gate_bench_component_meta2_20260629_053534/bench_gsm8k_top2gap_w8_b16_beta1p0_g01p0.json` |
+| MATH-500 | 937.56 | 954.60 | 8.43 | 8.28 | -1.8% | `jetspec/runs/dflash_gate_bench_component_meta2_20260629_053534/bench_math500_top2gap_w8_b16_beta1p0_g01p0.json` |
+
+Losslessness:
+- Fresh flushed gate rows and full benchmark rows report `losslessness.token_exact=true` with zero mismatches for both datasets.
+- The tree node count remains exactly `16.00`, and accept lengths are unchanged from the prior b16 rows.
+
+Verdict:
+- LAND for the accept-kernel follow-up: the existing CUDA tree-greedy kernel removes a small but measurable post-verify overhead while preserving duplicate-sibling semantics.
+- FAIL for final goal: tree is still below linear. Same-run ratios are `0.87x` GSM8K and `0.79x` MATH-500; against the prior faster linear bars, tree is `0.71x` and `0.63x`.
+- Remaining gap is too large for accept/commit cleanup alone; the compact FA4 verifier still repeats prefix K/V materialization per node.
+
 ## Lean top2gap sweep - paper datasets
 
 Date/time: 2026-06-29 04:09-04:43 UTC.

@@ -320,6 +320,21 @@ class TestDFlashTreeConstruction(CustomTestCase):
                 retrieve_next_sibling[row].tolist(), expected_next_sibling.tolist()
             )
 
+    def test_batched_retrieve_links_can_prefer_later_siblings(self):
+        parent_rows = torch.tensor([[-1, 0, 0, 0, 1, 2]], dtype=torch.long)
+
+        _, retrieve_next_token, retrieve_next_sibling = (
+            build_batched_retrieve_links_from_parents(
+                parent_rows,
+                num_verify_tokens=6,
+                num_real_nodes=torch.tensor([6], dtype=torch.long),
+                prefer_later_sibling=True,
+            )
+        )
+
+        self.assertEqual(retrieve_next_token.tolist(), [[3, 4, 5, -1, -1, -1]])
+        self.assertEqual(retrieve_next_sibling.tolist(), [[-1, -1, 1, 2, -1, -1]])
+
     def test_tree_custom_mask_prepends_prefix(self):
         parents = torch.tensor([-1, 0, 0, 1], dtype=torch.long)
         mask = build_tree_custom_mask(

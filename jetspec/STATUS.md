@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-29 05:42 UTC
+Updated: 2026-06-29 06:04 UTC
 
 ## Done / Committed
 
@@ -27,6 +27,7 @@ Updated: 2026-06-29 05:42 UTC
 - Lean top2gap sweep 2026-06-29: swept top2gap-only `width=8`, budgets `16/24/32/48`, `(beta,g0)=(1.0,1.0)` and `(2.0,0.5)` on first-80 GSM8K/MATH-500 with FA4 page16 and normal decode graphs. All 16 dataset rows were token-exact, but none matched linear throughput. Best paired config is `budget=16`, `beta=1.0`, `g0=1.0`: GSM8K `570.64 tok/s`, accept `6.45`, nodes `16.00` (`0.49x` linear); MATH-500 `674.74 tok/s`, accept `7.90`, nodes `16.00` (`0.45x` linear). Best single MATH row is `budget=16`, `beta=2.0`, `g0=0.5` at `679.60 tok/s`, but still only `0.45x` linear. Verdict: lean top2gap raises accept over linear at the node floor but remains verify/host-overhead limited.
 - Tree decode machinery pass 2026-06-29: landed a bounded Component B/C pass for metadata and accepted-path KV commit. B vectorizes batched retrieve-link construction and skips unused custom-mask/retrieve metadata on dense compact FA4 verify. C adds an ordered fused all-layer KV commit for accepted tree paths. Fresh flushed FA4 page16 oracle gate passed for top2gap w8/b16 beta=1.0 g0=1.0 on GSM8K and MATH-500 with zero mismatches. Compared with the prior lean b16 row, GSM8K improved `570.64 -> 775.72 tok/s` and `11.30 -> 8.31 ms/step`; MATH-500 improved `674.74 -> 908.35 tok/s` and `11.71 -> 8.70 ms/step`. Tree is still below same-run linear (`938.62/1206.93 tok/s`) and the prior linear bars (`1152.85/1505.24 tok/s`), so Component A paged-tree verify remains the main blocker.
 - Compact metadata follow-up 2026-06-29: landed a second Component B reduction in the compact FA4 path. Tree construction now bulk-copies draft top-k/tree rows instead of per-row `.item()`/`.tolist()` syncs, keeps compact sequence lengths on CPU without a device-to-host round trip, and fills one preallocated compact KV-index tensor instead of per-node tensor/cat materialization. Fresh flushed FA4 page16 oracle gate passed for top2gap w8/b16 beta=1.0 g0=1.0 on GSM8K and MATH-500 with zero mismatches. Compared with the B/C commit, GSM8K improved `775.72 -> 803.95 tok/s` and `8.31 -> 8.02 ms/step`; MATH-500 improved `908.35 -> 937.56 tok/s` and `8.70 -> 8.43 ms/step`. Tree is still below same-run linear (`936.66/1204.29 tok/s`) and prior linear bars (`1152.85/1505.24 tok/s`).
+- Accept-kernel follow-up 2026-06-29: compact FA4 tree acceptance now reuses SGLang's CUDA `verify_tree_greedy` kernel with later-first retrieve links to preserve JetSpec duplicate-sibling semantics, replacing the torch tensor-algebra accept walk on the dense compact path. Fresh flushed FA4 page16 oracle gate passed for top2gap w8/b16 beta=1.0 g0=1.0 on GSM8K and MATH-500 with zero mismatches. Compared with the compact metadata commit, GSM8K improved `803.95 -> 817.61 tok/s` and `8.02 -> 7.89 ms/step`; MATH-500 improved `937.56 -> 954.60 tok/s` and `8.43 -> 8.28 ms/step`. Tree remains below same-run linear (`937.49/1205.79 tok/s`) and prior linear bars (`1152.85/1505.24 tok/s`).
 
 ## Tree Decode Machinery Pass - Components B/C
 
@@ -105,6 +106,44 @@ Status:
 - Losslessness gate: PASS. Fresh flushed oracle comparison reported `exact=true`, zero mismatches for GSM8K and MATH-500 gate and benchmark rows.
 - Performance: landed as a bounded Component B follow-up; same-node b16 tree step time improved again without changing acceptance or verifier numerics.
 - Verdict: still not linear. The remaining same-run per-step gap is `8.02 vs 6.24 ms` on GSM8K and `8.43 vs 6.33 ms` on MATH-500. The remaining overhead is now dominated by the compact FA4 verifier's repeated prefix/KV gather shape and target model replay rather than accepted-path KV commit.
+
+## Accept-Kernel Follow-Up
+
+Date/time: 2026-06-29 05:56-06:02 UTC.
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Backend for DFlash rows: `--attention-backend fa4 --page-size 16`
+- Decode graph flags: `--cuda-graph-max-bs-decode 1 --cuda-graph-backend-decode full`
+- Harness: `jetspec/run_dflash_gate_bench.sh all`, first 5 flushed gate prompts plus first 80 benchmark prompts per dataset.
+- Summary artifact: `jetspec/runs/dflash_gate_bench_component_accept_kernel2_20260629_055615/summary.ndjson`
+
+Landed:
+- `build_batched_retrieve_links_from_parents(..., prefer_later_sibling=True)` can produce later-first sibling links for the accept walk. This preserves JetSpec's duplicate-child rule where a later sibling with the same draft token overwrites an earlier one.
+- Dense compact FA4 tree acceptance uses SGLang's CUDA `verify_tree_greedy` kernel when available, with the tensor implementation retained as the fallback for other paths/devices.
+
+Results:
+
+| dataset | config | exact | accept | tok/s | ms/step | mean nodes | vs same-run linear | vs prior linear bar | artifact |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| GSM8K | linear w1 FA4 page16 | PASS | 5.85 | 937.49 | 6.24 | n/a | 1.00x | 0.81x | `jetspec/runs/dflash_gate_bench_component_accept_kernel2_20260629_055615/bench_gsm8k_linear_w1_fa4p16.json` |
+| GSM8K | top2gap w8/b16 beta=1.0 g0=1.0 | PASS | 6.45 | 817.61 | 7.89 | 16.00 | 0.87x | 0.71x | `jetspec/runs/dflash_gate_bench_component_accept_kernel2_20260629_055615/bench_gsm8k_top2gap_w8_b16_beta1p0_g01p0.json` |
+| MATH-500 | linear w1 FA4 page16 | PASS | 7.62 | 1205.79 | 6.32 | n/a | 1.00x | 0.80x | `jetspec/runs/dflash_gate_bench_component_accept_kernel2_20260629_055615/bench_math500_linear_w1_fa4p16.json` |
+| MATH-500 | top2gap w8/b16 beta=1.0 g0=1.0 | PASS | 7.90 | 954.60 | 8.28 | 16.00 | 0.79x | 0.63x | `jetspec/runs/dflash_gate_bench_component_accept_kernel2_20260629_055615/bench_math500_top2gap_w8_b16_beta1p0_g01p0.json` |
+
+Before/after versus the compact metadata commit:
+
+| dataset | metadata tok/s | new tok/s | metadata ms/step | new ms/step | step-time delta |
+|---|---:|---:|---:|---:|---:|
+| GSM8K | 803.95 | 817.61 | 8.02 | 7.89 | -1.7% |
+| MATH-500 | 937.56 | 954.60 | 8.43 | 8.28 | -1.8% |
+
+Status:
+- Losslessness gate: PASS. Fresh flushed oracle comparison reported `exact=true`, zero mismatches for GSM8K and MATH-500 gate and benchmark rows.
+- Performance: landed because it removes part of the post-verify torch accept walk without changing verifier math, accepted path semantics, or node count.
+- Verdict: still not linear. The remaining same-run per-step gap is `7.89 vs 6.24 ms` on GSM8K and `8.28 vs 6.32 ms` on MATH-500.
 
 ## Lean Top2gap Sweep - Paper Datasets
 

@@ -2914,14 +2914,43 @@ class DFlashWorkerV2(BaseSpecWorker):
         tree_target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
             bs, tree_budget
         )
-        predict, accept_index, num_correct_drafts = tree_accept_greedy_batched(
-            tree_tokens=tree_tokens,
-            parent_indices=tree_parents,
-            depths=tree_depths,
-            target_tokens=tree_target_predict,
-            num_real_nodes=num_real_nodes_tensor,
-            max_tree_depth=block_size - 1,
-        )
+        use_tree_accept_kernel = str(device).startswith("cuda") and use_compact_tree_verify
+        if use_tree_accept_kernel:
+            (
+                accept_retrieve_index,
+                accept_retrieve_next_token,
+                accept_retrieve_next_sibling,
+            ) = build_batched_retrieve_links_from_parents(
+                tree_parents,
+                num_verify_tokens=tree_budget,
+                num_real_nodes=num_real_nodes_tensor,
+                prefer_later_sibling=True,
+            )
+            predict = tree_target_predict.reshape(-1).to(torch.int32)
+            accept_index = torch.full(
+                (bs, block_size), -1, dtype=torch.int32, device=device
+            )
+            num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+            verify_tree_greedy_func(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=num_correct_drafts,
+                candidates=tree_tokens,
+                retrieve_index=accept_retrieve_index,
+                retrieve_next_token=accept_retrieve_next_token,
+                retrieve_next_sibling=accept_retrieve_next_sibling,
+                target_predict=tree_target_predict,
+                topk=tree_width,
+            )
+        else:
+            predict, accept_index, num_correct_drafts = tree_accept_greedy_batched(
+                tree_tokens=tree_tokens,
+                parent_indices=tree_parents,
+                depths=tree_depths,
+                target_tokens=tree_target_predict,
+                num_real_nodes=num_real_nodes_tensor,
+                max_tree_depth=block_size - 1,
+            )
 
         accept_cap = os.environ.get("SGLANG_DFLASH_TREE_ACCEPT_CAP")
         if accept_cap is not None:
