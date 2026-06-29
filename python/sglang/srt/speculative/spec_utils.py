@@ -609,6 +609,81 @@ def move_kv_cache_overlap_safe(kvcache, tgt_loc: torch.Tensor, src_loc: torch.Te
     kvcache.move_kv_cache(tgt_loc, src_loc)
 
 
+def move_kv_cache_accept_path_ordered(
+    kvcache,
+    tgt_loc_2d: torch.Tensor,
+    src_loc_2d: torch.Tensor,
+    commit_lens: torch.Tensor,
+):
+    """Move root-to-leaf accepted-path KV rows without per-layer snapshots.
+
+    DFlash tree nodes are numbered topologically: every parent has a lower local
+    node id than its children.  The accepted path is root-inclusive, so copying
+    path offsets from left to right cannot clobber a source row that has not
+    already been read.  Each per-offset copy can therefore use the normal
+    all-layer KV copy path instead of cloning source rows for every layer.
+    """
+
+    if tgt_loc_2d.numel() == 0:
+        return
+    if tgt_loc_2d.ndim != 2 or src_loc_2d.ndim != 2:
+        raise ValueError(
+            "accept-path KV move expects rank-2 locations, "
+            f"got tgt={tuple(tgt_loc_2d.shape)} src={tuple(src_loc_2d.shape)}."
+        )
+    if tgt_loc_2d.shape != src_loc_2d.shape:
+        raise ValueError(
+            "accept-path KV move source/target shape mismatch: "
+            f"tgt={tuple(tgt_loc_2d.shape)} src={tuple(src_loc_2d.shape)}."
+        )
+    if commit_lens.ndim != 1 or commit_lens.shape[0] != tgt_loc_2d.shape[0]:
+        raise ValueError(
+            "accept-path KV move commit_lens must be rank-1 with one value per row: "
+            f"commit_lens={tuple(commit_lens.shape)} locs={tuple(tgt_loc_2d.shape)}."
+        )
+
+    full_kv_pool = getattr(kvcache, "full_kv_pool", None)
+    if full_kv_pool is not None:
+        move_kv_cache_accept_path_ordered(
+            full_kv_pool,
+            tgt_loc_2d,
+            src_loc_2d,
+            commit_lens,
+        )
+        swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
+        if swa_kv_pool is not None:
+            move_kv_cache_accept_path_ordered(
+                swa_kv_pool,
+                swa_kv_pool.translate_loc_from_full_to_swa(tgt_loc_2d),
+                swa_kv_pool.translate_loc_from_full_to_swa(src_loc_2d),
+                commit_lens,
+            )
+        return
+
+    move_ordered = getattr(kvcache, "move_kv_cache_accept_path_ordered", None)
+    if move_ordered is not None:
+        move_ordered(tgt_loc_2d, src_loc_2d, commit_lens)
+        return
+
+    if tgt_loc_2d.dtype != torch.int64:
+        tgt_loc_2d = tgt_loc_2d.to(torch.int64)
+    if src_loc_2d.dtype != torch.int64:
+        src_loc_2d = src_loc_2d.to(torch.int64)
+    if commit_lens.device != tgt_loc_2d.device:
+        commit_lens = commit_lens.to(device=tgt_loc_2d.device, non_blocking=True)
+    if commit_lens.dtype != torch.int64:
+        commit_lens = commit_lens.to(torch.int64)
+
+    width = int(tgt_loc_2d.shape[1])
+    for path_offset in range(width):
+        valid_rows = commit_lens > path_offset
+        tgt_loc = tgt_loc_2d[:, path_offset][valid_rows]
+        if tgt_loc.numel() == 0:
+            continue
+        src_loc = src_loc_2d[:, path_offset][valid_rows]
+        kvcache.move_kv_cache(tgt_loc, src_loc)
+
+
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """Rebuild mamba track indices from reqs before a TARGET_VERIFY forward.
 

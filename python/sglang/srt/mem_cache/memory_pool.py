@@ -53,6 +53,7 @@ from sglang.srt.layers.utils.dcp_utils import (
 )
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.triton_ops.cache_move import (
+    copy_all_layer_kv_cache_accept_path_ordered_tiled,
     copy_all_layer_kv_cache_tiled,
     set_kv_buffer_prefix_valid_tiled,
 )
@@ -1786,6 +1787,78 @@ class MHATokenToKVPool(KVCache):
                 num_warps=cfg["num_warps"],
                 num_stages=2,
             )
+
+    def move_kv_cache_accept_path_ordered(
+        self,
+        tgt_loc_2d: torch.Tensor,
+        src_loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ):
+        # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
+        if self.layer_num == 0 or tgt_loc_2d.numel() == 0:
+            return
+
+        if tgt_loc_2d.ndim != 2 or src_loc_2d.ndim != 2:
+            raise ValueError(
+                "accept-path KV move expects rank-2 locations, "
+                f"got tgt={tuple(tgt_loc_2d.shape)} src={tuple(src_loc_2d.shape)}."
+            )
+        if tgt_loc_2d.shape != src_loc_2d.shape:
+            raise ValueError(
+                "accept-path KV move source/target shape mismatch: "
+                f"tgt={tuple(tgt_loc_2d.shape)} src={tuple(src_loc_2d.shape)}."
+            )
+        if commit_lens.ndim != 1 or commit_lens.shape[0] != tgt_loc_2d.shape[0]:
+            raise ValueError(
+                "accept-path KV move commit_lens must be rank-1 with one value per row: "
+                f"commit_lens={tuple(commit_lens.shape)} locs={tuple(tgt_loc_2d.shape)}."
+            )
+
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc_2d, 0, size_limit, "accept_path_kv tgt_loc_2d")
+        maybe_detect_oob(src_loc_2d, 0, size_limit, "accept_path_kv src_loc_2d")
+
+        assert (
+            self._kv_copy_config is not None
+        ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+
+        device = self.k_buffer[0].device
+        if tgt_loc_2d.device != device:
+            tgt_loc_2d = tgt_loc_2d.to(device=device, non_blocking=True)
+        if src_loc_2d.device != device:
+            src_loc_2d = src_loc_2d.to(device=device, non_blocking=True)
+        if commit_lens.device != device:
+            commit_lens = commit_lens.to(device=device, non_blocking=True)
+        if tgt_loc_2d.dtype != torch.int64:
+            tgt_loc_2d = tgt_loc_2d.to(torch.int64)
+        if src_loc_2d.dtype != torch.int64:
+            src_loc_2d = src_loc_2d.to(torch.int64)
+        if commit_lens.dtype != torch.int32:
+            commit_lens = commit_lens.to(torch.int32)
+        if not tgt_loc_2d.is_contiguous():
+            tgt_loc_2d = tgt_loc_2d.contiguous()
+        if not src_loc_2d.is_contiguous():
+            src_loc_2d = src_loc_2d.contiguous()
+        if not commit_lens.is_contiguous():
+            commit_lens = commit_lens.contiguous()
+
+        cfg = self._kv_copy_config
+        grid = (
+            self.data_ptrs.numel(),
+            cfg["byte_tiles"],
+            int(tgt_loc_2d.shape[0]),
+        )
+        copy_all_layer_kv_cache_accept_path_ordered_tiled[grid](
+            self.data_ptrs,
+            self.data_strides,
+            tgt_loc_2d,
+            src_loc_2d,
+            commit_lens,
+            int(tgt_loc_2d.shape[1]),
+            BYTES_PER_TILE=cfg["bytes_per_tile"],
+            num_warps=cfg["num_warps"],
+            num_stages=2,
+        )
 
 
 class NoOpMHATokenToKVPool(MHATokenToKVPool):

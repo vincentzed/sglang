@@ -9,6 +9,48 @@ Hardware/env:
 - Decode settings: BF16/default dtype, greedy `temperature=0`, `--tp-size 1`, `max_new_tokens=96`
 - Harness: `jetspec/run_fixed_prompts.py`, 10 fixed prompts including GSM-style arithmetic, sequence, code, translation, and summary prompts.
 
+## Tree decode machinery pass - Components B/C
+
+Date/time: 2026-06-29 05:10-05:16 UTC.
+
+Question:
+- How much of the equal-node-count b16 tree overhead can be removed without touching the FA4 compact verifier itself?
+
+Mode:
+- Combined bounded Component B/C patch.
+- Component B: batched tensor retrieve-link construction, plus skipping unused `custom_mask` and retrieve-link metadata for dense compact FA4 verify.
+- Component C: fused ordered all-layer accepted-path KV commit for MHA KV pools, replacing the old overlap-safe per-layer snapshot copy path in dense compact and expanded-causal tree commits.
+- No Component A paged-tree attention kernel change in this run; target verify still uses the compact FA4 path.
+- Servers used `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`, `PYTHONPATH=python`, `--attention-backend fa4 --page-size 16`, `--max-running-requests 1`, `--cuda-graph-max-bs-decode 1`, and `--cuda-graph-backend-decode full`.
+- Target `Qwen/Qwen3-8B`, draft `JetSpec/jetspec-qwen3-8b`, greedy `temperature=0`, `top_p=1.0`, `max_new_tokens=2048`.
+- Harness: `jetspec/run_dflash_gate_bench.sh all`; it launches a fresh flushed width=1 oracle, runs full linear baselines, launches the tree server, gates tree rows against the fresh oracle, and writes `summary.ndjson`.
+- Summary artifact: `jetspec/runs/dflash_gate_bench_component_bc_20260629_051037/summary.ndjson`.
+
+Fresh same-run results:
+
+| Dataset | Config | Accept len | Tok/s | ms/step | Mean nodes | Exact | vs same-run linear | vs prior linear bar | Artifact |
+|---|---|---:|---:|---:|---:|---|---:|---:|---|
+| GSM8K | linear w1 FA4 page16 | 5.85 | 938.62 | 6.23 | n/a | PASS | 1.00x | 0.81x | `jetspec/runs/dflash_gate_bench_component_bc_20260629_051037/bench_gsm8k_linear_w1_fa4p16.json` |
+| GSM8K | top2gap w8/b16 beta=1.0 g0=1.0 | 6.45 | 775.72 | 8.31 | 16.00 | PASS | 0.83x | 0.67x | `jetspec/runs/dflash_gate_bench_component_bc_20260629_051037/bench_gsm8k_top2gap_w8_b16_beta1p0_g01p0.json` |
+| MATH-500 | linear w1 FA4 page16 | 7.62 | 1206.93 | 6.32 | n/a | PASS | 1.00x | 0.80x | `jetspec/runs/dflash_gate_bench_component_bc_20260629_051037/bench_math500_linear_w1_fa4p16.json` |
+| MATH-500 | top2gap w8/b16 beta=1.0 g0=1.0 | 7.90 | 908.35 | 8.70 | 16.00 | PASS | 0.75x | 0.60x | `jetspec/runs/dflash_gate_bench_component_bc_20260629_051037/bench_math500_top2gap_w8_b16_beta1p0_g01p0.json` |
+
+Before/after against the prior lean top2gap b16 row:
+
+| Dataset | Prior tok/s | New tok/s | Prior ms/step | New ms/step | Step-time delta | Prior artifact |
+|---|---:|---:|---:|---:|---:|---|
+| GSM8K | 570.64 | 775.72 | 11.30 | 8.31 | -26.4% | `jetspec/runs/top2gap_lean_20260629/gsm8k_top2gap_w8_b16_beta1p0_g01p0_31841.json` |
+| MATH-500 | 674.74 | 908.35 | 11.71 | 8.70 | -25.7% | `jetspec/runs/top2gap_lean_20260629/math500_top2gap_w8_b16_beta1p0_g01p0_31841.json` |
+
+Losslessness:
+- Fresh flushed gate rows and full benchmark rows report `losslessness.token_exact=true` with zero mismatches for both datasets.
+- The tree node count remains exactly `16.00`, so the speedup is machinery reduction rather than accepting fewer nodes.
+
+Verdict:
+- LAND for Components B/C: tree step time drops by about one quarter at the same b16 node count, and the fresh oracle gate is exact.
+- FAIL for final goal: tree is still below linear. Same-run ratios are `0.83x` GSM8K and `0.75x` MATH-500; against the prior faster linear bars (`1152.85` GSM8K, `1505.24` MATH-500), tree is `0.67x` and `0.60x`.
+- Component A remains the main blocker. The JetSpec reference paged-tree kernel cannot be copied directly because it lacks the FA4 `softcap` behavior and casts softmax probabilities to V dtype before the V matmul; a landed replacement must preserve FA4 numerical behavior.
+
 ## Lean top2gap sweep - paper datasets
 
 Date/time: 2026-06-29 04:09-04:43 UTC.

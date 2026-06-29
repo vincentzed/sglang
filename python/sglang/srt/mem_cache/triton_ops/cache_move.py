@@ -83,3 +83,38 @@ def copy_all_layer_kv_cache_tiled(
     mask = mask_loc[:, None] & mask_byte[None, :]
     vals = tl.load(src_ptr, mask=mask)
     tl.store(tgt_ptr, vals, mask=mask)
+
+
+@triton.jit
+def copy_all_layer_kv_cache_accept_path_ordered_tiled(
+    data_ptrs,
+    strides,
+    tgt_loc_2d_ptr,
+    src_loc_2d_ptr,
+    commit_len_ptr,
+    block_size: tl.constexpr,
+    BYTES_PER_TILE: tl.constexpr,
+):
+    """Copy one accept path per row, preserving source-before-destination order."""
+    data_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+    bid = tl.program_id(2)
+
+    stride = tl.load(strides + data_id)
+    base_ptr = tl.load(data_ptrs + data_id)
+    base_ptr = tl.cast(base_ptr, tl.pointer_type(tl.uint8))
+
+    byte_off = tile_id * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
+    mask_byte = byte_off < stride
+    tl.multiple_of(byte_off, 16)
+
+    commit_len = tl.load(commit_len_ptr + bid)
+    row_base = bid * block_size
+    for path_offset in range(block_size):
+        if path_offset < commit_len:
+            src = tl.load(src_loc_2d_ptr + row_base + path_offset)
+            tgt = tl.load(tgt_loc_2d_ptr + row_base + path_offset)
+            src_ptr = base_ptr + src * stride + byte_off
+            tgt_ptr = base_ptr + tgt * stride + byte_off
+            vals = tl.load(src_ptr, mask=mask_byte)
+            tl.store(tgt_ptr, vals, mask=mask_byte)

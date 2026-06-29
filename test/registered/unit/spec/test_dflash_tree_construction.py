@@ -8,6 +8,7 @@ import torch
 from sglang.srt.mem_cache.memory_pool import conv_window_dedup_enabled
 from sglang.srt.speculative.dflash_tree_utils import (
     build_ancestor_matrix_from_parents,
+    build_batched_retrieve_links_from_parents,
     build_retrieve_links_from_parents,
     build_tree_custom_mask,
     build_tree_from_topk_cpu,
@@ -278,6 +279,46 @@ class TestDFlashTreeConstruction(CustomTestCase):
         )
         self.assertEqual(retrieve_next_token.tolist(), [1, 3, 4, -1, -1])
         self.assertEqual(retrieve_next_sibling.tolist(), [-1, 2, -1, -1, -1])
+
+    def test_batched_retrieve_links_match_single_row_helper(self):
+        parent_rows = torch.tensor(
+            [
+                [-1, 0, 0, 1, 1, 2, 0],
+                [-1, 0, 1, 2, 0, 0, 0],
+            ],
+            dtype=torch.long,
+        )
+        num_real_nodes = torch.tensor([6, 4], dtype=torch.long)
+
+        retrieve_index, retrieve_next_token, retrieve_next_sibling = (
+            build_batched_retrieve_links_from_parents(
+                parent_rows,
+                num_verify_tokens=7,
+                num_real_nodes=num_real_nodes,
+            )
+        )
+
+        self.assertEqual(
+            retrieve_index.tolist(),
+            [
+                [0, 1, 2, 3, 4, 5, 6],
+                [7, 8, 9, 10, 11, 12, 13],
+            ],
+        )
+        for row in range(parent_rows.shape[0]):
+            _, expected_next_token, expected_next_sibling = (
+                build_retrieve_links_from_parents(
+                    parent_rows[row],
+                    num_verify_tokens=7,
+                    num_nodes=int(num_real_nodes[row]),
+                )
+            )
+            self.assertEqual(
+                retrieve_next_token[row].tolist(), expected_next_token.tolist()
+            )
+            self.assertEqual(
+                retrieve_next_sibling[row].tolist(), expected_next_sibling.tolist()
+            )
 
     def test_tree_custom_mask_prepends_prefix(self):
         parents = torch.tensor([-1, 0, 0, 1], dtype=torch.long)

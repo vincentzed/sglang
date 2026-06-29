@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-29 04:45 UTC
+Updated: 2026-06-29 05:22 UTC
 
 ## Done / Committed
 
@@ -25,6 +25,46 @@ Updated: 2026-06-29 04:45 UTC
 - Paper-dataset benchmark 2026-06-28: added `jetspec/bench_paper_sglang.py` and measured first-80 GSM8K/MATH-500 prompts with JetSpec prompt formatting. Valid tree b128 reaches paper-level acceptance (`7.77` GSM8K vs paper `7.94`; `9.55` MATH-500 vs paper `9.56`) but is verify-cost-limited (`23.55/25.64 ms/step`, `329.91/372.49 tok/s`). b255 is not lossless (`3/5` GSM8K oracle mismatches, `2/5` MATH oracle mismatches) and is diagnostic only.
 - Top2gap construction Job 1 2026-06-29: added `speculative_dflash_tree_draft=top2gap`, per-depth top-2-gap sigmoid fanout caps, and measured tree node-count counters. Fresh flushed FA4 page16 width=1 oracle gates passed for top2gap w4/b64 beta=1.0 g0=1.0 on GSM8K and MATH-500 with zero token mismatches. First-5 accept length improved from `5.33 -> 6.56` on GSM8K and `7.71 -> 9.18` on MATH-500; mean root-inclusive tree nodes were `57.54` and `50.45`.
 - Lean top2gap sweep 2026-06-29: swept top2gap-only `width=8`, budgets `16/24/32/48`, `(beta,g0)=(1.0,1.0)` and `(2.0,0.5)` on first-80 GSM8K/MATH-500 with FA4 page16 and normal decode graphs. All 16 dataset rows were token-exact, but none matched linear throughput. Best paired config is `budget=16`, `beta=1.0`, `g0=1.0`: GSM8K `570.64 tok/s`, accept `6.45`, nodes `16.00` (`0.49x` linear); MATH-500 `674.74 tok/s`, accept `7.90`, nodes `16.00` (`0.45x` linear). Best single MATH row is `budget=16`, `beta=2.0`, `g0=0.5` at `679.60 tok/s`, but still only `0.45x` linear. Verdict: lean top2gap raises accept over linear at the node floor but remains verify/host-overhead limited.
+- Tree decode machinery pass 2026-06-29: landed a bounded Component B/C pass for metadata and accepted-path KV commit. B vectorizes batched retrieve-link construction and skips unused custom-mask/retrieve metadata on dense compact FA4 verify. C adds an ordered fused all-layer KV commit for accepted tree paths. Fresh flushed FA4 page16 oracle gate passed for top2gap w8/b16 beta=1.0 g0=1.0 on GSM8K and MATH-500 with zero mismatches. Compared with the prior lean b16 row, GSM8K improved `570.64 -> 775.72 tok/s` and `11.30 -> 8.31 ms/step`; MATH-500 improved `674.74 -> 908.35 tok/s` and `11.71 -> 8.70 ms/step`. Tree is still below same-run linear (`938.62/1206.93 tok/s`) and the prior linear bars (`1152.85/1505.24 tok/s`), so Component A paged-tree verify remains the main blocker.
+
+## Tree Decode Machinery Pass - Components B/C
+
+Date/time: 2026-06-29 05:10-05:16 UTC.
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Backend for DFlash rows: `--attention-backend fa4 --page-size 16`
+- Decode graph flags: `--cuda-graph-max-bs-decode 1 --cuda-graph-backend-decode full`
+- Harness: `jetspec/run_dflash_gate_bench.sh all`, first 5 flushed gate prompts plus first 80 benchmark prompts per dataset.
+- Summary artifact: `jetspec/runs/dflash_gate_bench_component_bc_20260629_051037/summary.ndjson`
+
+Landed:
+- Component B: `build_batched_retrieve_links_from_parents` replaces per-row Python retrieve-link construction for tree-state metadata, and dense compact FA4 verify skips unused `custom_mask`/retrieve-link metadata.
+- Component C: `copy_all_layer_kv_cache_accept_path_ordered_tiled` adds a fused ordered accepted-path KV commit for MHA KV pools; dense compact and expanded-causal tree commits call the ordered helper.
+- Component D support: `jetspec/run_dflash_gate_bench.sh` records the fresh oracle gate, full linear baseline, tree gate, and full tree benchmark in one reproducible run.
+
+Results:
+
+| dataset | config | exact | accept | tok/s | ms/step | mean nodes | vs same-run linear | vs prior linear bar | artifact |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| GSM8K | linear w1 FA4 page16 | PASS | 5.85 | 938.62 | 6.23 | n/a | 1.00x | 0.81x | `jetspec/runs/dflash_gate_bench_component_bc_20260629_051037/bench_gsm8k_linear_w1_fa4p16.json` |
+| GSM8K | top2gap w8/b16 beta=1.0 g0=1.0 | PASS | 6.45 | 775.72 | 8.31 | 16.00 | 0.83x | 0.67x | `jetspec/runs/dflash_gate_bench_component_bc_20260629_051037/bench_gsm8k_top2gap_w8_b16_beta1p0_g01p0.json` |
+| MATH-500 | linear w1 FA4 page16 | PASS | 7.62 | 1206.93 | 6.32 | n/a | 1.00x | 0.80x | `jetspec/runs/dflash_gate_bench_component_bc_20260629_051037/bench_math500_linear_w1_fa4p16.json` |
+| MATH-500 | top2gap w8/b16 beta=1.0 g0=1.0 | PASS | 7.90 | 908.35 | 8.70 | 16.00 | 0.75x | 0.60x | `jetspec/runs/dflash_gate_bench_component_bc_20260629_051037/bench_math500_top2gap_w8_b16_beta1p0_g01p0.json` |
+
+Before/after versus the prior lean top2gap b16 row:
+
+| dataset | prior tok/s | new tok/s | prior ms/step | new ms/step | step-time delta |
+|---|---:|---:|---:|---:|---:|
+| GSM8K | 570.64 | 775.72 | 11.30 | 8.31 | -26.4% |
+| MATH-500 | 674.74 | 908.35 | 11.71 | 8.70 | -25.7% |
+
+Status:
+- Losslessness gate: PASS. Fresh flushed oracle comparison reported `exact=true`, zero mismatches for GSM8K and MATH-500 gate and benchmark rows.
+- Performance: landed because b16 tree per-step cost dropped by about one quarter with unchanged node count and unchanged acceptance.
+- Verdict: still not linear. The remaining same-run per-step gap is `8.31 vs 6.23 ms` on GSM8K and `8.70 vs 6.32 ms` on MATH-500. Against the prior faster linear bars, tree remains `0.67x` and `0.60x` linear. Component A, the FA4-exact paged-tree verify replacement, remains the critical unlanded blocker.
 
 ## Lean Top2gap Sweep - Paper Datasets
 

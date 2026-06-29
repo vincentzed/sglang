@@ -37,7 +37,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.dflash_tree_utils import (
     DraftTreeCPU,
-    build_retrieve_links_from_parents,
+    build_batched_retrieve_links_from_parents,
     build_tree_custom_mask,
     build_tree_from_topk_cpu,
     compute_tree_budget,
@@ -49,8 +49,8 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     commit_mamba_states_after_verify,
-    move_kv_cache_overlap_safe,
     move_accept_tokens_to_target_kvcache,
+    move_kv_cache_accept_path_ordered,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.speculative.triton_ops.dflash import (
@@ -2123,34 +2123,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         tree_cache_loc_2d = tree_cache_loc.view(bs, tree_budget)
 
-        custom_mask = build_tree_custom_mask(
-            parent_indices_batch=tree_parent_rows,
-            num_real_nodes=num_real_nodes,
-            prefix_lens=prefix_lens,
-            num_verify_tokens=tree_budget,
-            device=device,
-        )
-        retrieve_index_rows = []
-        retrieve_next_token_rows = []
-        retrieve_next_sibling_rows = []
-        for i, parents in enumerate(tree_parent_rows):
-            retrieve_index, retrieve_next_token, retrieve_next_sibling = (
-                build_retrieve_links_from_parents(
-                    parents,
-                    num_verify_tokens=tree_budget,
-                    num_nodes=num_real_nodes[i],
-                    row_offset=i * tree_budget,
-                    token_ids=tree_tokens[i],
-                )
-            )
-            retrieve_index_rows.append(retrieve_index)
-            retrieve_next_token_rows.append(retrieve_next_token)
-            retrieve_next_sibling_rows.append(retrieve_next_sibling)
-
-        retrieve_index = torch.stack(retrieve_index_rows, dim=0)
-        retrieve_next_token = torch.stack(retrieve_next_token_rows, dim=0)
-        retrieve_next_sibling = torch.stack(retrieve_next_sibling_rows, dim=0)
-
         target_model_runner = self.target_worker.model_runner
         active_target_attn_backend = target_model_runner.attn_backend
         while getattr(active_target_attn_backend, "full_attn_backend", None) is not None:
@@ -2168,6 +2140,41 @@ class DFlashWorkerV2(BaseSpecWorker):
             and not use_compact_tree_verify
             and os.environ.get("SGLANG_DFLASH_TREE_EXPANDED_CAUSAL", "0") == "1"
         )
+        needs_custom_mask = (
+            not (use_compact_tree_verify or use_flashinfer_expanded_causal_tree)
+            or os.environ.get("SGLANG_DFLASH_TREE_DUMP_ATTENDED_SET") is not None
+        )
+        custom_mask = (
+            build_tree_custom_mask(
+                parent_indices_batch=tree_parent_rows,
+                num_real_nodes=num_real_nodes,
+                prefix_lens=prefix_lens,
+                num_verify_tokens=tree_budget,
+                device=device,
+            )
+            if needs_custom_mask
+            else None
+        )
+        needs_tree_state_links = (
+            target_model_runner.mambaish_config is not None
+            or getattr(active_target_attn_backend, "linear_attn_backend", None) is not None
+            or self._tree_verify_attn_backend is not None
+            or not use_compact_tree_verify
+        )
+        retrieve_index = None
+        retrieve_next_token = None
+        retrieve_next_sibling = None
+        num_real_nodes_tensor = torch.tensor(
+            num_real_nodes, dtype=torch.long, device=device
+        )
+        if needs_tree_state_links:
+            retrieve_index, retrieve_next_token, retrieve_next_sibling = (
+                build_batched_retrieve_links_from_parents(
+                    tree_parents,
+                    num_verify_tokens=tree_budget,
+                    num_real_nodes=num_real_nodes_tensor,
+                )
+            )
 
         compact_kv_indices = None
         compact_kv_indptr = None
@@ -2654,13 +2661,19 @@ class DFlashWorkerV2(BaseSpecWorker):
                                     custom_mask=None,
                                     retrieve_index=retrieve_index[
                                         :, chunk_start:chunk_end
-                                    ],
+                                    ]
+                                    if retrieve_index is not None
+                                    else None,
                                     retrieve_next_token=retrieve_next_token[
                                         :, chunk_start:chunk_end
-                                    ],
+                                    ]
+                                    if retrieve_next_token is not None
+                                    else None,
                                     retrieve_next_sibling=retrieve_next_sibling[
                                         :, chunk_start:chunk_end
-                                    ],
+                                    ]
+                                    if retrieve_next_sibling is not None
+                                    else None,
                                     max_tree_depth=block_size,
                                     capture_hidden_mode=CaptureHiddenMode.FULL,
                                     allow_cuda_graph=False,
@@ -2869,9 +2882,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         tree_target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
             bs, tree_budget
-        )
-        num_real_nodes_tensor = torch.tensor(
-            num_real_nodes, dtype=torch.long, device=device
         )
         predict, accept_index, num_correct_drafts = tree_accept_greedy_batched(
             tree_tokens=tree_tokens,
@@ -4025,13 +4035,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accept_index_local,
             ).to(torch.int64)
             accepted_cache_loc_2d = tree_cache_loc_2d[:, :block_size].to(torch.int64)
-            valid_offsets = (
-                accepted_offsets_2d < commit_lens.to(torch.int64).unsqueeze(1)
-            )
-            move_kv_cache_overlap_safe(
+            move_kv_cache_accept_path_ordered(
                 model_worker_batch.token_to_kv_pool_allocator.get_kvcache(),
-                accepted_cache_loc_2d[valid_offsets],
-                source_cache_loc_2d[valid_offsets],
+                accepted_cache_loc_2d,
+                source_cache_loc_2d,
+                commit_lens,
             )
         elif use_flashinfer_expanded_causal_tree:
             assert expanded_cache_loc_3d is not None
@@ -4041,13 +4049,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accept_index_local.to(torch.long),
                 accept_offsets_2d,
             ].to(torch.int64)
-            valid_offsets = (
-                accepted_offsets_2d < commit_lens.to(torch.int64).unsqueeze(1)
-            )
-            move_kv_cache_overlap_safe(
+            move_kv_cache_accept_path_ordered(
                 model_worker_batch.token_to_kv_pool_allocator.get_kvcache(),
-                accepted_cache_loc_2d[valid_offsets],
-                source_cache_loc_2d[valid_offsets],
+                accepted_cache_loc_2d,
+                source_cache_loc_2d,
+                commit_lens,
             )
         elif os.environ.get("SGLANG_DFLASH_TREE_LOGICAL_COMMIT"):
             accepted_cache_loc_2d = torch.gather(

@@ -548,22 +548,107 @@ def build_ancestor_matrix_from_parents(
     *,
     device: Optional[torch.device | str] = None,
 ) -> torch.Tensor:
-    parents = (
-        parent_indices.tolist()
-        if isinstance(parent_indices, torch.Tensor)
-        else list(parent_indices)
-    )
-    num_nodes = len(parents)
+    if isinstance(parent_indices, torch.Tensor):
+        parent_tensor = parent_indices.to(dtype=torch.long)
+        if device is not None and parent_tensor.device != torch.device(device):
+            parent_tensor = parent_tensor.to(device=device)
+        elif device is None:
+            device = parent_tensor.device
+        num_nodes = int(parent_tensor.numel())
+    else:
+        parents = list(parent_indices)
+        num_nodes = len(parents)
+        parent_tensor = torch.tensor(parents, dtype=torch.long, device=device)
     if num_nodes <= 0:
         raise ValueError("parent_indices must contain at least the root node.")
     mask = torch.eye(num_nodes, dtype=torch.bool, device=device)
     mask[:, 0] = True
-    for idx in range(1, num_nodes):
-        parent = int(parents[idx])
-        while parent > 0:
-            mask[idx, parent] = True
-            parent = int(parents[parent])
+    if num_nodes == 1:
+        return mask
+
+    rows = torch.arange(num_nodes, dtype=torch.long, device=device)
+    current = parent_tensor.clone()
+    for _ in range(num_nodes - 1):
+        valid = current > 0
+        mask[rows[valid], current[valid]] = True
+        current = torch.where(valid, parent_tensor[current.clamp(min=0)], current)
     return mask
+
+
+def build_batched_retrieve_links_from_parents(
+    parent_indices: torch.Tensor,
+    *,
+    num_verify_tokens: Optional[int] = None,
+    num_real_nodes: Optional[torch.Tensor | Iterable[int]] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if parent_indices.dim() != 2:
+        raise ValueError(
+            "parent_indices must be a 2D tensor of shape "
+            f"(batch, num_verify_tokens), got {tuple(parent_indices.shape)}."
+        )
+
+    device = parent_indices.device
+    bs = int(parent_indices.shape[0])
+    width = (
+        int(parent_indices.shape[1])
+        if num_verify_tokens is None
+        else int(num_verify_tokens)
+    )
+    if width > int(parent_indices.shape[1]):
+        raise ValueError(
+            f"num_verify_tokens={width} exceeds parent_indices width={parent_indices.shape[1]}."
+        )
+    parents = parent_indices[:, :width].to(dtype=torch.long)
+
+    if num_real_nodes is None:
+        real_nodes = torch.full((bs,), width, dtype=torch.long, device=device)
+    elif isinstance(num_real_nodes, torch.Tensor):
+        real_nodes = num_real_nodes.to(device=device, dtype=torch.long)
+    else:
+        real_nodes = torch.tensor(list(num_real_nodes), dtype=torch.long, device=device)
+    if int(real_nodes.numel()) != bs:
+        raise ValueError(
+            f"num_real_nodes must have one entry per batch row; got {int(real_nodes.numel())} for bs={bs}."
+        )
+    if real_nodes.device.type == "cpu" and bool((real_nodes > width).any().item()):
+        raise ValueError("num_real_nodes cannot exceed num_verify_tokens.")
+
+    nodes = torch.arange(width, dtype=torch.long, device=device)
+    candidate_ids = nodes.view(1, 1, width)
+    parent_ids = nodes.view(1, width, 1)
+    valid_child = (nodes.view(1, width) > 0) & (
+        nodes.view(1, width) < real_nodes.view(bs, 1)
+    )
+
+    child_of_parent = (parents[:, None, :] == parent_ids) & valid_child[:, None, :]
+    first_child = torch.where(
+        child_of_parent,
+        candidate_ids,
+        torch.full_like(candidate_ids, width),
+    ).min(dim=2).values
+    retrieve_next_token = torch.where(
+        first_child < width,
+        first_child,
+        torch.full_like(first_child, -1),
+    )
+
+    later = nodes.view(1, 1, width) > nodes.view(1, width, 1)
+    valid_pair = valid_child[:, :, None] & valid_child[:, None, :]
+    next_sibling = torch.where(
+        (parents[:, :, None] == parents[:, None, :]) & later & valid_pair,
+        candidate_ids,
+        torch.full_like(candidate_ids, width),
+    ).min(dim=2).values
+    retrieve_next_sibling = torch.where(
+        next_sibling < width,
+        next_sibling,
+        torch.full_like(next_sibling, -1),
+    )
+
+    retrieve_index = torch.arange(bs * width, dtype=torch.long, device=device).view(
+        bs, width
+    )
+    return retrieve_index, retrieve_next_token, retrieve_next_sibling
 
 
 def build_retrieve_links_from_parents(
@@ -576,7 +661,6 @@ def build_retrieve_links_from_parents(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     device = parent_indices.device
     total_nodes = int(parent_indices.numel()) if num_nodes is None else int(num_nodes)
-    parents = parent_indices[:total_nodes].to(dtype=torch.long).tolist()
     width = total_nodes if num_verify_tokens is None else int(num_verify_tokens)
     if width < total_nodes:
         raise ValueError(
@@ -586,23 +670,21 @@ def build_retrieve_links_from_parents(
     retrieve_index = torch.arange(
         int(row_offset), int(row_offset) + width, dtype=torch.long, device=device
     )
-    retrieve_next_token = torch.full((width,), -1, dtype=torch.long, device=device)
-    retrieve_next_sibling = torch.full((width,), -1, dtype=torch.long, device=device)
+    if int(parent_indices.numel()) < width:
+        padded_parents = torch.zeros((width,), dtype=torch.long, device=device)
+        padded_parents[:total_nodes].copy_(parent_indices[:total_nodes].to(torch.long))
+    else:
+        padded_parents = parent_indices[:width].to(torch.long)
 
-    children: list[list[int]] = [[] for _ in range(width)]
-    for idx in range(1, total_nodes):
-        children[parents[idx]].append(idx)
-    for idx, node_children in enumerate(children[:total_nodes]):
-        if not node_children:
-            continue
-        # These links drive tree-state kernels (conv/GDN/Mamba), so they must
-        # encode the physical parent/child topology for every node.  JetSpec's
-        # duplicate-token overwrite rule belongs only to acceptance; pruning
-        # duplicate-token siblings here would leave the pruned nodes with an
-        # incorrect parent state during verify.
-        retrieve_next_token[idx] = node_children[0]
-        for child, sibling in zip(node_children, node_children[1:]):
-            retrieve_next_sibling[child] = sibling
+    _, retrieve_next_token, retrieve_next_sibling = (
+        build_batched_retrieve_links_from_parents(
+            padded_parents.view(1, width),
+            num_verify_tokens=width,
+            num_real_nodes=torch.tensor([total_nodes], dtype=torch.long, device=device),
+        )
+    )
+    retrieve_next_token = retrieve_next_token.squeeze(0)
+    retrieve_next_sibling = retrieve_next_sibling.squeeze(0)
     return retrieve_index, retrieve_next_token, retrieve_next_sibling
 
 
