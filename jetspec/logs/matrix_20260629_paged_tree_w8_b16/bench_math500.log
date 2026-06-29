@@ -1,0 +1,12 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+{
+  "accept_length": 8.019423558897243,
+  "mean_per_prompt_accept_length": 8.0087790578695,
+  "num_prompts": 80,
+  "throughput_server_e2e_tok_s": 1063.0958858175754,
+  "throughput_wall_tok_s": 1060.726886015534,
+  "total_completion_tokens": 51196,
+  "total_server_e2e_latency_s": 48.15746225998009,
+  "total_spec_verify_ct": 6384,
+  "total_wall_latency_s": 48.26501588199608
+}

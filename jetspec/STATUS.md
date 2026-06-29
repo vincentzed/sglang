@@ -1,6 +1,55 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-29 22:47 UTC
+Updated: 2026-06-29 23:30 UTC
+
+## Focused 4-config Matrix + Profiles
+
+Question:
+- Does any tree config beat both linear baselines, and where does the per-step cost go?
+
+Environment and artifacts:
+- Branch/head: `jetspec-tree-draft` at `aa0236deded7b5b043071aaaee88044dee0da106`.
+- GPUs: workers ran on GPUs `4,5,6,7`; all were free after cleanup.
+- Target/draft: `Qwen/Qwen3-8B` / `JetSpec/jetspec-qwen3-8b`.
+- Serving: FA4 page16, normal decode CUDA graph, `max_running_requests=1`, greedy `temperature=0`.
+- Harness: `jetspec/bench_paper_sglang.py`, first 80 prompts for GSM8K and MATH-500.
+- Profiles: torch decode traces plus nsys reports for all 4 configs.
+- Summary artifact: `jetspec/runs/matrix_20260629_summary.json`.
+
+Matrix:
+
+| config | dataset | exact vs native DFlash | accept | tok/s | ms/step | nodes |
+|---|---|---:|---:|---:|---:|---:|
+| DFlash w1 native | GSM8K | PASS | 5.849 | 1170.50 | 4.997 | n/a |
+| DFlash w1 native | MATH-500 | PASS | 7.624 | 1522.10 | 5.009 | n/a |
+| linear JetSpec w1 | GSM8K | PASS | 5.849 | 1152.40 | 5.076 | n/a |
+| linear JetSpec w1 | MATH-500 | PASS | 7.624 | 1488.61 | 5.122 | n/a |
+| compact tree w8/b16 | GSM8K | PASS | 6.450 | 1002.22 | 6.436 | 16.00 |
+| compact tree w8/b16 | MATH-500 | PASS | 7.900 | 1167.54 | 6.767 | 16.00 |
+| paged tree w8/b16 | GSM8K | FAIL 50/80 | 6.497 | 900.15 | 7.218 | 16.00 |
+| paged tree w8/b16 | MATH-500 | FAIL 54/80 | 8.019 | 1060.73 | 7.560 | 16.00 |
+
+Break-even:
+- Compact tree loses to both linear baselines. Against native DFlash it needs accept `7.533` on GSM8K and `10.299` on MATH-500, but reaches only `6.450` and `7.900`.
+- Paged tree also loses by the break-even math and is not token-exact, so its rows are diagnostic only.
+- Explicit width-1 JetSpec is token-exact to native width-unset DFlash and has only a small measured overhead: `+0.078 ms/step` GSM8K and `+0.113 ms/step` MATH-500.
+
+Profile read:
+- Compact tree's rendered torch table adds `0.72 ms` compact K/V gather and `0.27 ms` tree DtoD copies over the decode capture. Raw trace CPU scopes put the residual in `_forward_batch_generation_tree` and its tree metadata work; those scopes are inclusive and should not be summed as exclusive wall time.
+- Paged tree removes compact gather/DtoD rows, but FA4 attention rows grow to `3.70 ms` versus `1.77 ms` for explicit w1, and the path is not lossless.
+- Normalized over 4 captured tree forwards, compact K/V gather is about `0.18 ms/step` (`13%` of the GSM8K compact-vs-explicit-w1 step gap), tree DtoD copies are `0.07 ms/step` (`5%`), accept is `0.05 ms/step` (`4%`), and inclusive CPU metadata scopes point at tree build/retrieve/top-k work (`0.10/0.34/0.51 ms/step` respectively, non-additive).
+- Biggest reducible overhead remains compact verifier per-node prefix/KV materialization plus metadata. The needed lever is a FA4-exact paged/shared-prefix verifier that preserves serving numerics.
+
+Trace paths:
+- DFlash native: `jetspec/profiles/matrix_dflash_w1_native/torch_decode_analysis.txt`, `jetspec/profiles/matrix_dflash_w1_native/nsys_dflash_w1_native.nsys-rep`
+- Explicit w1: `jetspec/profiles/matrix_linear_jetspec_w1/torch_decode_analysis.txt`, `jetspec/profiles/matrix_linear_jetspec_w1/nsys_linear_jetspec_w1.nsys-rep`
+- Compact tree: `jetspec/profiles/matrix_compact_tree_w8_b16/torch_decode_analysis.txt`, `jetspec/profiles/matrix_compact_tree_w8_b16/nsys_compact_tree_w8_b16.nsys-rep`
+- Paged tree: `jetspec/profiles/matrix_paged_tree_w8_b16/torch_decode_analysis.txt`, `jetspec/profiles/matrix_paged_tree_w8_b16/nsys_paged_tree_w8_b16.nsys-rep`
+
+Verdict:
+- NO tree config beats both linear baselines.
+- The only valid/lossless tree row is compact w8/b16, and it loses on both datasets.
+- Paged w8/b16 remains default-off/diagnostic because it is non-exact on full serving rows and slower than compact in this matrix.
 
 ## Urgent AR-Oracle Re-Gate
 

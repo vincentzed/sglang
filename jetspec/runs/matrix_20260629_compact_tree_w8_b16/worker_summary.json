@@ -1,0 +1,47 @@
+{
+  "config_name": "compact_tree_w8_b16",
+  "branch": "jetspec-tree-draft",
+  "commit": "aa0236deded7b5b043071aaaee88044dee0da106",
+  "gpu": 6,
+  "ports": {
+    "main_server": 31142,
+    "nsys_server": 31162
+  },
+  "bench_json_paths": {
+    "gsm8k": "jetspec/runs/matrix_20260629_compact_tree_w8_b16/bench_gsm8k.json",
+    "math500": "jetspec/runs/matrix_20260629_compact_tree_w8_b16/bench_math500.json"
+  },
+  "torch_analysis_path": "jetspec/profiles/matrix_compact_tree_w8_b16/torch_decode_analysis.txt",
+  "torch_output_dir": "jetspec/profiles/matrix_compact_tree_w8_b16/torch_decode",
+  "nsys_output_paths": {
+    "rep": "jetspec/profiles/matrix_compact_tree_w8_b16/nsys_compact_tree_w8_b16.nsys-rep",
+    "log": "jetspec/profiles/matrix_compact_tree_w8_b16/nsys_compact_tree_w8_b16.log",
+    "driver": "jetspec/profiles/matrix_compact_tree_w8_b16/nsys_driver_compact_tree_w8_b16.sh",
+    "server_log": "jetspec/profiles/matrix_compact_tree_w8_b16/nsys_server_31162.log"
+  },
+  "nsys_succeeded": true,
+  "log_paths": {
+    "server": "jetspec/logs/matrix_20260629_compact_tree_w8_b16/server_31142.log",
+    "server_pid": "jetspec/logs/matrix_20260629_compact_tree_w8_b16/server_31142.pid",
+    "bench_gsm8k": "jetspec/logs/matrix_20260629_compact_tree_w8_b16/bench_gsm8k.log",
+    "bench_math500": "jetspec/logs/matrix_20260629_compact_tree_w8_b16/bench_math500.log"
+  },
+  "datasets": {
+    "gsm8k": {
+      "accept_length": 6.450038138825324,
+      "throughput_wall_tok_s": 1002.2203532945791,
+      "total_spec_verify_ct": 3933,
+      "total_completion_tokens": 25368,
+      "total_wall_latency_s": 25.311798864000593,
+      "mean_tree_nodes": 16.0
+    },
+    "math500": {
+      "accept_length": 7.900214592274678,
+      "throughput_wall_tok_s": 1167.536674492911,
+      "total_spec_verify_ct": 6524,
+      "total_completion_tokens": 51541,
+      "total_wall_latency_s": 44.14508008700068,
+      "mean_tree_nodes": 16.0
+    }
+  }
+}

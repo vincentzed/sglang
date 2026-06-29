@@ -1,0 +1,53 @@
+{
+  "bench_json_paths": {
+    "gsm8k": "jetspec/runs/matrix_20260629_linear_jetspec_w1/bench_gsm8k.json",
+    "math500": "jetspec/runs/matrix_20260629_linear_jetspec_w1/bench_math500.json"
+  },
+  "config_name": "linear_jetspec_w1",
+  "datasets": {
+    "gsm8k": {
+      "accept_length": 5.84920451925294,
+      "mean_tree_nodes": null,
+      "num_prompts": 80,
+      "status": "ok",
+      "throughput_wall_tok_s": 1152.3996493364743,
+      "total_completion_tokens": 25368,
+      "total_spec_verify_ct": 4337,
+      "total_wall_latency_s": 22.013196563020756
+    },
+    "math500": {
+      "accept_length": 7.624408284023668,
+      "mean_tree_nodes": null,
+      "num_prompts": 80,
+      "status": "ok",
+      "throughput_wall_tok_s": 1488.6105237067266,
+      "total_completion_tokens": 51541,
+      "total_spec_verify_ct": 6760,
+      "total_wall_latency_s": 34.62356283204281
+    }
+  },
+  "gpu": 5,
+  "gpu_note": "GPU 5 used for throughput, torch decode profiling, and nsys capture; fallback was not needed.",
+  "log_paths": {
+    "bench_gsm8k": "jetspec/logs/matrix_20260629_linear_jetspec_w1/bench_gsm8k.log",
+    "bench_math500": "jetspec/logs/matrix_20260629_linear_jetspec_w1/bench_math500.log",
+    "nsys": "jetspec/profiles/matrix_linear_jetspec_w1/nsys_linear_jetspec_w1.log",
+    "nsys_driver": "jetspec/profiles/matrix_linear_jetspec_w1/nsys_driver_linear_jetspec_w1.sh",
+    "nsys_server": "jetspec/profiles/matrix_linear_jetspec_w1/nsys_server_31161.log",
+    "nsys_server_pid": "jetspec/profiles/matrix_linear_jetspec_w1/nsys_server_31161.pid",
+    "server": "jetspec/logs/matrix_20260629_linear_jetspec_w1/server_31141.log",
+    "server_pid": "jetspec/logs/matrix_20260629_linear_jetspec_w1/server_31141.pid"
+  },
+  "nsys_output_paths": [
+    "jetspec/profiles/matrix_linear_jetspec_w1/nsys_linear_jetspec_w1.nsys-rep"
+  ],
+  "nsys_succeeded": true,
+  "ports": {
+    "main_server": 31141,
+    "nsys_server": 31161
+  },
+  "torch_analysis_path": "jetspec/profiles/matrix_linear_jetspec_w1/torch_decode_analysis.txt",
+  "torch_trace_paths": [
+    "jetspec/profiles/matrix_linear_jetspec_w1/torch_decode/decode/1782774624.0240302/triage-trace-decode-1782774624.0803614-TP-0.trace.json.gz"
+  ]
+}
