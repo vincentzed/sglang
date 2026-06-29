@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from typing import TYPE_CHECKING, Optional
 
@@ -241,19 +242,37 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
     if server_args.speculative_dflash_tree_draft not in (
         "accum_logp",
+        "top2gap",
         "entropy",
         "hybrid",
     ):
         raise ValueError(
             "--speculative-dflash-tree-draft must be one of "
-            "'accum_logp', 'entropy', or 'hybrid', got "
+            "'accum_logp', 'top2gap', 'entropy', or 'hybrid', got "
             f"{server_args.speculative_dflash_tree_draft!r}."
         )
-    if tree_width > 1 and server_args.speculative_dflash_tree_draft != "accum_logp":
+    if tree_width > 1 and server_args.speculative_dflash_tree_draft not in (
+        "accum_logp",
+        "top2gap",
+    ):
         raise NotImplementedError(
-            "DFLASH tree v1 only supports --speculative-dflash-tree-draft=accum_logp. "
-            "Entropy-guided drafting is a follow-up."
+            "DFLASH tree v1 only supports --speculative-dflash-tree-draft "
+            "values 'accum_logp' and 'top2gap'. Entropy-guided drafting is a follow-up."
         )
+    top2gap_beta = float(server_args.speculative_dflash_top2gap_beta)
+    if not math.isfinite(top2gap_beta) or top2gap_beta < 0:
+        raise ValueError(
+            "--speculative-dflash-top2gap-beta must be finite and nonnegative, "
+            f"got {server_args.speculative_dflash_top2gap_beta}."
+        )
+    server_args.speculative_dflash_top2gap_beta = top2gap_beta
+    top2gap_g0 = float(server_args.speculative_dflash_top2gap_g0)
+    if not math.isfinite(top2gap_g0):
+        raise ValueError(
+            "--speculative-dflash-top2gap-g0 must be finite, "
+            f"got {server_args.speculative_dflash_top2gap_g0}."
+        )
+    server_args.speculative_dflash_top2gap_g0 = top2gap_g0
 
     block_size = int(server_args.speculative_num_draft_tokens)
     if server_args.speculative_dflash_tree_budget is None:

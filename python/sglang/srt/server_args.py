@@ -382,6 +382,13 @@ _DFLASH_SPECULATIVE_CONFIG_KEYS = {
     "speculative_dflash_tree_draft": "speculative_dflash_tree_draft",
     "dflash_tree_draft": "speculative_dflash_tree_draft",
     "tree_draft": "speculative_dflash_tree_draft",
+    "speculative_dflash_top2gap_beta": "speculative_dflash_top2gap_beta",
+    "dflash_top2gap_beta": "speculative_dflash_top2gap_beta",
+    "top2gap_beta": "speculative_dflash_top2gap_beta",
+    "speculative_dflash_top2gap_g0": "speculative_dflash_top2gap_g0",
+    "dflash_top2gap_g0": "speculative_dflash_top2gap_g0",
+    "top2gap_g0": "speculative_dflash_top2gap_g0",
+    "top2gap_g_0": "speculative_dflash_top2gap_g0",
     "speculative_dflash_head_type": "speculative_dflash_head_type",
     "dflash_head_type": "speculative_dflash_head_type",
     "head_type": "speculative_dflash_head_type",
@@ -1588,7 +1595,7 @@ class ServerArgs:
     ] = None
     speculative_config: A[
         Optional[str],
-        "Speculative decoding config as a JSON object. For DFLASH, supported keys are tree_width, tree_budget, tree_draft, and head_type.",
+        "Speculative decoding config as a JSON object. For DFLASH, supported keys are tree_width, tree_budget, tree_draft, top2gap_beta, top2gap_g0, and head_type.",
     ] = None
     speculative_dflash_tree_width: A[
         int,
@@ -1602,9 +1609,17 @@ class ServerArgs:
         str,
         Arg(
             help="DFLASH only. Tree construction scoring mode.",
-            choices=["accum_logp", "entropy", "hybrid"],
+            choices=["accum_logp", "top2gap", "entropy", "hybrid"],
         ),
     ] = "accum_logp"
+    speculative_dflash_top2gap_beta: A[
+        float,
+        "DFLASH only. Beta for top2gap tree fanout: larger values sharpen the sigmoid from high fanout to chain-like fanout.",
+    ] = 1.0
+    speculative_dflash_top2gap_g0: A[
+        float,
+        "DFLASH only. Center gap g0 for top2gap tree fanout; gaps above this branch less, gaps below this branch more.",
+    ] = 1.0
     speculative_dflash_head_type: A[
         str,
         Arg(

@@ -161,6 +161,35 @@ def compute_accept_length(meta_info: dict[str, Any]) -> float:
     return completion_tokens / spec_verify_ct
 
 
+def extract_dflash_tree_node_stats(
+    server_info: dict[str, Any],
+) -> dict[str, int | float] | None:
+    for state in server_info.get("internal_states") or []:
+        if "dflash_tree_build_ct" not in state:
+            continue
+        return {
+            "build_ct": int(state.get("dflash_tree_build_ct") or 0),
+            "num_nodes_total": int(state.get("dflash_tree_num_nodes_total") or 0),
+            "avg_num_nodes": float(state.get("avg_dflash_tree_num_nodes") or 0.0),
+        }
+    return None
+
+
+def diff_dflash_tree_node_stats(
+    before: dict[str, int | float] | None,
+    after: dict[str, int | float] | None,
+) -> dict[str, int | float] | None:
+    if before is None or after is None:
+        return None
+    build_ct = int(after["build_ct"]) - int(before["build_ct"])
+    num_nodes_total = int(after["num_nodes_total"]) - int(before["num_nodes_total"])
+    return {
+        "build_ct": build_ct,
+        "num_nodes_total": num_nodes_total,
+        "mean_num_nodes": num_nodes_total / build_ct if build_ct > 0 else None,
+    }
+
+
 def load_baseline(path: Path | None) -> dict[tuple[str, int], list[int]]:
     if path is None:
         return {}
@@ -285,6 +314,9 @@ def main() -> None:
     parser.add_argument("--tokenizer-path", default="Qwen/Qwen3-8B")
     parser.add_argument("--tree-width", type=int, default=1)
     parser.add_argument("--tree-budget", type=int)
+    parser.add_argument("--tree-draft", default="accum_logp")
+    parser.add_argument("--top2gap-beta", type=float)
+    parser.add_argument("--top2gap-g0", type=float)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--warmup-samples", type=int, default=2)
     parser.add_argument("--compare-to", type=Path)
@@ -316,6 +348,13 @@ def main() -> None:
         )
     if args.flush_cache_before_run:
         flush_cache(args.base_url)
+
+    try:
+        server_info_before = request_json(
+            "GET", f"{args.base_url}/server_info", timeout=30.0
+        )
+    except Exception as exc:  # noqa: BLE001
+        server_info_before = {"error": str(exc)}
 
     baseline = load_baseline(args.compare_to)
     rows = []
@@ -386,18 +425,26 @@ def main() -> None:
             "page_size": 16,
             "tree_width": args.tree_width,
             "tree_budget": args.tree_budget,
+            "tree_draft": args.tree_draft,
+            "top2gap_beta": args.top2gap_beta,
+            "top2gap_g0": args.top2gap_g0,
         },
         "warmup": {
             "num_prompts": len(warmup_records),
             "sample_indices": [row["sample_index"] for row in warmup_records],
         },
         "summary": summarize(rows),
+        "tree_node_stats": diff_dflash_tree_node_stats(
+            extract_dflash_tree_node_stats(server_info_before),
+            extract_dflash_tree_node_stats(server_info),
+        ),
         "losslessness": {
             "compared_to": str(args.compare_to) if args.compare_to else None,
             "token_exact": not mismatches,
             "mismatches": mismatches,
         },
         "prompts": rows,
+        "server_info_before": server_info_before,
         "server_info": server_info,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)

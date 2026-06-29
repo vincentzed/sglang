@@ -14,6 +14,7 @@ from sglang.srt.speculative.dflash_tree_utils import (
     compute_tree_budget,
     tree_accept_greedy,
     tree_accept_greedy_batched,
+    top2gap_fanout_caps,
 )
 from sglang.srt.server_args import _merge_speculative_config
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -143,6 +144,76 @@ class TestDFlashTreeConstruction(CustomTestCase):
             ],
             budget=4,
         )
+
+    def test_explicit_fanout_caps_are_forwarded(self):
+        tree = build_tree_from_topk_cpu(
+            root_token=1,
+            topk_tokens=torch.tensor(
+                [
+                    [10, 20, 30, 40],
+                    [11, 21, 31, 41],
+                    [12, 22, 32, 42],
+                ]
+            ),
+            topk_logprobs=torch.tensor(
+                [
+                    [-0.1, -0.2, -0.3, -0.4],
+                    [-0.1, -0.2, -0.3, -0.4],
+                    [-0.1, -0.2, -0.3, -0.4],
+                ]
+            ),
+            budget=8,
+            depth_first=False,
+            fanout_caps=[1, 4, 4],
+        )
+
+        root_children = [
+            idx for idx, parent in enumerate(tree.parent_indices) if parent == 0
+        ]
+        self.assertEqual(root_children, [1])
+
+    def test_top2gap_fanout_caps_use_top2_gap_sigmoid(self):
+        caps = top2gap_fanout_caps(
+            [
+                [-0.10, -0.10, -2.0, -3.0],
+                [-0.10, -1.10, -2.0, -3.0],
+                [-0.10, -5.10, -6.0, -7.0],
+            ],
+            beta=1.0,
+            g_0=1.0,
+        )
+
+        self.assertEqual(caps, [3, 2, 1])
+
+    def test_top2gap_tree_uses_accum_logp_with_adaptive_fanout_caps(self):
+        tree = build_tree_from_topk_cpu(
+            root_token=1,
+            topk_tokens=torch.tensor(
+                [
+                    [10, 20, 30, 40],
+                    [11, 21, 31, 41],
+                    [12, 22, 32, 42],
+                ]
+            ),
+            topk_logprobs=torch.tensor(
+                [
+                    [-0.10, -5.10, -6.0, -7.0],
+                    [-0.10, -5.10, -6.0, -7.0],
+                    [-0.10, -5.10, -6.0, -7.0],
+                ]
+            ),
+            budget=8,
+            depth_first=False,
+            score_mode="top2gap",
+            top2gap_beta=1.0,
+            top2gap_g_0=1.0,
+        )
+
+        self.assertEqual(
+            [idx for idx, parent in enumerate(tree.parent_indices) if parent == 0],
+            [1],
+        )
+        self.assertEqual(tree.num_nodes, 4)
 
     def test_tree_mask_and_retrieve_links_from_irregular_bfs_tree(self):
         tree = build_tree_from_topk_cpu(
@@ -294,13 +365,16 @@ class TestDFlashTreeConstruction(CustomTestCase):
         kwargs = {
             "speculative_config": (
                 '{"dflash": {"tree_width": 7, "tree_budget": 128, '
-                '"tree_draft": "accum_logp", "head_type": "causal"}}'
+                '"tree_draft": "top2gap", "top2gap_beta": 2.0, '
+                '"top2gap_g_0": 0.5, "head_type": "causal"}}'
             )
         }
         _merge_speculative_config(kwargs)
         self.assertEqual(kwargs["speculative_dflash_tree_width"], 7)
         self.assertEqual(kwargs["speculative_dflash_tree_budget"], 128)
-        self.assertEqual(kwargs["speculative_dflash_tree_draft"], "accum_logp")
+        self.assertEqual(kwargs["speculative_dflash_tree_draft"], "top2gap")
+        self.assertEqual(kwargs["speculative_dflash_top2gap_beta"], 2.0)
+        self.assertEqual(kwargs["speculative_dflash_top2gap_g0"], 0.5)
         self.assertEqual(kwargs["speculative_dflash_head_type"], "causal")
 
     def test_dflash_tree_uses_dense_mamba_intermediate_conv_windows(self):

@@ -1,6 +1,6 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-28 17:05 UTC
+Updated: 2026-06-29 03:25 UTC
 
 ## Done / Committed
 
@@ -23,6 +23,38 @@ Updated: 2026-06-28 17:05 UTC
 - Mask root-cause Job 2 2026-06-28: dense FA4 page16 tree verify now uses an exact compact KV index list for each query row, so every accepted node reads exactly committed prefix plus self/ancestors. The dense accepted-path reverify is removed for compact dense target verify, and accepted KV is committed directly by copying accepted tree slots into the canonical next-prefix slots. Fresh flushed FA4 page16 width=1 oracle gates passed for w7/b64 and w7/b128 with zero token mismatches.
 - Mask root-cause Job 3 2026-06-28: canonical MT-bench rerun completed with the dense reverify removed. FA4 page16 width=1 linear reached `764.540 tok/s` with accept length `4.070`; dense tree w7/b64 no-reverify reached `243.000 tok/s` with accept length `5.053`. Tree improves over the old retained-reverify tree (`199.983 tok/s`) but is still only `0.32x` linear (`3.15x` slower), so dense tree does not beat or match linear yet.
 - Paper-dataset benchmark 2026-06-28: added `jetspec/bench_paper_sglang.py` and measured first-80 GSM8K/MATH-500 prompts with JetSpec prompt formatting. Valid tree b128 reaches paper-level acceptance (`7.77` GSM8K vs paper `7.94`; `9.55` MATH-500 vs paper `9.56`) but is verify-cost-limited (`23.55/25.64 ms/step`, `329.91/372.49 tok/s`). b255 is not lossless (`3/5` GSM8K oracle mismatches, `2/5` MATH oracle mismatches) and is diagnostic only.
+- Top2gap construction Job 1 2026-06-29: added `speculative_dflash_tree_draft=top2gap`, per-depth top-2-gap sigmoid fanout caps, and measured tree node-count counters. Fresh flushed FA4 page16 width=1 oracle gates passed for top2gap w4/b64 beta=1.0 g0=1.0 on GSM8K and MATH-500 with zero token mismatches. First-5 accept length improved from `5.33 -> 6.56` on GSM8K and `7.71 -> 9.18` on MATH-500; mean root-inclusive tree nodes were `57.54` and `50.45`.
+
+## Top2gap Construction Job 1 - Losslessness Gate
+
+Date/time: 2026-06-29 03:16-03:22 UTC.
+
+Environment:
+- GPU: `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`
+- Dense model: `Qwen/Qwen3-8B`
+- Dense draft model: `JetSpec/jetspec-qwen3-8b`
+- Backend for DFlash rows: `--attention-backend fa4 --page-size 16`
+- Decode graph flags: `--cuda-graph-max-bs-decode 1 --cuda-graph-backend-decode full`
+- Harness: `jetspec/bench_paper_sglang.py`, first 5 samples per dataset, greedy `temperature=0`, `top_p=1.0`, `max_new_tokens=2048`
+
+Implemented:
+- `build_tree_from_topk_cpu(..., score_mode="top2gap")` computes per-depth fanout caps from the rank-1/rank-2 logprob gap: `round(width * sigmoid(-beta * (gap - g0)))`, clamped to at least 1.
+- The breadth-first and depth-first CPU tree builders now honor explicit `fanout_caps`.
+- Server args and speculative arg validation expose `--speculative-dflash-tree-draft top2gap`, `--speculative-dflash-top2gap-beta`, and `--speculative-dflash-top2gap-g0`.
+- `jetspec/bench_paper_sglang.py` records `tree_draft`, top2gap params, and mean root-inclusive tree node count from scheduler internal state.
+
+Artifacts:
+
+| dataset | config | lossless gate | accept len | tok/s | ms/step | mean tree nodes | artifact |
+|---|---|---|---:|---:|---:|---:|---|
+| GSM8K | width=1 oracle | oracle | 5.33 | 854.93 | 6.24 | n/a | `jetspec/runs/top2gap_job1_oracle_gate_gsm8k_w1_31965.json` |
+| GSM8K | top2gap w4/b64 beta=1.0 g0=1.0 | pass 5/5 | 6.56 | 351.82 | 18.66 | 57.54 | `jetspec/runs/top2gap_job1_gate_gsm8k_tree_w4_b64_beta1_g01_31966.json` |
+| MATH-500 | width=1 oracle | oracle | 7.71 | 1224.58 | 6.30 | n/a | `jetspec/runs/top2gap_job1_oracle_gate_math500_w1_31965.json` |
+| MATH-500 | top2gap w4/b64 beta=1.0 g0=1.0 | pass 5/5 | 9.18 | 479.81 | 19.14 | 50.45 | `jetspec/runs/top2gap_job1_gate_math500_tree_w4_b64_beta1_g01_31966.json` |
+
+Status:
+- Job 1 losslessness gate passed. The construction change is shape-only for verify/commit correctness, and the fresh flushed oracle check confirmed token-exact outputs on both datasets.
+- Next: run the requested beta/g0/budget/width sweep to find whether a lean top2gap tree can beat linear DFlash throughput.
 
 ## Paper Dataset Benchmark - GSM8K and MATH-500
 

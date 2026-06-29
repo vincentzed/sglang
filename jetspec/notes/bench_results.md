@@ -1,6 +1,6 @@
 # JetSpec DFlash live GPU validation
 
-Date: 2026-06-28 UTC
+Date: 2026-06-29 UTC
 
 Hardware/env:
 - GPU: `CUDA_VISIBLE_DEVICES=7` (`NVIDIA B300 SXM6 AC`, SM100, 275 GB)
@@ -8,6 +8,35 @@ Hardware/env:
 - Repo/env: local develop install, `python -m sglang.launch_server`, `PYTHONPATH=python`
 - Decode settings: BF16/default dtype, greedy `temperature=0`, `--tp-size 1`, `max_new_tokens=96`
 - Harness: `jetspec/run_fixed_prompts.py`, 10 fixed prompts including GSM-style arithmetic, sequence, code, translation, and summary prompts.
+
+## Top2gap construction Job 1 - fresh oracle losslessness gate
+
+Date/time: 2026-06-29 03:16-03:22 UTC.
+
+Landed change:
+- Add `speculative_dflash_tree_draft=top2gap` as an opt-in tree construction mode.
+- Compute per-depth fanout caps from the draft top-2 logprob gap with `round(width * sigmoid(-beta * (gap - g0)))`, clamped to at least 1.
+- Route the caps through the existing `build_tree_from_topk_cpu(..., fanout_caps=...)` plumbing and keep the default `accum_logp` construction unchanged.
+- Add node-count stats (`avg_dflash_tree_num_nodes`) to scheduler internal state and have `jetspec/bench_paper_sglang.py` record the measured delta per run.
+
+Mode:
+- Servers used `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`, `PYTHONPATH=python`, `--attention-backend fa4 --page-size 16`, `--max-running-requests 1`, `--cuda-graph-max-bs-decode 1`, and `--cuda-graph-backend-decode full`.
+- Losslessness gate used fresh flushed width=1 DFlash oracle artifacts, first 5 prompts from each paper dataset, greedy `temperature=0`, `top_p=1.0`, `max_new_tokens=2048`.
+- Top2gap gate config: width 4, budget 64, beta 1.0, g0 1.0.
+
+Results:
+
+| Dataset | Config | Lossless gate | Accept len | Tok/s | Steps/s | ms/step | Mean tree nodes | Artifact |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| GSM8K | width=1 oracle | oracle | 5.33 | 854.93 | 160.26 | 6.24 | n/a | `jetspec/runs/top2gap_job1_oracle_gate_gsm8k_w1_31965.json` |
+| GSM8K | top2gap w4/b64 beta=1.0 g0=1.0 | pass 5/5 | 6.56 | 351.82 | 53.63 | 18.66 | 57.54 | `jetspec/runs/top2gap_job1_gate_gsm8k_tree_w4_b64_beta1_g01_31966.json` |
+| MATH-500 | width=1 oracle | oracle | 7.71 | 1224.58 | 158.83 | 6.30 | n/a | `jetspec/runs/top2gap_job1_oracle_gate_math500_w1_31965.json` |
+| MATH-500 | top2gap w4/b64 beta=1.0 g0=1.0 | pass 5/5 | 9.18 | 479.81 | 52.25 | 19.14 | 50.45 | `jetspec/runs/top2gap_job1_gate_math500_tree_w4_b64_beta1_g01_31966.json` |
+
+Gate verdict:
+- PASS: both top2gap artifacts have `losslessness.token_exact=true` and zero mismatches against the fresh flushed FA4 page16 width=1 oracle.
+- The shape lever is active: first-5 accept length improves over the oracle on both datasets while using fewer than the full 64 root-inclusive nodes on average.
+- Throughput still trails linear on this single representative gate; Job 2 must sweep beta/g0/budget/width to look for the best lean-tree point.
 
 ## Profile-guided Job 1 - decode baseline hotspots
 

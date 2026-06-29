@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import math
 from typing import Iterable, Optional
 
 import msgspec
@@ -187,6 +188,46 @@ def batch_topk_to_cpu(logits: torch.Tensor, k: int) -> tuple[list, list, list]:
     return log_probs.tolist(), topk_logprobs.tolist(), topk_tokens.tolist()
 
 
+def _top2gap_sigmoid_cap(
+    gap: float,
+    width: int,
+    *,
+    beta: float,
+    g_0: float,
+) -> int:
+    arg = -float(beta) * (float(gap) - float(g_0))
+    if arg >= 0:
+        sigmoid = 1.0 / (1.0 + math.exp(-arg))
+    else:
+        exp_arg = math.exp(arg)
+        sigmoid = exp_arg / (1.0 + exp_arg)
+    return max(1, int(round(int(width) * sigmoid)))
+
+
+def top2gap_fanout_caps(
+    topk_logprobs_cpu: list[list[float]],
+    *,
+    beta: float = 1.0,
+    g_0: float = 1.0,
+) -> list[int]:
+    if not topk_logprobs_cpu:
+        return []
+
+    width = len(topk_logprobs_cpu[0])
+    if width < 2:
+        return [1] * len(topk_logprobs_cpu)
+
+    return [
+        _top2gap_sigmoid_cap(
+            float(row[0]) - float(row[1]),
+            width,
+            beta=beta,
+            g_0=g_0,
+        )
+        for row in topk_logprobs_cpu
+    ]
+
+
 def _build_tree_breadth_first(
     root_token: int,
     topk_tokens_cpu: list[list[int]],
@@ -215,7 +256,11 @@ def _build_tree_breadth_first(
         if depth >= depth_count:
             continue
 
-        fanout_cap = fanout_caps[depth] if fanout_caps is not None else width
+        fanout_cap = (
+            fanout_caps[depth]
+            if fanout_caps is not None and depth < len(fanout_caps)
+            else width
+        )
         children_to_add = min(fanout_cap, width, int(budget) - num_nodes)
         row_tokens = topk_tokens_cpu[depth]
         row_logprobs = topk_logprobs_cpu[depth]
@@ -309,7 +354,11 @@ def _build_tree_depth_first(
         if depth >= depth_count:
             continue
         start_child = 1 if node_idx in spine_set else 0
-        fanout_cap = fanout_caps[depth] if fanout_caps is not None else width
+        fanout_cap = (
+            fanout_caps[depth]
+            if fanout_caps is not None and depth < len(fanout_caps)
+            else width
+        )
         children_to_add = min(
             max(fanout_cap - start_child, 0),
             width - start_child,
@@ -362,11 +411,14 @@ def _build_tree_cpu(
     score_mode: str = "accum_logp",
     per_depth_entropy: Optional[list[float]] = None,
     hybrid_alpha: float = 1.0,
+    fanout_caps: Optional[list[int]] = None,
+    top2gap_beta: float = 1.0,
+    top2gap_g_0: float = 1.0,
 ) -> DraftTreeCPU:
-    if score_mode not in ("accum_logp", "entropy", "hybrid"):
+    if score_mode not in ("accum_logp", "entropy", "hybrid", "top2gap"):
         raise ValueError(
             "DFlash tree v1 supports score_mode in "
-            f"('accum_logp', 'entropy', 'hybrid'), got {score_mode!r}."
+            f"('accum_logp', 'entropy', 'hybrid', 'top2gap'), got {score_mode!r}."
         )
     if len(topk_tokens_cpu) != len(topk_logprobs_cpu):
         raise ValueError(
@@ -390,6 +442,27 @@ def _build_tree_cpu(
                 f"logprobs={len(logprobs)}."
             )
 
+    if fanout_caps is not None:
+        for depth, cap in enumerate(fanout_caps):
+            if int(cap) <= 0:
+                raise ValueError(
+                    "DFlash tree fanout caps must be positive. "
+                    f"depth={depth}, cap={cap}."
+                )
+
+    if score_mode == "top2gap":
+        if fanout_caps is not None:
+            raise ValueError(
+                "score_mode='top2gap' computes fanout caps from top-k logprobs; "
+                "do not also pass fanout_caps."
+            )
+        fanout_caps = top2gap_fanout_caps(
+            topk_logprobs_cpu,
+            beta=top2gap_beta,
+            g_0=top2gap_g_0,
+        )
+        score_mode = "accum_logp"
+
     builder = _build_tree_depth_first if depth_first else _build_tree_breadth_first
     return builder(
         root_token,
@@ -399,6 +472,7 @@ def _build_tree_cpu(
         score_mode=score_mode,
         per_depth_entropy=per_depth_entropy,
         hybrid_alpha=hybrid_alpha,
+        fanout_caps=fanout_caps,
     )
 
 
@@ -412,6 +486,9 @@ def build_tree_from_topk_cpu(
     score_mode: str = "accum_logp",
     per_depth_entropy: Optional[list[float]] = None,
     hybrid_alpha: float = 1.0,
+    fanout_caps: Optional[list[int]] = None,
+    top2gap_beta: float = 1.0,
+    top2gap_g_0: float = 1.0,
 ) -> DraftTreeCPU:
     tokens_cpu = (
         topk_tokens.tolist() if isinstance(topk_tokens, torch.Tensor) else topk_tokens
@@ -430,6 +507,9 @@ def build_tree_from_topk_cpu(
         score_mode=score_mode,
         per_depth_entropy=per_depth_entropy,
         hybrid_alpha=hybrid_alpha,
+        fanout_caps=fanout_caps,
+        top2gap_beta=top2gap_beta,
+        top2gap_g_0=top2gap_g_0,
     )
 
 
@@ -444,6 +524,9 @@ def build_tree_from_topk(
     score_mode: str = "accum_logp",
     per_depth_entropy: Optional[list[float]] = None,
     hybrid_alpha: float = 1.0,
+    fanout_caps: Optional[list[int]] = None,
+    top2gap_beta: float = 1.0,
+    top2gap_g_0: float = 1.0,
 ) -> DraftTree:
     return build_tree_from_topk_cpu(
         root_token,
@@ -454,6 +537,9 @@ def build_tree_from_topk(
         score_mode=score_mode,
         per_depth_entropy=per_depth_entropy,
         hybrid_alpha=hybrid_alpha,
+        fanout_caps=fanout_caps,
+        top2gap_beta=top2gap_beta,
+        top2gap_g_0=top2gap_g_0,
     ).to_gpu(device)
 
 

@@ -207,8 +207,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             else compute_tree_budget(self.block_size, self.tree_width)
         )
         self.tree_draft = str(server_args.speculative_dflash_tree_draft)
+        self.tree_top2gap_beta = float(server_args.speculative_dflash_top2gap_beta)
+        self.tree_top2gap_g_0 = float(server_args.speculative_dflash_top2gap_g0)
         self.dflash_head_type = str(server_args.speculative_dflash_head_type)
         self.use_tree_draft = self.tree_width > 1
+        self._dflash_tree_num_nodes_total = 0
+        self._dflash_tree_build_ct = 0
         self._tree_verify_attn_backend = None
         self._tree_verify_full_attn_backend = None
         self._checked_tree_verify_attn_backend = False
@@ -241,10 +245,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self.use_compact_draft_cache,
             )
             logger.info(
-                "DFLASH tree config. width=%s, budget=%s, draft=%s, head_type=%s, causal_head=%s",
+                "DFLASH tree config. width=%s, budget=%s, draft=%s, top2gap_beta=%s, top2gap_g0=%s, head_type=%s, causal_head=%s",
                 self.tree_width,
                 self.tree_budget,
                 self.tree_draft,
+                self.tree_top2gap_beta,
+                self.tree_top2gap_g_0,
                 self.dflash_head_type,
                 self.dflash_causal_head,
             )
@@ -953,7 +959,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         # sliding-window path, the draft req->token view is rebuilt from committed
         # target state before each draft forward, so there is nothing persistent
         # to flush here.
-        pass
+        self._dflash_tree_num_nodes_total = 0
+        self._dflash_tree_build_ct = 0
+
+    def get_dflash_tree_node_stats(self) -> dict[str, float | int]:
+        build_ct = int(self._dflash_tree_build_ct)
+        total_nodes = int(self._dflash_tree_num_nodes_total)
+        return {
+            "dflash_tree_build_ct": build_ct,
+            "dflash_tree_num_nodes_total": total_nodes,
+            "avg_dflash_tree_num_nodes": (
+                total_nodes / build_ct if build_ct > 0 else 0.0
+            ),
+        }
 
     def _gather_req_to_token_masked(
         self,
@@ -2076,9 +2094,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 tree_budget,
                 depth_first=False,
                 score_mode=self.tree_draft,
+                top2gap_beta=self.tree_top2gap_beta,
+                top2gap_g_0=self.tree_top2gap_g_0,
             )
             num_nodes = int(tree.num_nodes)
             num_real_nodes.append(num_nodes)
+            self._dflash_tree_num_nodes_total += num_nodes
+            self._dflash_tree_build_ct += 1
             token_row = torch.tensor(tree.token_ids, dtype=torch.long, device=device)
             parent_row = torch.tensor(
                 tree.parent_indices, dtype=torch.long, device=device

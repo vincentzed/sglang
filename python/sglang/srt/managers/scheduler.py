@@ -3746,6 +3746,12 @@ class Scheduler(
                 self.metrics_reporter.spec_total_num_accept_tokens
                 / self.metrics_reporter.spec_total_num_forward_ct
             )
+        if self.draft_worker is not None:
+            tree_node_stats_fn = getattr(
+                self.draft_worker, "get_dflash_tree_node_stats", None
+            )
+            if callable(tree_node_stats_fn):
+                ret.update(tree_node_stats_fn())
 
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
