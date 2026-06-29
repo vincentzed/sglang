@@ -51,6 +51,48 @@ Verdict:
 - FAIL for final goal: tree is still below linear. Same-run ratios are `0.83x` GSM8K and `0.75x` MATH-500; against the prior faster linear bars (`1152.85` GSM8K, `1505.24` MATH-500), tree is `0.67x` and `0.60x`.
 - Component A remains the main blocker. The JetSpec reference paged-tree kernel cannot be copied directly because it lacks the FA4 `softcap` behavior and casts softmax probabilities to V dtype before the V matmul; a landed replacement must preserve FA4 numerical behavior.
 
+## Compact metadata follow-up
+
+Date/time: 2026-06-29 05:35-05:42 UTC.
+
+Question:
+- How much of the residual post-B/C overhead is small metadata materialization in the compact FA4 path?
+
+Mode:
+- Component B follow-up only; no attention-kernel or acceptance-policy change.
+- Bulk-copy root/top-k inputs to the CPU tree builder instead of per-row `.item()` and per-row `.tolist()` syncs.
+- Stage tree token/parent/depth rows on CPU and copy each full tensor to GPU once.
+- Build compact sequence lengths directly on CPU, gather each row's tree-path KV slots once, and fill one preallocated compact KV-index tensor instead of allocating per-node path tensors and per-node `torch.cat` outputs.
+- Servers used `CUDA_VISIBLE_DEVICES=7`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`, `PYTHONPATH=python`, `--attention-backend fa4 --page-size 16`, `--max-running-requests 1`, `--cuda-graph-max-bs-decode 1`, and `--cuda-graph-backend-decode full`.
+- Target `Qwen/Qwen3-8B`, draft `JetSpec/jetspec-qwen3-8b`, greedy `temperature=0`, `top_p=1.0`, `max_new_tokens=2048`.
+- Harness: `jetspec/run_dflash_gate_bench.sh all`.
+- Summary artifact: `jetspec/runs/dflash_gate_bench_component_meta2_20260629_053534/summary.ndjson`.
+
+Fresh same-run results:
+
+| Dataset | Config | Accept len | Tok/s | ms/step | Mean nodes | Exact | vs same-run linear | vs prior linear bar | Artifact |
+|---|---|---:|---:|---:|---:|---|---:|---:|---|
+| GSM8K | linear w1 FA4 page16 | 5.85 | 936.66 | 6.24 | n/a | PASS | 1.00x | 0.81x | `jetspec/runs/dflash_gate_bench_component_meta2_20260629_053534/bench_gsm8k_linear_w1_fa4p16.json` |
+| GSM8K | top2gap w8/b16 beta=1.0 g0=1.0 | 6.45 | 803.95 | 8.02 | 16.00 | PASS | 0.86x | 0.70x | `jetspec/runs/dflash_gate_bench_component_meta2_20260629_053534/bench_gsm8k_top2gap_w8_b16_beta1p0_g01p0.json` |
+| MATH-500 | linear w1 FA4 page16 | 7.62 | 1204.29 | 6.33 | n/a | PASS | 1.00x | 0.80x | `jetspec/runs/dflash_gate_bench_component_meta2_20260629_053534/bench_math500_linear_w1_fa4p16.json` |
+| MATH-500 | top2gap w8/b16 beta=1.0 g0=1.0 | 7.90 | 937.56 | 8.43 | 16.00 | PASS | 0.78x | 0.62x | `jetspec/runs/dflash_gate_bench_component_meta2_20260629_053534/bench_math500_top2gap_w8_b16_beta1p0_g01p0.json` |
+
+Before/after against the Component B/C commit:
+
+| Dataset | B/C tok/s | New tok/s | B/C ms/step | New ms/step | Step-time delta | Prior artifact |
+|---|---:|---:|---:|---:|---:|---|
+| GSM8K | 775.72 | 803.95 | 8.31 | 8.02 | -3.5% | `jetspec/runs/dflash_gate_bench_component_bc_20260629_051037/bench_gsm8k_top2gap_w8_b16_beta1p0_g01p0.json` |
+| MATH-500 | 908.35 | 937.56 | 8.70 | 8.43 | -3.1% | `jetspec/runs/dflash_gate_bench_component_bc_20260629_051037/bench_math500_top2gap_w8_b16_beta1p0_g01p0.json` |
+
+Losslessness:
+- Fresh flushed gate rows and full benchmark rows report `losslessness.token_exact=true` with zero mismatches for both datasets.
+- The tree node count remains exactly `16.00`, so the speedup is metadata-path reduction rather than accepting fewer nodes.
+
+Verdict:
+- LAND for the compact metadata follow-up: the same b16 tree path improved again while preserving FA4 compact verifier numerics.
+- FAIL for final goal: tree is still below linear. Same-run ratios are `0.86x` GSM8K and `0.78x` MATH-500; against the prior faster linear bars, tree is `0.70x` and `0.62x`.
+- The remaining gap needs the Component A paged-tree verifier or an equivalent way to stop repeated compact-prefix K/V gathers without changing FA4 softcap/probability math.
+
 ## Lean top2gap sweep - paper datasets
 
 Date/time: 2026-06-29 04:09-04:43 UTC.

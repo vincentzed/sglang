@@ -2081,16 +2081,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         if depth_count > 0:
             linear_draft_tokens[:, 1:].copy_(topk_tokens[:, :, 0])
 
-        tree_tokens = torch.zeros((bs, tree_budget), dtype=torch.long, device=device)
-        tree_parents = torch.zeros((bs, tree_budget), dtype=torch.long, device=device)
-        tree_depths = torch.ones((bs, tree_budget), dtype=torch.long, device=device)
+        tree_tokens_cpu = torch.zeros((bs, tree_budget), dtype=torch.long)
+        tree_parents_cpu = torch.zeros((bs, tree_budget), dtype=torch.long)
+        tree_depths_cpu = torch.ones((bs, tree_budget), dtype=torch.long)
+        root_tokens_cpu = block_ids[:, 0].to(device="cpu").tolist()
+        topk_tokens_cpu = topk_tokens.to(device="cpu").tolist()
+        topk_logprobs_cpu = topk_logprobs.to(device="cpu").tolist()
         num_real_nodes: list[int] = []
-        tree_parent_rows: list[torch.Tensor] = []
         for i in range(bs):
             tree: DraftTreeCPU = build_tree_from_topk_cpu(
-                int(block_ids[i, 0].item()),
-                topk_tokens[i],
-                topk_logprobs[i],
+                int(root_tokens_cpu[i]),
+                topk_tokens_cpu[i],
+                topk_logprobs_cpu[i],
                 tree_budget,
                 depth_first=False,
                 score_mode=self.tree_draft,
@@ -2101,15 +2103,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             num_real_nodes.append(num_nodes)
             self._dflash_tree_num_nodes_total += num_nodes
             self._dflash_tree_build_ct += 1
-            token_row = torch.tensor(tree.token_ids, dtype=torch.long, device=device)
-            parent_row = torch.tensor(
-                tree.parent_indices, dtype=torch.long, device=device
+            tree_tokens_cpu[i, :num_nodes] = torch.tensor(
+                tree.token_ids, dtype=torch.long
             )
-            depth_row = torch.tensor(tree.depths, dtype=torch.long, device=device)
-            tree_tokens[i, :num_nodes].copy_(token_row)
-            tree_parents[i, :num_nodes].copy_(parent_row)
-            tree_depths[i, :num_nodes].copy_(depth_row)
-            tree_parent_rows.append(tree_parents[i])
+            tree_parents_cpu[i, :num_nodes] = torch.tensor(
+                tree.parent_indices, dtype=torch.long
+            )
+            tree_depths_cpu[i, :num_nodes] = torch.tensor(tree.depths, dtype=torch.long)
+
+        tree_tokens = tree_tokens_cpu.to(device=device, non_blocking=True)
+        tree_parents = tree_parents_cpu.to(device=device, non_blocking=True)
+        tree_depths = tree_depths_cpu.to(device=device, non_blocking=True)
+        tree_parent_rows = [tree_parents[i] for i in range(bs)]
 
         tree_positions_2d = prefix_lens.to(torch.int64).unsqueeze(1) + tree_depths
         tree_cache_loc = assign_extend_cache_locs_func(
@@ -2338,13 +2343,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                         )
         elif use_compact_tree_verify:
             req_to_token = self.model_runner.req_to_token_pool.req_to_token
-            compact_parts: list[torch.Tensor] = []
             compact_lens: list[int] = []
+            compact_path_lens_by_row: list[list[int]] = []
+            compact_path_flat_by_row: list[list[int]] = []
+            req_pool_indices_cpu = model_worker_batch.req_pool_indices.to(device="cpu")
+            prefix_lens_cpu = prefix_lens.to(device="cpu", dtype=torch.int32)
             for row in range(bs):
-                req_row = int(model_worker_batch.req_pool_indices[row].item())
-                prefix_len = int(prefix_lens[row].item())
-                prefix_locs = req_to_token[req_row, :prefix_len].to(torch.int32)
-                parents = tree_parents[row, : num_real_nodes[row]].tolist()
+                prefix_len = int(prefix_lens_cpu[row])
+                parents = tree_parents_cpu[row, : num_real_nodes[row]].tolist()
+                row_path_lens: list[int] = []
+                row_path_flat: list[int] = []
                 for node in range(tree_budget):
                     if node < num_real_nodes[row]:
                         path: list[int] = []
@@ -2353,27 +2361,50 @@ class DFlashWorkerV2(BaseSpecWorker):
                             path.append(cur)
                             cur = int(parents[cur])
                         path.reverse()
-                        path_locs = tree_cache_loc_2d[
-                            row,
-                            torch.tensor(path, dtype=torch.long, device=device),
-                        ].to(torch.int32)
                     else:
-                        path_locs = tree_cache_loc_2d[row, node : node + 1].to(
-                            torch.int32
-                        )
-                    compact_parts.append(torch.cat((prefix_locs, path_locs), dim=0))
-                    compact_lens.append(prefix_len + int(path_locs.numel()))
+                        path = [node]
+                    row_path_lens.append(len(path))
+                    row_path_flat.extend(path)
+                    compact_lens.append(prefix_len + len(path))
+                compact_path_lens_by_row.append(row_path_lens)
+                compact_path_flat_by_row.append(row_path_flat)
 
+            compact_seq_lens_cpu = torch.tensor(compact_lens, dtype=torch.int32)
             compact_seq_lens = torch.tensor(
                 compact_lens, dtype=torch.int32, device=device
             )
-            compact_seq_lens_cpu = compact_seq_lens.to(device="cpu")
             compact_kv_indptr = torch.empty(
                 (bs * tree_budget + 1,), dtype=torch.int32, device=device
             )
             compact_kv_indptr[0] = 0
             compact_kv_indptr[1:] = torch.cumsum(compact_seq_lens, dim=0)
-            compact_kv_indices = torch.cat(compact_parts, dim=0)
+            compact_kv_indices = torch.empty(
+                int(compact_seq_lens_cpu.sum().item()), dtype=torch.int32, device=device
+            )
+            kv_offset = 0
+            for row in range(bs):
+                req_row = int(req_pool_indices_cpu[row])
+                prefix_len = int(prefix_lens_cpu[row])
+                prefix_locs = req_to_token[req_row, :prefix_len].to(torch.int32)
+                path_flat = compact_path_flat_by_row[row]
+                path_flat_indices = torch.tensor(
+                    path_flat, dtype=torch.long, device=device
+                )
+                path_locs_flat = tree_cache_loc_2d[row].index_select(
+                    0, path_flat_indices
+                ).to(torch.int32)
+                path_offset = 0
+                for path_len in compact_path_lens_by_row[row]:
+                    if prefix_len > 0:
+                        compact_kv_indices[kv_offset : kv_offset + prefix_len].copy_(
+                            prefix_locs
+                        )
+                    kv_offset += prefix_len
+                    compact_kv_indices[kv_offset : kv_offset + path_len].copy_(
+                        path_locs_flat[path_offset : path_offset + path_len]
+                    )
+                    path_offset += path_len
+                    kv_offset += path_len
             compact_qo_indptr = torch.arange(
                 0, bs * tree_budget + 1, dtype=torch.int32, device=device
             )
