@@ -1,6 +1,44 @@
 # DFlash Tree Speculative Decode Status
 
-Updated: 2026-06-29 22:35 UTC
+Updated: 2026-06-29 22:47 UTC
+
+## Urgent AR-Oracle Re-Gate
+
+Question:
+- The previous paged-tree failure was measured against the width=1 linear DFlash oracle. This re-gate measures all candidates against true AR greedy decode instead.
+
+Environment and artifacts:
+- Branch/head under investigation: `jetspec-tree-draft` at `cbbf89dd85`.
+- GPU: `CUDA_VISIBLE_DEVICES=4` because GPU 0 was already occupied.
+- Target: `Qwen/Qwen3-8B`; draft: `JetSpec/jetspec-qwen3-8b`.
+- Dataset: first 5 GSM8K gate prompts from `jetspec/bench_paper_sglang.py`, greedy `temperature=0`, `top_p=1.0`, `max_new_tokens=2048`, `--flush-cache-between-prompts`, no warmup.
+- DFlash rows used FA4 page16 with normal decode graph. The true AR row used no speculative algorithm, FA4 page16, and decode graph disabled to avoid the no-spec FA4 graph init bug. Launch note: no-spec FA4 is otherwise auto-forced to page128 on this branch, so the AR launch passed `--speculative-eagle-topk 2` only to preserve page16; artifact `server_info` confirms `speculative_algorithm=None`, `page_size=16`, `speculative_eagle_topk=2`.
+- Artifact dir: `jetspec/runs/urgent_ar_oracle_20260629_223803`; summary table: `jetspec/runs/urgent_ar_oracle_20260629_223803/summary_vs_true_ar.json`.
+- Driver: `scratch/run_urgent_ar_oracle_compare.sh`.
+
+Results versus true AR greedy:
+
+| config | exact vs AR | mismatched prompts | first-diff samples | token-diff count | accept | gate tok/s | artifact |
+|---|---|---:|---|---:|---:|---:|---|
+| linear DFlash w1 | FAIL | 3/5 | `0@75`, `1@122`, `4@22` | 570 | 5.335 | 1068.78 | `gate_gsm8k_linear_w1_vs_true_ar.json` |
+| compact tree top2gap w8/b16 | FAIL | 3/5 | `0@75`, `1@122`, `4@22` | 570 | 6.199 | 964.75 | `gate_gsm8k_compact_tree_w8_b16_vs_true_ar.json` |
+| paged tree top2gap w8/b16 | FAIL | 2/5 | `0@8`, `1@49` | 353 | 6.183 | 887.44 | `gate_gsm8k_paged_tree_w8_b16_vs_true_ar.json` |
+
+Per-sample exactness:
+
+| sample | linear w1 | compact tree | paged tree |
+|---:|---|---|---|
+| 0 | FAIL, first diff 75 | FAIL, first diff 75 | FAIL, first diff 8 |
+| 1 | FAIL, first diff 122 | FAIL, first diff 122 | FAIL, first diff 49 |
+| 2 | PASS | PASS | PASS |
+| 3 | PASS | PASS | PASS |
+| 4 | FAIL, first diff 22 | FAIL, first diff 22 | PASS |
+
+Interpretation:
+- Neither compact tree nor paged tree is token-exact to true AR greedy on this gate. Strict losslessness is kernel-relative here, not absolute across different FA4/verify execution shapes.
+- Paged tree is closer to true AR than compact/linear on this set: `2/5` prompt mismatches and `353` token diffs versus `3/5` and `570` for both width=1 linear DFlash and compact tree.
+- This is not the win path because paged tree still differs from true AR on samples 0 and 1. No full GSM8K/MATH-500 tree-paged benchmark was run or accepted.
+- Practical verdict: paged-tree verify remains default-off as a strict-lossless feature. The old "linear DFlash oracle" is also not a true AR oracle for these prompts, so future wording should distinguish "lossless vs linear DFlash / compact verifier" from "lossless vs true AR greedy."
 
 ## Urgent Paged-Tree A/B Result
 

@@ -1094,3 +1094,41 @@ Blocked full benchmark:
 - `CUDA_VISIBLE_DEVICES=7 python -c 'torch.cuda.mem_get_info()'` reported about `1.07 GiB` free.
 - A targeted `nvidia-smi --gpu-reset -i 7` was refused with "In use by another client".
 - Because of that device state, the fresh flushed GSM8K/MATH-500 token oracle and `jetspec/bench_paper_sglang.py` before/after table remain pending.
+
+## 2026-06-29 AR-greedy oracle re-gate
+
+Question:
+- The first paged-tree serving gate compared paged tree to the width=1 linear DFlash oracle. This re-gate compares linear, compact tree, and paged tree directly to true AR greedy decode on the same first-5 GSM8K gate prompts.
+
+Mode:
+- Branch/head: `jetspec-tree-draft` at `cbbf89dd85`.
+- GPU: `CUDA_VISIBLE_DEVICES=4` because GPU 0 was occupied when the urgent run started.
+- Target/draft: `Qwen/Qwen3-8B` / `JetSpec/jetspec-qwen3-8b`.
+- Harness: `jetspec/bench_paper_sglang.py`, `--dataset gsm8k --num-samples 5 --warmup-samples 0 --flush-cache-before-run --flush-cache-between-prompts --max-new-tokens 2048`.
+- DFlash rows used `--attention-backend fa4 --page-size 16`, `--cuda-graph-max-bs-decode 1`, and `--cuda-graph-backend-decode full`.
+- The AR row used `speculative_algorithm=None`, FA4 page16, and disabled decode CUDA graph. On this branch no-spec FA4 page16 is auto-forced to page128 unless `speculative_eagle_topk > 1`, so the launch passed `--speculative-eagle-topk 2` only to keep page16. The AR artifact's `server_info` confirms `speculative_algorithm=None`, `page_size=16`, and `speculative_eagle_topk=2`.
+- Artifacts: `jetspec/runs/urgent_ar_oracle_20260629_223803/`; summary: `summary_vs_true_ar.json`.
+
+Results versus true AR greedy:
+
+| Config | Exact vs AR | Mismatched prompts | First diffs | Token-diff count | Accept len | Gate tok/s | Artifact |
+|---|---|---:|---|---:|---:|---:|---|
+| linear DFlash w1 | FAIL | 3/5 | `0@75`, `1@122`, `4@22` | 570 | 5.335 | 1068.78 | `gate_gsm8k_linear_w1_vs_true_ar.json` |
+| compact tree top2gap w8/b16 | FAIL | 3/5 | `0@75`, `1@122`, `4@22` | 570 | 6.199 | 964.75 | `gate_gsm8k_compact_tree_w8_b16_vs_true_ar.json` |
+| paged tree top2gap w8/b16 | FAIL | 2/5 | `0@8`, `1@49` | 353 | 6.183 | 887.44 | `gate_gsm8k_paged_tree_w8_b16_vs_true_ar.json` |
+
+Per-sample exactness:
+
+| Sample | linear DFlash w1 | compact tree | paged tree |
+|---:|---|---|---|
+| 0 | FAIL, first diff 75 | FAIL, first diff 75 | FAIL, first diff 8 |
+| 1 | FAIL, first diff 122 | FAIL, first diff 122 | FAIL, first diff 49 |
+| 2 | PASS | PASS | PASS |
+| 3 | PASS | PASS | PASS |
+| 4 | FAIL, first diff 22 | FAIL, first diff 22 | PASS |
+
+Verdict:
+- This is the "neither compact nor paged exactly equals true AR" branch of the decision tree.
+- Paged tree is closer to true AR than the compact/linear path on this small gate (`2/5`, 353 token diffs versus `3/5`, 570 token diffs), and it fixes sample 4 relative to compact/linear.
+- It is not a win because paged tree still mismatches true AR on samples 0 and 1. No full GSM8K/MATH-500 tree-paged benchmark was run or accepted.
+- Strict "losslessness" for this path is kernel-relative. The width=1 linear DFlash/compact verifier oracle is not identical to true AR greedy on the same FA4 page16 gate prompts.
