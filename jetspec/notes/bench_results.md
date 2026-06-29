@@ -134,6 +134,12 @@ Verdict:
 - FAIL for final goal: tree is still below linear. Same-run ratios are `0.87x` GSM8K and `0.79x` MATH-500; against the prior faster linear bars, tree is `0.71x` and `0.63x`.
 - Remaining gap is too large for accept/commit cleanup alone; the compact FA4 verifier still repeats prefix K/V materialization per node.
 
+Residual profile:
+- Artifact: `jetspec/profiles/dflash_gate_bench_component_accept_kernel_profile_20260629_060426/top2gap_w8_b16_decode_analysis.txt`.
+- The accept walk is reduced to `~0.02-0.04 ms/call` (`verify_tree_greedy_func`), so the post-verify accept logic is no longer the main limiter.
+- Tree-only compact verifier costs remain: `vectorized_gather_kernel` is still `0.94 ms` over the captured decode profile, and `_forward_batch_generation_tree` DtoD copies remain visible at `0.47 ms` / 210 launches.
+- The explicit FA4 attention kernels are similar to or smaller than the linear profile; the remaining b16 gap is the compact FA4 verifier's per-node K/V materialization. The required next step is Component A: a paged-tree verifier that shares prefix KV while preserving FA4 softcap and fp32 softmax-probability accumulation before the V matmul.
+
 ## Lean top2gap sweep - paper datasets
 
 Date/time: 2026-06-29 04:09-04:43 UTC.

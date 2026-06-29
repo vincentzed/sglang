@@ -145,6 +145,13 @@ Status:
 - Performance: landed because it removes part of the post-verify torch accept walk without changing verifier math, accepted path semantics, or node count.
 - Verdict: still not linear. The remaining same-run per-step gap is `7.89 vs 6.24 ms` on GSM8K and `8.28 vs 6.32 ms` on MATH-500.
 
+Residual profile after this commit:
+- Artifact: `jetspec/profiles/dflash_gate_bench_component_accept_kernel_profile_20260629_060426/top2gap_w8_b16_decode_analysis.txt`
+- The tree accept walk is no longer a millisecond block: `verify_tree_greedy_func` is about `0.02-0.04 ms/call` in the trace.
+- Compact FA4 still pays tree-only K/V materialization costs: `vectorized_gather_kernel` remains `0.94 ms` over the captured decode window, and DtoD copies from `_forward_batch_generation_tree` remain visible (`0.47 ms`, 210 launches).
+- The explicit FA4 attention kernels are not larger than linear; the residual is the compact verifier machinery that repeats prefix/KV gather work to present one ragged FA4 row per node.
+- Hard wall: closing the remaining `~1.6-2.0 ms/step` gap needs Component A: a paged-tree verifier that shares prefix KV across nodes and stays FA4-numerically equivalent. It must honor `softcap=layer.logit_cap` and keep fp32 softmax-probability accumulation through the V matmul. The JetSpec reference kernel is not directly landable because it lacks those FA4-exact properties.
+
 ## Lean Top2gap Sweep - Paper Datasets
 
 Date/time: 2026-06-29 04:09-04:43 UTC.
