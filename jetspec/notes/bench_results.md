@@ -992,3 +992,39 @@ PYTHONPATH=python python jetspec/run_fixed_prompts.py \
   --compare-to jetspec/runs/moe_linear_zlab_31106.json \
   --health-timeout-s 1800 --request-timeout-s 600
 ```
+
+## 2026-06-29 FA4 paged-tree verifier pre-gate
+
+Scope:
+- Component 1 implementation is present as an opt-in dense FA4/page16 path via `SGLANG_DFLASH_TREE_PAGED_FA4_VERIFY=1`.
+- This entry records pre-gate evidence only. It is not a replacement for the required fresh flushed GSM8K/MATH-500 oracle and paper benchmark.
+
+Unit and backend validation:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1 PYTHONPATH=python \
+  python -m pytest test/registered/jit/test_dflash_paged_tree_verify.py -q -s
+```
+
+Result: 2 tests passed.
+
+What the tests cover:
+- Paged FA4 output is bit-identical to compact gather+FA4 for the same Q/K/V, paged prefix/tree layout, ancestor mask, and nonzero `softcap=5.0`: `max_abs_diff=0.0`, `mean_abs_diff=0.0`.
+- Disabling softcap changes the compact oracle, so the softcap assertion is live.
+- The tiny real backend path (`RadixAttention -> FlashAttentionBackend`) selects paged DFlash metadata and matches a softcapped bf16 reference.
+- The FA4 CUDA graph metadata path (`init_forward_metadata_out_graph(..., in_capture=True)` then `init_forward_metadata_in_graph(...)`) also matches the same reference.
+
+Isolated timing probe:
+
+Shape: `bs=16`, `tree_budget=16`, `prefix_len=256`, `page_size=16`, `hq=32`, `hkv=8`, `head_dim=128`, `softcap=5.0`.
+
+| path | mean ms/iter | max abs diff vs other path |
+|---|---:|---:|
+| compact `index_select` K/V + FA4 | 0.6212 | 0.0 |
+| paged FA4 + CUTE ancestor mask | 0.1728 | 0.0 |
+
+Blocked full benchmark:
+- GPU 7 was not usable for full model serving: `nvidia-smi -i 7` reported `272379 MiB / 275040 MiB` used, while `nvidia-smi --query-compute-apps`, `pmon`, and listener/process checks showed no visible SGLang owner.
+- `CUDA_VISIBLE_DEVICES=7 python -c 'torch.cuda.mem_get_info()'` reported about `1.07 GiB` free.
+- A targeted `nvidia-smi --gpu-reset -i 7` was refused with "In use by another client".
+- Because of that device state, the fresh flushed GSM8K/MATH-500 token oracle and `jetspec/bench_paper_sglang.py` before/after table remain pending.

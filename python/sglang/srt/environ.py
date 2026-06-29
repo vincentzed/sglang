@@ -689,6 +689,10 @@ class Envs:
     # extend_attention_fwd for unsupported cases or when set false (e.g. for
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
+    # Use FA4's native paged KV path plus a CUTE tree mask for dense DFlash
+    # tree verify. This removes compact per-node K/V gathers while keeping FA4
+    # softcap and P*V numerics.
+    SGLANG_DFLASH_TREE_PAGED_FA4_VERIFY = EnvBool(False)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.

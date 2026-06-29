@@ -790,3 +790,22 @@ Verdict:
 ## Not Started
 
 - MoE direct exact KV/GDN-state commit after accepted tree verify. The current MoE path remains lossless through the linear-commit fallback and has not been changed in this performance pass.
+
+## 2026-06-29 Component 1 FA4 Paged-Tree Verify
+
+Status:
+- Implemented an opt-in FA4 paged-tree verifier for dense DFlash tree verify behind `SGLANG_DFLASH_TREE_PAGED_FA4_VERIFY=1`.
+- The verifier uses FA4 CUTE `mask_mod` over the normal paged prefix plus tree-node suffix slots, so FA4 still owns softcap, softmax, and the P*V accumulation numerics.
+- The worker now builds request-level prefix lengths and a `[request, q_node, kv_node]` ancestor mask instead of compact per-row K/V indices for this path.
+- CUDA graph metadata plumbing is present for the paged path; graph replay uses static prefix-length and ancestor-mask buffers, with `SGLANG_DFLASH_TREE_PAGED_FA4_CUDA_GRAPH=0` available as a kill switch.
+
+Validation completed:
+- `CUDA_VISIBLE_DEVICES=7 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1 PYTHONPATH=python python -m pytest test/registered/jit/test_dflash_paged_tree_verify.py -q -s`
+- Result: 2 passed.
+- The isolated FA4 oracle test compares paged-tree FA4 against compact gather plus FA4 with nonzero `softcap=5.0`; observed `max_abs_diff=0.0`, `mean_abs_diff=0.0`.
+- The backend-path test runs `RadixAttention -> FlashAttentionBackend` with paged DFlash metadata, then repeats through `init_forward_metadata_out_graph(..., in_capture=True)` / `init_forward_metadata_in_graph(...)`; both match a softcapped reference within bf16 tolerance.
+- Isolated timing on GPU 7 with `bs=16`, `tree_budget=16`, `prefix_len=256`, `hq=32`, `hkv=8`, `head_dim=128`: compact gather+FA4 `0.6212 ms/iter`, paged FA4 `0.1728 ms/iter`, with `max_abs_diff=0.0`.
+
+Full gate status:
+- Fresh flushed GSM8K/MATH-500 oracle and `jetspec/bench_paper_sglang.py` runs were not completed in this pass because GPU 7 reported only about `1.1 GiB` free while `nvidia-smi`/`pmon` showed no compute owner; targeted `nvidia-smi --gpu-reset -i 7` was refused as "in use by another client".
+- The paged path remains default-off until the full flushed oracle and paper benchmark can be run on a usable GPU.

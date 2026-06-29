@@ -8,6 +8,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -2139,14 +2140,31 @@ class DFlashWorkerV2(BaseSpecWorker):
             type(active_target_attn_backend).__name__ == "FlashAttentionBackend"
             and getattr(active_target_attn_backend, "fa_impl_ver", None) == 4
         )
+        use_paged_tree_verify = bool(
+            use_compact_tree_verify
+            and envs.SGLANG_DFLASH_TREE_PAGED_FA4_VERIFY.get()
+            and type(active_target_attn_backend).__name__ == "FlashAttentionBackend"
+            and getattr(active_target_attn_backend, "fa_impl_ver", None) == 4
+            and int(getattr(active_target_attn_backend, "page_size", 1)) == 16
+            and target_model_runner.mambaish_config is None
+            and getattr(active_target_attn_backend, "linear_attn_backend", None) is None
+            and self._tree_verify_attn_backend is None
+        )
+        if use_paged_tree_verify:
+            use_compact_tree_verify = False
         use_flashinfer_expanded_causal_tree = (
             type(active_target_attn_backend).__name__ == "FlashInferAttnBackend"
             and self._tree_verify_attn_backend is None
             and not use_compact_tree_verify
+            and not use_paged_tree_verify
             and os.environ.get("SGLANG_DFLASH_TREE_EXPANDED_CAUSAL", "0") == "1"
         )
         needs_custom_mask = (
-            not (use_compact_tree_verify or use_flashinfer_expanded_causal_tree)
+            not (
+                use_compact_tree_verify
+                or use_paged_tree_verify
+                or use_flashinfer_expanded_causal_tree
+            )
             or os.environ.get("SGLANG_DFLASH_TREE_DUMP_ATTENDED_SET") is not None
         )
         custom_mask = (
@@ -2164,7 +2182,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_model_runner.mambaish_config is not None
             or getattr(active_target_attn_backend, "linear_attn_backend", None) is not None
             or self._tree_verify_attn_backend is not None
-            or not use_compact_tree_verify
+            or not (use_compact_tree_verify or use_paged_tree_verify)
         )
         retrieve_index = None
         retrieve_next_token = None
@@ -2187,6 +2205,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         compact_seq_lens = None
         compact_seq_lens_cpu = None
         compact_req_pool_indices = None
+        paged_tree_prefix_lens = None
+        paged_tree_ancestor_mask = None
+        paged_req_pool_indices = None
+        paged_seq_lens = None
+        paged_seq_lens_cpu = None
         expanded_tokens = None
         expanded_positions = None
         expanded_cache_loc = None
@@ -2341,6 +2364,32 @@ class DFlashWorkerV2(BaseSpecWorker):
                         ].copy_(
                             expanded_cache_loc_3d[row, node].to(req_to_token.dtype)
                         )
+        elif use_paged_tree_verify:
+            ancestor_mask_cpu = torch.zeros(
+                (bs, tree_budget, tree_budget), dtype=torch.int32
+            )
+            for row in range(bs):
+                parents = tree_parents_cpu[row, : num_real_nodes[row]].tolist()
+                for node in range(tree_budget):
+                    if node < num_real_nodes[row]:
+                        path: list[int] = []
+                        cur = node
+                        while cur >= 0:
+                            path.append(cur)
+                            cur = int(parents[cur])
+                        path.reverse()
+                    else:
+                        path = [node]
+                    ancestor_mask_cpu[row, node, path] = 1
+            paged_tree_prefix_lens = prefix_lens.to(torch.int32)
+            paged_tree_ancestor_mask = ancestor_mask_cpu.to(
+                device=device, non_blocking=True
+            )
+            paged_req_pool_indices = (
+                model_worker_batch.req_pool_indices.repeat_interleave(tree_budget)
+            )
+            paged_seq_lens = prefix_lens.repeat_interleave(tree_budget).to(torch.int32)
+            paged_seq_lens_cpu = paged_seq_lens.to(device="cpu", dtype=torch.int32)
         elif use_compact_tree_verify:
             req_to_token = self.model_runner.req_to_token_pool.req_to_token
             compact_lens: list[int] = []
@@ -2425,7 +2474,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_draft_token_num = (
             block_size
             if use_flashinfer_expanded_causal_tree
-            else (1 if use_compact_tree_verify else tree_budget)
+            else (1 if (use_compact_tree_verify or use_paged_tree_verify) else tree_budget)
         )
         compact_fa4_can_try_cuda_graph = bool(
             use_compact_tree_verify
@@ -2433,6 +2482,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             and getattr(
                 target_model_runner.decode_cuda_graph_runner,
                 "dflash_tree_compact_fa4_graph",
+                False,
+            )
+        )
+        paged_fa4_can_try_cuda_graph = bool(
+            use_paged_tree_verify
+            and target_model_runner.decode_cuda_graph_runner
+            and getattr(
+                target_model_runner.decode_cuda_graph_runner,
+                "dflash_tree_paged_fa4_graph",
                 False,
             )
         )
@@ -2448,7 +2506,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             custom_mask=(
                 None
-                if (use_compact_tree_verify or use_flashinfer_expanded_causal_tree)
+                if (
+                    use_compact_tree_verify
+                    or use_paged_tree_verify
+                    or use_flashinfer_expanded_causal_tree
+                )
                 else custom_mask
             ),
             retrieve_index=(
@@ -2472,13 +2534,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             max_tree_depth=block_size,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             allow_cuda_graph=(
-                compact_fa4_can_try_cuda_graph
+                paged_fa4_can_try_cuda_graph
+                if use_paged_tree_verify
+                else compact_fa4_can_try_cuda_graph
                 if use_compact_tree_verify
                 else True
             ),
             compact_kv_indices=compact_kv_indices,
             compact_kv_indptr=compact_kv_indptr,
             compact_qo_indptr=compact_qo_indptr,
+            paged_tree_prefix_lens=paged_tree_prefix_lens,
+            paged_tree_ancestor_mask=paged_tree_ancestor_mask,
             force_causal=use_flashinfer_expanded_causal_tree,
             mamba_cache_indices=(
                 expanded_mamba_indices.to(torch.int32)
@@ -2493,7 +2559,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if compare_layer_hidden:
             verify_input.allow_cuda_graph = False
         dense_compact_direct_commit = (
-            use_compact_tree_verify
+            (use_compact_tree_verify or use_paged_tree_verify)
             and target_model_runner.mambaish_config is None
         )
         use_reverify_commit = (
@@ -2636,6 +2702,45 @@ class DFlashWorkerV2(BaseSpecWorker):
                             )
                         )
                         if expanded_can_run_cuda_graph:
+                            skip_attn_backend_init = None
+                        else:
+                            verify_forward_batch.allow_cuda_graph = False
+                            target_model_runner.attn_backend.init_forward_metadata(
+                                verify_forward_batch
+                            )
+                    elif use_paged_tree_verify:
+                        assert paged_req_pool_indices is not None
+                        assert paged_seq_lens is not None
+                        assert paged_seq_lens_cpu is not None
+                        verify_forward_batch = ForwardBatch(
+                            forward_mode=ForwardMode.TARGET_VERIFY,
+                            batch_size=bs * tree_budget,
+                            input_ids=verify_draft_token,
+                            req_pool_indices=paged_req_pool_indices,
+                            seq_lens=paged_seq_lens,
+                            out_cache_loc=tree_cache_loc,
+                            seq_lens_sum=int(paged_seq_lens_cpu.sum().item()),
+                            seq_lens_cpu=paged_seq_lens_cpu,
+                            positions=verify_positions,
+                            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                            spec_info=verify_input,
+                            capture_hidden_mode=CaptureHiddenMode.FULL,
+                        )
+                        if target_model_runner.model_is_mrope:
+                            verify_forward_batch.mrope_positions = (
+                                verify_positions.unsqueeze(0).repeat(3, 1)
+                            )
+                        verify_forward_batch.allow_cuda_graph = (
+                            verify_input.allow_cuda_graph
+                        )
+                        paged_can_run_cuda_graph = bool(
+                            verify_forward_batch.allow_cuda_graph
+                            and target_model_runner.decode_cuda_graph_runner
+                            and target_model_runner.decode_cuda_graph_runner.can_run_graph(
+                                verify_forward_batch
+                            )
+                        )
+                        if paged_can_run_cuda_graph:
                             skip_attn_backend_init = None
                         else:
                             verify_forward_batch.allow_cuda_graph = False
@@ -2914,7 +3019,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         tree_target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
             bs, tree_budget
         )
-        use_tree_accept_kernel = str(device).startswith("cuda") and use_compact_tree_verify
+        use_tree_accept_kernel = str(device).startswith("cuda") and (
+            use_compact_tree_verify or use_paged_tree_verify
+        )
         if use_tree_accept_kernel:
             (
                 accept_retrieve_index,
@@ -3142,7 +3249,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             scratch_start = tree_budget - compare_branch_len
             active_page_size = int(getattr(active_target_attn_backend, "page_size", 1))
             use_page_contiguous_branch_compare = (
-                use_compact_tree_verify
+                (use_compact_tree_verify or use_paged_tree_verify)
                 and active_page_size > 1
                 and not use_flashinfer_expanded_causal_tree
             )
@@ -4088,7 +4195,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accepted_cache_loc_2d.reshape(-1),
                 bs,
             )
-        elif use_compact_tree_verify:
+        elif use_compact_tree_verify or use_paged_tree_verify:
             source_cache_loc_2d = torch.gather(
                 tree_cache_loc_2d,
                 1,

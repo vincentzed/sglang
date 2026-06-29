@@ -68,6 +68,7 @@ def dflash_paged_tree_verify_attn(
     cache_seqlens: torch.Tensor,
     prefix_lens: torch.Tensor,
     ancestor_mask: torch.Tensor,
+    tree_budget_tensor: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     softcap: Optional[float] = None,
     num_splits: int = 1,
@@ -128,9 +129,14 @@ def dflash_paged_tree_verify_attn(
         )
 
     q_batched = q.view(bs, tree_budget, num_q_heads, head_dim)
-    tree_budget_tensor = torch.tensor(
-        [tree_budget], dtype=torch.int32, device=q.device
-    )
+    if tree_budget_tensor is None:
+        tree_budget_tensor = torch.tensor(
+            [tree_budget], dtype=torch.int32, device=q.device
+        )
+    _require_cuda_contiguous(tree_budget_tensor, "tree_budget_tensor")
+    if tree_budget_tensor.dtype != torch.int32 or tree_budget_tensor.numel() != 1:
+        raise ValueError("tree_budget_tensor must be a single torch.int32 value")
+
     result = _fa4_flash_attn_varlen_func(
         q=q_batched,
         k=k_cache,

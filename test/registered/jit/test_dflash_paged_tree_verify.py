@@ -5,7 +5,15 @@ import torch
 
 from sglang.jit_kernel.dflash_paged_tree_verify import dflash_paged_tree_verify_attn
 from sglang.jit_kernel.flash_attention_v4 import flash_attn_varlen_func
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+    DenseAttentionCase,
+    build_dense_attention_fixture,
+    run_dense_forward,
+)
 
 register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-b200")
 
@@ -182,6 +190,62 @@ def _compact_fa4_reference(case: dict[str, torch.Tensor | float], softcap):
     )
 
 
+def _expand_gqa(x: torch.Tensor, num_heads: int) -> torch.Tensor:
+    if x.shape[0] == num_heads:
+        return x
+    assert num_heads % x.shape[0] == 0
+    return x.repeat_interleave(num_heads // x.shape[0], dim=0)
+
+
+def _softcapped_tree_reference(
+    fixture,
+    ancestor_mask: torch.Tensor,
+    *,
+    softcap: float,
+) -> torch.Tensor:
+    case = fixture.case
+    module = fixture.reference_module
+    dtype = fixture.input_hidden.dtype
+    q, k, v = module.project_qkv(fixture.input_hidden)
+    q = q.view(-1, case.num_heads, module.head_dim)
+    k = k.view(-1, case.num_kv_heads, module.head_dim)
+    v = v.view(-1, case.num_kv_heads, module.head_dim)
+    outputs = []
+    offset = 0
+    for req_idx, prefix in enumerate(fixture.prefix_hidden):
+        tree_budget = case.input_lens[req_idx]
+        req_q = q[offset : offset + tree_budget]
+        req_k = k[offset : offset + tree_budget]
+        req_v = v[offset : offset + tree_budget]
+        offset += tree_budget
+
+        _, prefix_k, prefix_v = module.project_qkv(prefix)
+        prefix_k = prefix_k.view(-1, case.num_kv_heads, module.head_dim)
+        prefix_v = prefix_v.view(-1, case.num_kv_heads, module.head_dim)
+        all_k = torch.cat([prefix_k, req_k], dim=0)
+        all_v = torch.cat([prefix_v, req_v], dim=0)
+        prefix_allowed = torch.ones(
+            prefix_k.shape[0], dtype=torch.bool, device=ancestor_mask.device
+        )
+
+        for node_idx, query in enumerate(req_q):
+            tree_allowed = ancestor_mask[req_idx, node_idx].to(torch.bool)
+            allowed = torch.cat([prefix_allowed, tree_allowed], dim=0)
+            keys = _expand_gqa(all_k[allowed].movedim(0, 1), case.num_heads)
+            values = _expand_gqa(all_v[allowed].movedim(0, 1), case.num_heads)
+            scores = (
+                torch.einsum("hd,hkd->hk", query.float(), keys.float())
+                * module.scaling
+            )
+            scores = softcap * torch.tanh(scores / softcap)
+            probs = torch.softmax(scores, dim=-1)
+            out = torch.einsum("hk,hkd->hd", probs, values.float())
+            outputs.append(out.reshape(-1))
+
+    attn_output = torch.stack(outputs, dim=0).to(dtype)
+    return module.reconstruct_output(attn_output)
+
+
 def test_dflash_paged_tree_verify_matches_compact_fa4_softcap_bf16():
     case = _make_case(dtype=torch.bfloat16)
 
@@ -212,6 +276,99 @@ def test_dflash_paged_tree_verify_matches_compact_fa4_softcap_bf16():
     assert diff.mean().item() == 0.0
     torch.testing.assert_close(
         paged_out.float(), compact_out.float(), atol=0.0, rtol=0.0
+    )
+
+
+class _PytestCase:
+    def skipTest(self, reason: str) -> None:
+        pytest.skip(reason)
+
+
+def test_dflash_paged_tree_verify_backend_path_matches_reference_softcap_bf16():
+    tree_budget = 5
+    case = DenseAttentionCase(
+        name="dflash_paged_tree_verify_backend_path",
+        backend="fa4",
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        num_heads=4,
+        num_kv_heads=2,
+        page_size=16,
+        prefix_lens=(17, 31),
+        extend_lens=(tree_budget, tree_budget),
+    )
+    fixture = build_dense_attention_fixture(
+        _PytestCase(),
+        case,
+        head_dim=64,
+        hidden_size=256,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    softcap = 5.0
+    fixture.actual_module.attn.logit_cap = softcap
+
+    parents_by_req = (
+        (-1, 0, 0, 1, 2),
+        (-1, 0, 1, 1, 0),
+    )
+    ancestor_mask = torch.zeros(
+        (case.batch_size, tree_budget, tree_budget),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    for req_idx, parents in enumerate(parents_by_req):
+        for node_idx in range(tree_budget):
+            ancestor_mask[req_idx, node_idx, _ancestor_path(list(parents), node_idx)] = 1
+
+    batch = fixture.forward_batch
+    prefix_lens = torch.tensor(case.prefix_lens, dtype=torch.int32, device="cuda")
+    req_pool_indices = torch.arange(
+        case.batch_size, dtype=torch.int32, device="cuda"
+    ).repeat_interleave(tree_budget)
+    batch.batch_size = case.batch_size * tree_budget
+    batch.req_pool_indices = req_pool_indices
+    batch.seq_lens = prefix_lens.repeat_interleave(tree_budget)
+    batch.seq_lens_cpu = batch.seq_lens.to(device="cpu", dtype=torch.int32)
+    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+    batch.spec_info = DFlashVerifyInput(
+        draft_token=batch.input_ids,
+        positions=batch.positions,
+        draft_token_num=1,
+        topk=1,
+        custom_mask=None,
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+        paged_tree_prefix_lens=prefix_lens,
+        paged_tree_ancestor_mask=ancestor_mask,
+    )
+
+    expected = _softcapped_tree_reference(
+        fixture,
+        ancestor_mask,
+        softcap=softcap,
+    )
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_forward_metadata(batch)
+        actual = run_dense_forward(fixture, batch, {"input_hidden": fixture.input_hidden})
+
+    assert fixture.backend.forward_metadata.dflash_paged_tree
+    torch.testing.assert_close(actual, expected, atol=4.0e-2, rtol=4.0e-2)
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_cuda_graph_state(
+            max_bs=batch.batch_size,
+            max_num_tokens=batch.input_ids.numel(),
+        )
+        fixture.backend.init_forward_metadata_out_graph(batch, in_capture=True)
+        fixture.backend.init_forward_metadata_in_graph(batch)
+        graph_metadata_actual = run_dense_forward(
+            fixture,
+            batch,
+            {"input_hidden": fixture.input_hidden},
+        )
+
+    assert fixture.backend.forward_metadata.dflash_paged_tree
+    torch.testing.assert_close(
+        graph_metadata_actual, expected, atol=4.0e-2, rtol=4.0e-2
     )
 
 

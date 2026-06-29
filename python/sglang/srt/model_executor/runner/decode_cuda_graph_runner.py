@@ -234,6 +234,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.num_tokens_per_bs = 1
         self.dflash_tree_expanded_causal_graph = False
         self.dflash_tree_compact_fa4_graph = False
+        self.dflash_tree_paged_fa4_graph = False
         self.dflash_tree_graph_rows_per_request = 1
         self.dflash_tree_graph_uses_full_attn_replacement = False
         self.dflash_tree_graph_full_attn_backend = None
@@ -242,6 +243,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.dflash_tree_compact_kv_indices_buffers: dict[int, torch.Tensor] = {}
         self.dflash_tree_compact_kv_indptr_buffers: dict[int, torch.Tensor] = {}
         self.dflash_tree_compact_qo_indptr_buffers: dict[int, torch.Tensor] = {}
+        self.dflash_tree_paged_prefix_lens_buffer: Optional[torch.Tensor] = None
+        self.dflash_tree_paged_ancestor_mask_buffer: Optional[torch.Tensor] = None
         self.dflash_tree_compact_fa4_graph_max_rows = max(
             1,
             int(
@@ -272,9 +275,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     is not None
                 ):
                     active_attn_backend = active_attn_backend.full_attn_backend
-                self.dflash_tree_compact_fa4_graph = (
+                active_is_fa4 = (
                     type(active_attn_backend).__name__ == "FlashAttentionBackend"
                     and getattr(active_attn_backend, "fa_impl_ver", None) == 4
+                )
+                self.dflash_tree_paged_fa4_graph = (
+                    active_is_fa4
+                    and getattr(active_attn_backend, "page_size", None) == 16
+                    and os.environ.get("SGLANG_DFLASH_TREE_PAGED_FA4_VERIFY", "0")
+                    == "1"
+                    and os.environ.get("SGLANG_DFLASH_TREE_PAGED_FA4_CUDA_GRAPH", "1")
+                    != "0"
+                )
+                self.dflash_tree_compact_fa4_graph = (
+                    active_is_fa4
+                    and not self.dflash_tree_paged_fa4_graph
                     and os.environ.get(
                         "SGLANG_DFLASH_TREE_COMPACT_FA4_CUDA_GRAPH", "1"
                     )
@@ -300,7 +315,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         model_runner.server_args.speculative_dflash_tree_budget,
                         self.dflash_tree_compact_fa4_graph_max_rows,
                     )
-                if self.dflash_tree_compact_fa4_graph:
+                if self.dflash_tree_paged_fa4_graph:
+                    # Paged FA4 verify has one query row per tree node.  The
+                    # metadata buffer tracks per-request prefix/mask state, but
+                    # the graph's batch dimension is still row-shaped.
+                    self.num_tokens_per_bs = 1
+                    self.dflash_tree_graph_rows_per_request = int(
+                        model_runner.server_args.speculative_dflash_tree_budget
+                    )
+                elif self.dflash_tree_compact_fa4_graph:
                     # Compact FA4 verify already has one query row per tree
                     # node. Capture that exact row-shaped verifier with one
                     # token per row; replay only pads rows and K/V gather
@@ -350,6 +373,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if (
                 self.dflash_tree_expanded_causal_graph
                 or self.dflash_tree_compact_fa4_graph
+                or self.dflash_tree_paged_fa4_graph
             ):
                 row_multiplier = self.dflash_tree_graph_rows_per_request
                 self.capture_bs = sorted(
@@ -514,6 +538,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         if self.dflash_tree_compact_fa4_graph:
             self._init_dflash_tree_compact_graph_buffers()
+        if self.dflash_tree_paged_fa4_graph:
+            self._init_dflash_tree_paged_graph_buffers()
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
@@ -618,6 +644,86 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             "DFLASH compact FA4 target verify CUDA graph KV-span buckets: %s",
             buckets,
         )
+
+    def _init_dflash_tree_paged_graph_buffers(self) -> None:
+        tree_budget = int(self.dflash_tree_graph_rows_per_request)
+        max_req_bs = max(1, (self.max_bs + tree_budget - 1) // tree_budget)
+        self.dflash_tree_paged_prefix_lens_buffer = torch.full(
+            (max_req_bs,),
+            int(self.seq_len_fill_value),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.dflash_tree_paged_ancestor_mask_buffer = torch.zeros(
+            (max_req_bs, tree_budget, tree_budget),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        eye = torch.eye(tree_budget, dtype=torch.int32, device=self.device)
+        self.dflash_tree_paged_ancestor_mask_buffer.copy_(
+            eye.unsqueeze(0).expand(max_req_bs, -1, -1)
+        )
+        logger.info(
+            "DFLASH paged FA4 target verify CUDA graph buffers: max_req_bs=%s, "
+            "tree_budget=%s",
+            max_req_bs,
+            tree_budget,
+        )
+
+    def _fill_dflash_paged_graph_buffers(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        raw_bs: int,
+        padded_bs: int,
+    ) -> None:
+        spec_info = forward_batch.spec_info
+        prefix_lens = getattr(spec_info, "paged_tree_prefix_lens", None)
+        ancestor_mask = getattr(spec_info, "paged_tree_ancestor_mask", None)
+        if prefix_lens is None or ancestor_mask is None:
+            raise RuntimeError("DFlash paged graph replay missing paged-tree metadata")
+        if (
+            self.dflash_tree_paged_prefix_lens_buffer is None
+            or self.dflash_tree_paged_ancestor_mask_buffer is None
+        ):
+            raise RuntimeError("DFlash paged graph buffers were not initialized")
+
+        tree_budget = int(self.dflash_tree_graph_rows_per_request)
+        if raw_bs % tree_budget != 0 or padded_bs % tree_budget != 0:
+            raise RuntimeError(
+                "DFlash paged graph expects row batch sizes divisible by tree budget: "
+                f"raw_bs={raw_bs}, padded_bs={padded_bs}, tree_budget={tree_budget}"
+            )
+        raw_req_bs = raw_bs // tree_budget
+        padded_req_bs = padded_bs // tree_budget
+        if raw_req_bs > prefix_lens.numel():
+            raise RuntimeError(
+                "DFlash paged graph prefix metadata is shorter than the real batch: "
+                f"raw_req_bs={raw_req_bs}, prefix_lens={prefix_lens.numel()}"
+            )
+        if tuple(ancestor_mask.shape[:3]) != (
+            prefix_lens.numel(),
+            tree_budget,
+            tree_budget,
+        ):
+            raise RuntimeError(
+                "DFlash paged graph ancestor mask has wrong shape: "
+                f"got {tuple(ancestor_mask.shape)}, tree_budget={tree_budget}"
+            )
+
+        prefix_buf = self.dflash_tree_paged_prefix_lens_buffer
+        mask_buf = self.dflash_tree_paged_ancestor_mask_buffer
+        prefix_buf[:raw_req_bs].copy_(prefix_lens[:raw_req_bs].to(dtype=torch.int32))
+        mask_buf[:raw_req_bs].copy_(ancestor_mask[:raw_req_bs].to(dtype=torch.int32))
+        if padded_req_bs > raw_req_bs:
+            prefix_buf[raw_req_bs:padded_req_bs].fill_(int(self.seq_len_fill_value))
+            eye = torch.eye(tree_budget, dtype=torch.int32, device=self.device)
+            mask_buf[raw_req_bs:padded_req_bs].copy_(
+                eye.unsqueeze(0).expand(padded_req_bs - raw_req_bs, -1, -1)
+            )
+
+        spec_info.paged_tree_prefix_lens = prefix_buf[:padded_req_bs]
+        spec_info.paged_tree_ancestor_mask = mask_buf[:padded_req_bs]
 
     def _dflash_compact_kv_bucket_for_forward_batch(
         self, forward_batch: ForwardBatch
@@ -799,6 +905,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 is not None
             )
 
+        is_dflash_paged_supported = True
+        if (
+            self.dflash_tree_paged_fa4_graph
+            and forward_batch.forward_mode.is_target_verify()
+            and getattr(forward_batch.spec_info, "paged_tree_prefix_lens", None)
+            is not None
+        ):
+            tree_budget = int(self.dflash_tree_graph_rows_per_request)
+            is_dflash_paged_supported = (
+                forward_batch.input_ids.numel() == forward_batch.batch_size
+                and forward_batch.batch_size % tree_budget == 0
+                and forward_batch.batch_size <= self.max_bs
+            )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
@@ -806,6 +926,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and capture_hidden_mode_matches
             and is_ngram_supported
             and is_dflash_compact_supported
+            and is_dflash_paged_supported
         )
 
     def _init_profile_context_and_memory_record(self):
@@ -1304,6 +1425,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 padded_bs=bs,
                 bucket=dflash_compact_bucket,
             )
+        if (
+            self.dflash_tree_paged_fa4_graph
+            and forward_batch.forward_mode.is_target_verify()
+            and getattr(forward_batch.spec_info, "paged_tree_prefix_lens", None)
+            is not None
+        ):
+            self._fill_dflash_paged_graph_buffers(
+                forward_batch,
+                raw_bs=raw_bs,
+                padded_bs=bs,
+            )
         if self.enable_pdmux:
             stream_idx = get_current_stream_idx()
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
@@ -1461,6 +1593,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             compact_kv_indptr = None
             compact_qo_indptr = None
             compact_kv_max_seq_len = -1
+            paged_tree_prefix_lens = None
+            paged_tree_ancestor_mask = None
             if compact_bucket is not None:
                 bs = num_tokens
                 capacity = bs * compact_bucket
@@ -1474,6 +1608,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     compact_bucket
                 ][: bs + 1]
                 compact_kv_max_seq_len = int(compact_bucket)
+                custom_mask = None
+            elif self.dflash_tree_paged_fa4_graph:
+                tree_budget = int(self.dflash_tree_graph_rows_per_request)
+                if num_tokens % tree_budget != 0:
+                    raise RuntimeError(
+                        "DFlash paged FA4 graph capture rows must be divisible by "
+                        f"tree_budget={tree_budget}, got num_tokens={num_tokens}."
+                    )
+                req_bs = num_tokens // tree_budget
+                if (
+                    self.dflash_tree_paged_prefix_lens_buffer is None
+                    or self.dflash_tree_paged_ancestor_mask_buffer is None
+                ):
+                    raise RuntimeError("DFlash paged graph buffers are uninitialized")
+                paged_tree_prefix_lens = self.dflash_tree_paged_prefix_lens_buffer[
+                    :req_bs
+                ]
+                paged_tree_ancestor_mask = (
+                    self.dflash_tree_paged_ancestor_mask_buffer[:req_bs]
+                )
                 custom_mask = None
             spec_info = DFlashVerifyInput(
                 draft_token=None,
@@ -1490,6 +1644,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 compact_kv_indptr=compact_kv_indptr,
                 compact_qo_indptr=compact_qo_indptr,
                 compact_kv_max_seq_len=compact_kv_max_seq_len,
+                paged_tree_prefix_lens=paged_tree_prefix_lens,
+                paged_tree_ancestor_mask=paged_tree_ancestor_mask,
                 force_causal=self.dflash_tree_expanded_causal_graph,
                 num_tokens_per_batch=self.num_tokens_per_bs,
             )

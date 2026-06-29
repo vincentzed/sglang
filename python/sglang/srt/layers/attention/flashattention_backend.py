@@ -39,6 +39,7 @@ from sglang.jit_kernel.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
+from sglang.jit_kernel.dflash_paged_tree_verify import dflash_paged_tree_verify_attn
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 
 
@@ -214,6 +215,12 @@ class FlashAttentionMetadata:
     # cannot use raw token ids as page ids, so this mode gathers K/V into varlen.
     dflash_compact_tree: bool = False
     dflash_compact_kv_indices: torch.Tensor = None
+    # DFlash FA4 tree verify over normal paged prefix+tree KV with a CUTE
+    # ancestor mask. This avoids compact K/V materialization.
+    dflash_paged_tree: bool = False
+    dflash_paged_tree_prefix_lens: torch.Tensor = None
+    dflash_paged_tree_ancestor_mask: torch.Tensor = None
+    dflash_paged_tree_budget_tensor: torch.Tensor = None
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -428,6 +435,26 @@ class FlashAttentionBackend(AttentionBackend):
             and getattr(spec_info, "compact_kv_indices", None) is not None
         )
 
+    def _dflash_paged_tree_verify(self, spec_info: Optional[SpecInput]) -> bool:
+        return (
+            spec_info is not None
+            and spec_info.__class__.__name__ == "DFlashVerifyInput"
+            and getattr(spec_info, "paged_tree_prefix_lens", None) is not None
+            and getattr(spec_info, "paged_tree_ancestor_mask", None) is not None
+        )
+
+    def _dflash_paged_tree_budget(self, spec_info: SpecInput, row_bs: int) -> int:
+        ancestor_mask = getattr(spec_info, "paged_tree_ancestor_mask", None)
+        if ancestor_mask is None or ancestor_mask.dim() != 3:
+            raise RuntimeError("DFlash paged-tree verify missing ancestor mask")
+        tree_budget = int(ancestor_mask.shape[-1])
+        if tree_budget <= 0 or row_bs % tree_budget != 0:
+            raise RuntimeError(
+                "DFlash paged-tree verify expects row batch size divisible by "
+                f"tree_budget; row_bs={row_bs}, tree_budget={tree_budget}"
+            )
+        return tree_budget
+
     def _dflash_compact_kv_bucket(
         self, spec_info: SpecInput, batch_size: int
     ) -> int:
@@ -522,8 +549,9 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 return
 
-            if forward_mode.is_target_verify() and self._dflash_compact_tree_verify(
-                spec_info
+            if forward_mode.is_target_verify() and (
+                self._dflash_compact_tree_verify(spec_info)
+                or self._dflash_paged_tree_verify(spec_info)
             ):
                 self._apply_cuda_graph_metadata(
                     bs=bs,
@@ -716,7 +744,36 @@ class FlashAttentionBackend(AttentionBackend):
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             verify_num_tokens = self._target_verify_num_tokens(forward_batch.spec_info)
-            if self._dflash_compact_tree_verify(forward_batch.spec_info):
+            if self._dflash_paged_tree_verify(forward_batch.spec_info):
+                prefix_lens = forward_batch.spec_info.paged_tree_prefix_lens.to(
+                    dtype=torch.int32
+                )
+                ancestor_mask = forward_batch.spec_info.paged_tree_ancestor_mask.to(
+                    dtype=torch.int32
+                )
+                num_requests = int(prefix_lens.shape[0])
+                if batch_size % num_requests != 0:
+                    raise RuntimeError(
+                        "DFlash paged-tree verify expects one row per tree node; "
+                        f"batch_size={batch_size}, num_requests={num_requests}"
+                    )
+                tree_budget = batch_size // num_requests
+                request_indices = forward_batch.req_pool_indices[::tree_budget]
+                metadata.cache_seqlens_int32 = (
+                    prefix_lens + tree_budget
+                ).to(torch.int32)
+                metadata.max_seq_len_q = tree_budget
+                metadata.max_seq_len_k = int(metadata.cache_seqlens_int32.max().item())
+                metadata.page_table = self.req_to_token_pool.req_to_token[
+                    request_indices, : metadata.max_seq_len_k
+                ]
+                metadata.dflash_paged_tree = True
+                metadata.dflash_paged_tree_prefix_lens = prefix_lens
+                metadata.dflash_paged_tree_ancestor_mask = ancestor_mask
+                metadata.dflash_paged_tree_budget_tensor = torch.tensor(
+                    [tree_budget], dtype=torch.int32, device=device
+                )
+            elif self._dflash_compact_tree_verify(forward_batch.spec_info):
                 compact_kv_indices = forward_batch.spec_info.compact_kv_indices.to(
                     dtype=torch.long
                 )
@@ -1133,11 +1190,17 @@ class FlashAttentionBackend(AttentionBackend):
             forward_batch.forward_mode.is_target_verify()
             and self._use_target_verify_custom_mask(forward_batch.spec_info)
             and not metadata.dflash_compact_tree
+            and not metadata.dflash_paged_tree
             and not is_swa_layer
         )
         use_dflash_compact_tree = (
             forward_batch.forward_mode.is_target_verify()
             and metadata.dflash_compact_tree
+            and not is_swa_layer
+        )
+        use_dflash_paged_tree = (
+            forward_batch.forward_mode.is_target_verify()
+            and metadata.dflash_paged_tree
             and not is_swa_layer
         )
 
@@ -1299,6 +1362,21 @@ class FlashAttentionBackend(AttentionBackend):
                     out=_fa_out,
                     **kwargs,
                 )
+            elif use_dflash_paged_tree:
+                result = dflash_paged_tree_verify_attn(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    prefix_lens=metadata.dflash_paged_tree_prefix_lens,
+                    ancestor_mask=metadata.dflash_paged_tree_ancestor_mask,
+                    tree_budget_tensor=metadata.dflash_paged_tree_budget_tensor,
+                    softmax_scale=layer.scaling,
+                    softcap=layer.logit_cap,
+                    num_splits=self.num_splits if self.num_splits != 0 else 1,
+                )
+                o = result
             elif use_dflash_compact_tree:
                 compact_kv_indices = metadata.dflash_compact_kv_indices
                 compact_k = key_cache.reshape(
@@ -2279,7 +2357,30 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             verify_num_tokens = self._target_verify_num_tokens(spec_info)
-            if self._dflash_compact_tree_verify(spec_info):
+            if self._dflash_paged_tree_verify(spec_info):
+                tree_budget = self._dflash_paged_tree_budget(spec_info, bs)
+                req_bs = bs // tree_budget
+                metadata.cache_seqlens_int32 = self.target_verify_metadata[
+                    "cache_seqlens"
+                ][:req_bs]
+                metadata.max_seq_len_q = tree_budget
+                metadata.cu_seqlens_q = None
+                metadata.cu_seqlens_k = None
+                metadata.page_table = self.target_verify_metadata["page_table"][
+                    :req_bs, :
+                ]
+                metadata.dflash_paged_tree = True
+                metadata.dflash_paged_tree_prefix_lens = (
+                    spec_info.paged_tree_prefix_lens[:req_bs]
+                )
+                metadata.dflash_paged_tree_ancestor_mask = (
+                    spec_info.paged_tree_ancestor_mask[:req_bs]
+                )
+                metadata.dflash_paged_tree_budget_tensor = torch.tensor(
+                    [tree_budget], dtype=torch.int32, device=device
+                )
+                self.target_verify_metadata[bs] = metadata
+            elif self._dflash_compact_tree_verify(spec_info):
                 bucket = self._dflash_compact_kv_bucket(spec_info, bs)
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
@@ -2579,7 +2680,28 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             verify_num_tokens = self._target_verify_num_tokens(spec_info)
-            if self._dflash_compact_tree_verify(spec_info):
+            if self._dflash_paged_tree_verify(spec_info):
+                tree_budget = self._dflash_paged_tree_budget(spec_info, bs)
+                req_bs = bs // tree_budget
+                metadata = self.target_verify_metadata[bs]
+                prefix_lens = spec_info.paged_tree_prefix_lens[:req_bs].to(torch.int32)
+                metadata.cache_seqlens_int32.copy_(prefix_lens + tree_budget)
+                metadata.max_seq_len_q = tree_budget
+                metadata.max_seq_len_k = int(
+                    metadata.cache_seqlens_int32.max().item()
+                )
+                max_seq_pages = (
+                    metadata.max_seq_len_k + self.page_size - 1
+                ) // self.page_size
+                request_indices = req_pool_indices[:bs:tree_budget]
+                page_indices = self.req_to_token[
+                    request_indices[:, None],
+                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
+                ]
+                metadata.page_table[:, :max_seq_pages].copy_(
+                    page_indices // self.page_size
+                )
+            elif self._dflash_compact_tree_verify(spec_info):
                 bucket = self._dflash_compact_kv_bucket(spec_info, bs)
                 metadata = self.target_verify_compact_metadata[(bs, bucket)]
                 metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))

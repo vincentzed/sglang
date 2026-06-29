@@ -49,6 +49,8 @@ class DFlashVerifyInput(SpecInput):
     # CUDA graph compact FA4 replay uses fixed K/V gather buffers.  This is the
     # captured max per-query KV span; eager compact verify leaves it unset.
     compact_kv_max_seq_len: int = -1
+    paged_tree_prefix_lens: torch.Tensor | None = None
+    paged_tree_ancestor_mask: torch.Tensor | None = None
     force_causal: bool = False
     mamba_cache_indices: torch.Tensor | None = None
 
