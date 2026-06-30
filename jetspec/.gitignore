@@ -1,0 +1,10 @@
+runs/
+profiles/
+logs/
+*.pid
+*.nsys-rep
+*.trace.json.gz
+_ref/
+_oldattempt/
+_hf_configs/
+baseline_linear.json
