@@ -27,11 +27,15 @@ def _jit_k_indexer_norm_rope_module(dtype: torch.dtype, is_neox: bool):
 
 @cache_once
 def _jit_k_indexer_norm_rope_store_module(
-    dtype: torch.dtype, page_size: int, is_neox: bool
+    dtype: torch.dtype, page_size: int, is_neox: bool, is_fp4: bool
 ):
-    args = make_cpp_args(dtype, is_arch_support_pdl(), page_size, is_neox)
+    args = make_cpp_args(dtype, is_arch_support_pdl(), page_size, is_neox, is_fp4)
+    name = (
+        f"dpsk_v32_k_indexer_norm_rope_store_p{page_size}"
+        f"{'_neox' if is_neox else ''}{'_fp4' if is_fp4 else ''}"
+    )
     return load_jit(
-        f"dpsk_v32_k_indexer_norm_rope_store_p{page_size}{'_neox' if is_neox else ''}",
+        name,
         *args,
         cuda_files=[_CUDA_FILE],
         cuda_wrappers=[
@@ -83,15 +87,23 @@ def fused_k_indexer_norm_rope_store(
     page_size: int,
     *,
     is_neox: bool = False,
+    is_fp4: bool = False,
 ) -> None:
-    """V3.2 indexer K + fused store: LayerNorm + RoPE on leading dims + fp8
+    """V3.2 indexer K + fused store: LayerNorm + RoPE on leading dims +
     act-quant + paged index-k cache write, in one launch. CUDA only.
+
+    is_fp4 selects the quant/store format: False writes the FP8 132 B/token
+    layout (128 B fp8 key + 4 B fp32 scale); True writes the MXFP4 68 B/token
+    layout (64 B packed E2M1 pairs + 4 UE8M0 group exponents), bit-identical
+    to store_fp4_index_k_cache on the bf16-rounded key.
 
     See fused_k_indexer_norm_rope for the is_neox convention.
     """
     if not out_cache_loc.is_contiguous():
         out_cache_loc = out_cache_loc.contiguous()
-    module = _jit_k_indexer_norm_rope_store_module(k_input.dtype, page_size, is_neox)
+    module = _jit_k_indexer_norm_rope_store_module(
+        k_input.dtype, page_size, is_neox, is_fp4
+    )
     module.forward(
         k_input,
         cache,
