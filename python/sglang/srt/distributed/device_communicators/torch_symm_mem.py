@@ -11,6 +11,12 @@ from torch.distributed import ProcessGroup
 from sglang.srt.distributed.device_communicators.all_reduce_utils import (
     TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES,
 )
+from sglang.srt.distributed.device_communicators.symm_mem_custom_ar import (
+    AR_VEC,
+    CUSTOM_AR_BUFFER_BYTES,
+    build_custom_ar_resources,
+    custom_all_reduce,
+)
 from sglang.srt.utils import is_cuda, is_hip
 
 try:
@@ -51,16 +57,29 @@ class TorchSymmMemCommunicator:
         10: [6, 8],
     }
 
-    def __init__(self, group: ProcessGroup, device: Union[int, str, torch.device]):
+    def __init__(
+        self,
+        group: ProcessGroup,
+        device: Union[int, str, torch.device],
+        *,
+        plain_all_reduce_enabled: bool = True,
+        custom_ar_enabled: bool = False,
+    ):
         """
         Args:
             group: Torch process group used for rendezvous and naming.
             device: Target CUDA device (index, 'cuda:X', or torch.device).
+            plain_all_reduce_enabled: serve the torch multimem/two-shot
+                all-reduce path (--enable-torch-symm-mem semantics).
+            custom_ar_enabled: build the JIT custom-AR resources
+                (SGLANG_OPT_USE_SYMM_MEM_CUSTOM_AR); enlarges the buffer.
         """
 
         self.disabled = True
         self.buffer = None
         self.max_size = 0
+        self.plain_all_reduce_enabled = plain_all_reduce_enabled
+        self.custom_ar_resources = None
 
         if not torch_symm_mem_available:
             return
@@ -93,13 +112,18 @@ class TorchSymmMemCommunicator:
             )
             return
         self.max_size = supported_max_sizes[self.world_size]
+        if custom_ar_enabled:
+            # Keep the custom-AR buffer above the largest prefill payload
+            # ([chunked_prefill_size, hidden] bf16), including room for the
+            # v4/v5 rotating tail regions.
+            self.max_size = max(self.max_size, CUSTOM_AR_BUFFER_BYTES)
         self.buffer = torch_symm_mem.empty(
             self.max_size // self.dtype.itemsize,
             device=self.device,
             dtype=self.dtype,
         )
-        handle = torch_symm_mem.rendezvous(self.buffer, self.group.group_name)
-        if handle.multicast_ptr == 0:
+        self.handle = torch_symm_mem.rendezvous(self.buffer, self.group.group_name)
+        if self.handle.multicast_ptr == 0:
             logger.warning(
                 "TorchSymmMemCommunicator: torch symmetric memory "
                 "multicast operations are not supported."
@@ -108,6 +132,19 @@ class TorchSymmMemCommunicator:
             self.disabled = True
             return
         self.disabled = False
+        if custom_ar_enabled:
+            self.custom_ar_resources = build_custom_ar_resources(
+                buffer=self.buffer,
+                handle=self.handle,
+                group_name=self.group.group_name,
+                world_size=self.world_size,
+            )
+            if self.custom_ar_resources is None:
+                logger.warning(
+                    "TorchSymmMemCommunicator: custom AR requested but not "
+                    "available for world size %d; using the default path.",
+                    self.world_size,
+                )
 
     def should_torch_symm_mem_allreduce(self, inp: torch.Tensor):
         """
@@ -122,7 +159,7 @@ class TorchSymmMemCommunicator:
         Returns:
             True if the symmetric-memory path can handle this tensor.
         """
-        if self.disabled:
+        if self.disabled or not self.plain_all_reduce_enabled:
             return False
         if inp.device != self.device:
             return False
@@ -133,6 +170,37 @@ class TorchSymmMemCommunicator:
         if inp_size % 4 != 0:
             return False
         return inp_size < self.max_size
+
+    def should_custom_all_reduce(self, inp: torch.Tensor) -> bool:
+        """Eligibility for the JIT custom-AR family (symm_mem_custom_ar.py).
+
+        A pure function of static resources + input metadata: every rank and
+        every call site must take the same branch, or the in-kernel barriers
+        deadlock. Ineligible inputs fall through to the default dispatch.
+        """
+        if self.custom_ar_resources is None or self.disabled:
+            return False
+        if inp.device != self.device or inp.dtype != self.dtype:
+            return False
+        if not inp.is_contiguous():
+            return False
+        n = inp.numel()
+        if n == 0 or n % AR_VEC != 0:
+            return False
+        return n * inp.element_size() < self.max_size
+
+    def custom_all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+        """Custom-AR dispatch; caller must have passed should_custom_all_reduce.
+
+        Returns a view of the symm buffer -- the result must be consumed
+        before the next all-reduce on this group.
+        """
+        return custom_all_reduce(
+            inp,
+            buffer=self.buffer,
+            group_name=self.group.group_name,
+            res=self.custom_ar_resources,
+        )
 
     def all_reduce(
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None

@@ -146,6 +146,8 @@ __global__ __launch_bounds__(1024, 1) void inkling_two_shot_all_reduce_fused_ker
 // tiny, latency-bound decode messages where two-shot's N peer reads lose. Reduce
 // is one transaction (hardware sums all GPUs); scatter partition keeps the store
 // traffic minimal. bf16-only (multimem.add supports .bf16x2 on sm90/sm100).
+// .acc::f32 requests fp32 accumulation in the switch reduce engine, matching
+// the fp32 accumulation of the two-shot/push kernels and NCCL NVLS.
 // kPerBlockBarrier swaps both barriers for block_system_barrier (per-block
 // peer handshake, no grid funnel). Correct for the two-shot too: any peer
 // block's ENTRY signal proves that peer's producer kernel completed (kernel
@@ -180,7 +182,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_multimem_one_shot_fused_kerne
     DType* addr = mc + v * kElemsPerVec;  // 16 B, 16-B aligned
     uint32_t r0, r1, r2, r3;
     // hardware reduce across all GPUs mapped to the multicast region.
-    asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
+    asm volatile("multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
                  : "l"(addr));
     // <-- EPILOGUE SEAM (norm / sconv / bias on {r0..r3} before broadcast)
@@ -307,7 +309,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_multimem_full_oneshot_kernel(
   for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < total_vec; v += stride) {
     DType* in = mc_ptr + v * kElemsPerVec;
     uint32_t r0, r1, r2, r3;
-    asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
+    asm volatile("multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
                  : "l"(in));
     // <-- EPILOGUE SEAM (norm / sconv / bias on {r0..r3} before the local store)
