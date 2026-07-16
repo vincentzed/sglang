@@ -98,6 +98,14 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_add_rmsnorm_kernel(
     if (act[i]) g_raw[i] = *reinterpret_cast<const uint4*>(gw + c0[i]);
   }
 
+  // ---- 0b. ENTRY barrier: every peer finished its previous kernel (and thus
+  // its previous read of the staging slot) before anyone pushes into it. This
+  // replaces the A/B staging rotation, whose even-count-per-graph invariant a
+  // model-agnostic integration cannot guarantee (see symm_mem_custom_ar.py).
+  // The gamma prefetch above hides under this spin; the per-block epoch just
+  // advances twice per launch. ----
+  inkling_ar::block_system_barrier<kNumGPU>(p.state, p.flag_ptrs, p.rank);
+
   // ---- 1. push: wait for the producer's output (PDL; no-op without a PDL
   // launch), multicast-store this rank's partial row, and issue the residual
   // load (it lands under the barrier). ----

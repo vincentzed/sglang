@@ -220,7 +220,17 @@ __global__ __launch_bounds__(1024, 1) void inkling_multimem_one_shot_fused_kerne
 // grid funnel -- the multi-block latency winner) over the single-leader grid
 // barrier. Safe here because the reduce loop reads exactly the vec ranges the
 // blockIdx-matched pushes wrote.
-template <typename DType, uint32_t kNumGPU, bool kPerBlockBarrier>
+//
+// kEntryBarrier adds a peer-progress barrier BEFORE the push, which removes
+// the caller-managed A/B staging rotation requirement entirely: a rank can
+// only push into the staging slot after every peer has arrived, i.e. after
+// every peer finished its previous kernel (stream order), including its local
+// reduce of the previous AR from this same slot. Use this for model-agnostic
+// call sites that cannot prove an even rotated-AR count per captured CUDA
+// graph (the reuse-distance-2 precondition of the single-barrier variant);
+// costs one extra per-block round trip (~2-4 us) but keeps a single slot safe
+// for ANY AR sequence, including odd counts across graph-replay boundaries.
+template <typename DType, uint32_t kNumGPU, bool kPerBlockBarrier, bool kEntryBarrier>
 __global__ __launch_bounds__(1024, 1) void inkling_multimem_push_oneshot_kernel(
     const DType* __restrict__ in_ptr,     // local input (producer's partial sums)
     DType* __restrict__ mc_stage_ptr,     // multicast staging base (slot r at r*num_items)
@@ -236,6 +246,16 @@ __global__ __launch_bounds__(1024, 1) void inkling_multimem_push_oneshot_kernel(
   constexpr uint32_t kElemsPerVec = Trait::kElemsPerVec;  // 8 bf16 = 16 B
   const uint32_t total_vec = num_items / kElemsPerVec;
   const uint32_t stride = gridDim.x * blockDim.x;
+
+  if constexpr (kEntryBarrier) {
+    // Entry barrier: every peer has finished its previous kernel (and thus its
+    // previous read of this staging slot) before anyone pushes into it.
+    if constexpr (kPerBlockBarrier) {
+      inkling_ar::block_system_barrier<kNumGPU>(state, flag_ptrs, rank);
+    } else {
+      inkling_ar::grid_system_barrier<kNumGPU>(state, flag_ptrs, rank, 1, /*publish_writes=*/false);
+    }
+  }
 
   // Phase 1: push. One multicast store per vec; the switch fans it out to every
   // GPU's replica of slot `rank` (including our own).
@@ -476,7 +496,8 @@ void inkling_multimem_push_oneshot(
     int64_t num_items,
     int64_t nb_override,
     int64_t bs_override,
-    int64_t per_block_barrier) {
+    int64_t per_block_barrier,
+    int64_t entry_barrier) {
   using namespace host;
   uint32_t n;
   // in_buffer is any LOCAL contiguous bf16 tensor (need not be a symm buffer);
@@ -493,8 +514,12 @@ void inkling_multimem_push_oneshot(
   RuntimeCheck(mc_stage_ptr % 16 == 0, "mc_stage_ptr not 16B aligned");
   RuntimeCheck(local_stage_ptr % 16 == 0, "local_stage_ptr not 16B aligned");
   const auto device = in_buffer.device();
-  const auto kernel = per_block_barrier ? inkling_multimem_push_oneshot_kernel<DType, kNumGPU, true>
-                                        : inkling_multimem_push_oneshot_kernel<DType, kNumGPU, false>;
+  const auto kernel =
+      per_block_barrier
+          ? (entry_barrier ? inkling_multimem_push_oneshot_kernel<DType, kNumGPU, true, true>
+                           : inkling_multimem_push_oneshot_kernel<DType, kNumGPU, true, false>)
+          : (entry_barrier ? inkling_multimem_push_oneshot_kernel<DType, kNumGPU, false, true>
+                           : inkling_multimem_push_oneshot_kernel<DType, kNumGPU, false, false>);
   const uint32_t block_size = bs_override > 0 ? static_cast<uint32_t>(bs_override) : 1024u;
   uint32_t cap = max_resident_blocks(kernel, block_size, device);
   // The per-block barrier has kMaxBarrierBlocks flag/epoch slots per rank.

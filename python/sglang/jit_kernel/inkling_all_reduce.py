@@ -67,14 +67,16 @@ _AR_TUNED_TP4 = {
     12: ("v5", 8, 512),
     16: ("v5", 8, 512),
     24: ("v5", 8, 1024),
-    32: ("v5", 8, 1024),
-    48: ("v5", 48, 1024),
-    64: ("v5", 48, 1024),
-    96: ("v5", 64, 1024),
-    # 128-192 re-swept on B300 TP4 (scratch/ar-port/bench_sweep_tp4_sweep1.json):
-    # v5/v3b beat the original "mm" picks; 160 covers EAGLE verify (bs*6).
-    128: ("v5", 0, 1024),
-    160: ("v5", 148, 512),
+    32: ("mm", 0, 0),
+    # 48-160 re-swept on B300 TP4 with the ENTRY-BARRIER v5 (the safe,
+    # rotation-free drop-in variant): the extra barrier round trip pushes v5
+    # behind torch multimem above ~32 rows (bench_tuned_tp4_v5entry.json).
+    # 160 covers the EAGLE verify band (bs * draft_token_num).
+    48: ("mm", 0, 0),
+    64: ("mm", 0, 0),
+    96: ("mm", 0, 0),
+    128: ("mm", 0, 0),
+    160: ("mm", 0, 0),
     192: ("v3b", 48, 768),
     256: ("v3b", 64, 1024),
     384: ("v3b", 32, 1024),
@@ -304,6 +306,7 @@ def inkling_multimem_push_oneshot(
     num_blocks: int = 0,
     block_size: int = 0,
     per_block_barrier: bool = False,
+    entry_barrier: bool = False,
 ) -> None:
     """One-shot PUSH all-reduce (v5) with a SINGLE mid barrier.
 
@@ -328,6 +331,11 @@ def inkling_multimem_push_oneshot(
         per_block_barrier: use the per-block peer handshake (no grid funnel;
             capped at MAX_BARRIER_BLOCKS blocks) instead of the single-leader
             grid barrier -- the multi-block latency winner.
+        entry_barrier: add a peer-progress barrier BEFORE the push, removing
+            the A/B staging-rotation requirement (safe for any AR sequence,
+            including odd counts per captured CUDA graph) at the cost of one
+            extra barrier round trip. Without it the caller MUST uphold the
+            reuse-distance-2 rotation invariant.
     """
     module = _jit_inkling_all_reduce_module(in_buffer.dtype, world_size)
     module.multimem_push_oneshot(
@@ -342,4 +350,5 @@ def inkling_multimem_push_oneshot(
         num_blocks,
         block_size,
         int(per_block_barrier),
+        int(entry_barrier),
     )

@@ -13,20 +13,19 @@
 #   * v2 two-shot + "mm" (torch multimem): remaining buckets.
 #
 # CUDA-graph safety: barrier epochs are device-resident and monotonic, so
-# capture+replay never sees stale flags. The v4/v5 A/B staging rotation flips
-# at Python trace time and bakes into captured graphs, which is only safe if
-# every captured graph (and every eager forward) issues an EVEN number of
-# rotated ARs -- see the SAFETY INVARIANT below.
+# capture+replay never sees stale flags.
 #
-# SAFETY INVARIANT (reuse distance 2): v4/v5 are out-of-place with no exit
-# barrier on the staged input, so a staging region may only be reused two ARs
-# later -- the intervening AR's barrier proves every peer consumed it. The A/B
-# alternation guarantees that IF the rotated-AR count per forward/graph is
-# even (transformer layers issue 2 TP all-reduces per layer: post-attention
-# and post-MLP, so counts are even for standard decoder stacks). If a model
-# could ever issue an odd number of rotated ARs per forward, a replay boundary
-# would put the same region in consecutive ARs -- re-derive the argument
-# before enabling this flag there.
+# Staging-reuse safety: this port does NOT use the Inkling A/B staging
+# rotation. The rotation's reuse-distance-2 invariant requires an EVEN number
+# of rotated ARs per captured graph, which a model-agnostic drop-in cannot
+# guarantee (measured counterexample: EAGLE verify graphs with flashinfer
+# seam-B fusion issue an ODD count -- one v5 per layer at seam A plus a single
+# unfused last-layer seam-B AR -- corrupting activations at every graph-replay
+# boundary; AIME25 dropped 92.9% -> 78.3% before this was fixed). Instead,
+# every push-style kernel here takes an ENTRY barrier before its multicast
+# push: a rank can only overwrite the staging slot after every peer finished
+# its previous kernel, which by stream order includes its previous read of the
+# slot. One slot, safe for any AR sequence, ~2-4 us extra per call.
 
 from __future__ import annotations
 
@@ -66,11 +65,11 @@ CUSTOM_AR_BUFFER_BYTES = 256 * 1024 * 1024
 # for the smallest token buckets.
 _AR_V4_REGION = 16 * 6144  # elems; 16B-aligned (multiple of AR_VEC)
 
-# v5 (push one-shot) needs a per-rank staging slot on every GPU: two rotating
-# staging areas of world * _AR_V5_REGION elems (A/B, same reuse-distance-2
-# argument as v4 -- v5's single barrier plays the entry barrier's role) plus
-# one local output region. Sized to the tuned v5 band (<=96 rows at
-# hidden=6144) plus EAGLE target-verify chains (bs * draft_token_num rows).
+# v5 (push one-shot) needs a per-rank staging slot on every GPU (world *
+# _AR_V5_REGION elems) plus one local output region. The layout still reserves
+# the Inkling A/B pair, but only slot A is used -- the in-kernel ENTRY barrier
+# fences reuse (see the header comment). Sized to the tuned v5 band (<=96 rows
+# at hidden=6144) plus EAGLE target-verify chains (bs * draft_token_num rows).
 _AR_V5_REGION = 160 * 6144  # elems; 16B-aligned (multiple of AR_VEC)
 
 
@@ -204,12 +203,20 @@ def custom_all_reduce(
     kernel, nb, bs = jit.select_ar_config(num_tokens, res.world)
     esz = buffer.element_size()
 
-    if kernel == "v5" and n <= _AR_V5_REGION and inp.data_ptr() % 16 == 0:
-        # Push one-shot: multicast-push input into the rotating staging area,
-        # one per-block barrier, local fp32 reduce into the out region. The
-        # input is read locally, so it needs NO stage-in copy.
-        cur = res.v5_cur
-        stage_off = res.v5_in[cur]
+    if kernel in ("v5", "v4") and n <= _AR_V5_REGION and inp.data_ptr() % 16 == 0:
+        # v4 (full one-shot) selections also route here: v4's rotating input
+        # staging has the same replay-boundary hazard, and entry-barrier v5
+        # covers its tiny-token band safely.
+        # Push one-shot WITH entry barrier: multicast-push into a single
+        # staging slot, per-block barriers before and after the push, local
+        # fp32 reduce into the out region. The input is read locally, so it
+        # needs NO stage-in copy. The entry barrier (not A/B rotation) fences
+        # staging reuse: this drop-in serves arbitrary model AR sequences,
+        # where the rotated-AR count per captured graph is NOT guaranteed even
+        # (e.g. EAGLE verify graphs with flashinfer seam-B fusion issue an ODD
+        # count, which corrupted the single-barrier rotating variant at every
+        # replay boundary).
+        stage_off = res.v5_in[0]
         out_view = buffer[res.v5_out : res.v5_out + n]
         jit.inkling_multimem_push_oneshot(
             inp.view(-1),
@@ -224,30 +231,8 @@ def custom_all_reduce(
             nb,
             bs,
             per_block_barrier=True,
+            entry_barrier=True,
         )
-        res.v5_cur = 1 - cur
-        return out_view.view(inp.shape)
-
-    if kernel == "v4" and n <= _AR_V4_REGION:
-        # Out-of-place full one-shot in the double-buffered tail regions.
-        cur = res.v4_cur
-        in_off = res.v4_in[cur]
-        in_view = buffer[in_off : in_off + n]
-        out_view = buffer[res.v4_out : res.v4_out + n]
-        in_view.copy_(inp.view(-1))
-        jit.inkling_multimem_full_oneshot(
-            in_view,
-            out_view,
-            res.multicast_ptr + in_off * esz,
-            res.flag_ptrs_dev,
-            res.state_ptr,
-            res.rank,
-            res.world,
-            n,
-            nb,
-            bs,
-        )
-        res.v4_cur = 1 - cur
         return out_view.view(inp.shape)
 
     buf = buffer[:n]
@@ -340,15 +325,14 @@ def fused_ar_add_rmsnorm(
     replacing {custom AR + fused_add_rmsnorm}. ``inp`` holds the UNREDUCED
     partial sums; returns ``(hidden_states, residual)`` exactly like the
     unfused ``layernorm(all_reduce(inp), residual)`` chain. The caller must
-    have checked ``fused_ar_rmsnorm_eligible``. Occupies one v5 staging
-    rotation slot (this IS a v5 AR with the epilogue seam filled in; same
-    reuse-distance-2 invariant)."""
+    have checked ``fused_ar_rmsnorm_eligible``. This IS a v5 AR with the
+    epilogue seam filled in; the in-kernel entry barrier fences staging
+    reuse (no rotation)."""
     comm = group.torch_symm_mem_comm
     res = comm.custom_ar_resources
     hs_out = torch.empty_like(inp)
     residual_out = torch.empty_like(residual)
-    cur = res.v5_cur
-    stage_off = res.v5_in[cur]
+    stage_off = res.v5_in[0]
     esz = comm.buffer.element_size()
     _ar_norm_jit().inkling_ar_add_rmsnorm(
         inp,
@@ -364,5 +348,4 @@ def fused_ar_add_rmsnorm(
         res.rank,
         res.world,
     )
-    res.v5_cur = 1 - cur
     return hs_out, residual_out
