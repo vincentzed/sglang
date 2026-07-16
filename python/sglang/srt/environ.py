@@ -1008,6 +1008,16 @@ class Envs:
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
+    # Route eligible TP all-reduces (bf16, world size 4/8, numel % 8 == 0)
+    # through the JIT symm-mem custom AR family (two-shot / multimem one-shot /
+    # push one-shot) instead of NCCL / custom-allreduce. Enlarges the torch
+    # symm-mem buffer to 256 MiB per rank. Ineligible shapes keep the default
+    # dispatch. See srt/distributed/device_communicators/symm_mem_custom_ar.py.
+    SGLANG_OPT_USE_SYMM_MEM_CUSTOM_AR = EnvBool(False)
+    # Fuse decode/EAGLE-verify {all-reduce -> residual-add + RMSNorm} chains
+    # into one symm-mem kernel (block per token) at both per-layer TP seams.
+    # Requires SGLANG_OPT_USE_SYMM_MEM_CUSTOM_AR.
+    SGLANG_OPT_USE_SYMM_MEM_FUSED_AR_NORM = EnvBool(False)
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)

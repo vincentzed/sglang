@@ -431,10 +431,20 @@ class GroupCoordinator:
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
-        if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
+        # The JIT custom-AR drop-in targets the TP group only (in pure-TP
+        # deployments _ATTN_TP and _MOE_TP alias _TP, so both per-layer AR
+        # seams route through this one coordinator).
+        use_symm_mem_custom_ar = (
+            envs.SGLANG_OPT_USE_SYMM_MEM_CUSTOM_AR.get() and group_name == "tp"
+        )
+        if (
+            self.use_torch_symm_mem_all_reduce or use_symm_mem_custom_ar
+        ) and self.world_size > 1:
             self.torch_symm_mem_comm = TorchSymmMemCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+                plain_all_reduce_enabled=self.use_torch_symm_mem_all_reduce,
+                custom_ar_enabled=use_symm_mem_custom_ar,
             )
 
         # Create communicator for other hardware backends
@@ -642,6 +652,15 @@ class GroupCoordinator:
         ):
             outplace_all_reduce_method = "ca"
         elif (
+            self.torch_symm_mem_comm is not None
+            and self.torch_symm_mem_comm.should_custom_all_reduce(input_)
+            and not is_in_tc_piecewise_cuda_graph()
+        ):
+            # JIT symm-mem custom AR (SGLANG_OPT_USE_SYMM_MEM_CUSTOM_AR):
+            # serves the payload band the ca communicator declines (its size
+            # cap) but that would otherwise fall to graph-pinned NCCL RING_LL.
+            outplace_all_reduce_method = "symm_mem_custom"
+        elif (
             self.qr_comm is not None
             and not self.qr_comm.disabled
             and self.qr_comm.should_quick_allreduce(input_)
@@ -758,6 +777,9 @@ class GroupCoordinator:
         elif outplace_all_reduce_method == "qr":
             assert not qr_comm.disabled
             out = qr_comm.quick_all_reduce(input_)
+        elif outplace_all_reduce_method == "symm_mem_custom":
+            assert not torch_symm_mem_comm.disabled
+            out = torch_symm_mem_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
             out = torch_symm_mem_comm.all_reduce(input_)

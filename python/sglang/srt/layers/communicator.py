@@ -23,9 +23,15 @@ import torch
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
+    get_moe_tp_group,
     get_tp_group,
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.device_communicators.symm_mem_custom_ar import (
+    fused_ar_add_rmsnorm,
+    fused_ar_rmsnorm_eligible,
+    fused_ar_rmsnorm_shape_eligible,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -159,6 +165,26 @@ def _fused_rmsnorm_fp8_per_token_quant(
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
 # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+
+
+def _symm_fused_ar_rmsnorm_ok(layernorm: torch.nn.Module) -> bool:
+    """The fused symm-mem {AR -> add + RMSNorm} kernel replicates plain-RMSNorm
+    fused_add_rmsnorm numerics only (no HF cast semantics, no variance-size
+    override, no subclass epilogues)."""
+    from sglang.srt.layers.layernorm import RMSNorm
+
+    return (
+        type(layernorm) is RMSNorm
+        and not layernorm.cast_x_before_out_mul
+        and layernorm.variance_size_override is None
+    )
+
+
+def _apply_symm_fused_ar_rmsnorm(forward_batch: ForwardBatch) -> bool:
+    """Mode gate for the fused symm-mem {AR -> add + RMSNorm} kernel: the
+    block-per-token layout only covers decode / EAGLE target-verify shapes."""
+    fm = forward_batch.forward_mode
+    return fm.is_decode() or fm.is_target_verify()
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):
@@ -566,6 +592,19 @@ class LayerCommunicator:
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
                 if (
+                    _apply_symm_fused_ar_rmsnorm(forward_batch)
+                    and _symm_fused_ar_rmsnorm_ok(self.input_layernorm)
+                    and fused_ar_rmsnorm_eligible(
+                        get_moe_tp_group(), hidden_states, residual
+                    )
+                ):
+                    hidden_states, residual = fused_ar_add_rmsnorm(
+                        hidden_states,
+                        residual,
+                        self.input_layernorm,
+                        get_moe_tp_group(),
+                    )
+                elif (
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
@@ -805,6 +844,15 @@ class LayerCommunicator:
             (
                 apply_flashinfer_allreduce_fusion(batch_size)
                 or (
+                    _apply_symm_fused_ar_rmsnorm(forward_batch)
+                    and _symm_fused_ar_rmsnorm_ok(self.input_layernorm)
+                    and fused_ar_rmsnorm_shape_eligible(
+                        get_moe_tp_group(),
+                        batch_size,
+                        self.input_layernorm.weight.shape[0],
+                    )
+                )
+                or (
                     _use_aiter
                     and batch_size > 0
                     and get_parallel().tp_size != 6
@@ -1042,7 +1090,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
         (``moe_dense_tp_size > 1``): both hidden states and residual stay in
         ``TP_ATTN_FULL`` across the boundary.
         """
-        hidden_states = get_parallel().attn_tp_group.all_reduce(hidden_states)
+        attn_tp_group = get_parallel().attn_tp_group
+        if (
+            _apply_symm_fused_ar_rmsnorm(forward_batch)
+            and _symm_fused_ar_rmsnorm_ok(layernorm)
+            and fused_ar_rmsnorm_eligible(attn_tp_group, hidden_states, residual)
+        ):
+            return fused_ar_add_rmsnorm(
+                hidden_states, residual, layernorm, attn_tp_group
+            )
+        hidden_states = attn_tp_group.all_reduce(hidden_states)
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
