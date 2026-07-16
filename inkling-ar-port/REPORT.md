@@ -174,9 +174,19 @@ grid is capped by barrier co-residency. Expected best case is < 1% e2e on TTFT
 for new two-shot kernel complexity with a new row-aligned partition. Not
 justified; revisit only if TP8 shows a different transport picture.
 
-## Step 6 — accuracy parity
+## Step 6 — accuracy parity (flag-on build, TP4)
 
-TODO(table): GSM8K ≥ 0.92, AIME25 within ±σ of 91.25, spec + no-spec.
+| eval | config | score | gate | verdict |
+|---|---|---|---|---|
+| GSM8K | EAGLE 5-1-6, max-tokens 8192 | **95.53%** | >= 0.92 | PASS |
+| AIME25 (n=8, 64k tok, T=1.0/top-p 0.95) | EAGLE 5-1-6 | RUNNING | 91.25 +/- 4 | - |
+| GSM8K | no-spec | PENDING | >= 0.92 | - |
+
+Eval hygiene note: the canon `SGLANG_SIMULATE_ACC_LEN=3.5` pin is for SPEED
+benches only (it simulates draft acceptance and corrupts outputs); the serve
+script now gates it behind SIM_ACC=1 so accuracy servers never inherit it.
+GSM8K needs `--max-tokens` bounded (8192): a handful of prompts send the
+thinking model into 400k-token reasoning loops that pin the whole KV pool.
 
 ## Mechanism attribution
 
