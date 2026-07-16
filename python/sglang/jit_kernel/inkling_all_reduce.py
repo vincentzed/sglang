@@ -71,8 +71,11 @@ _AR_TUNED_TP4 = {
     48: ("v5", 48, 1024),
     64: ("v5", 48, 1024),
     96: ("v5", 64, 1024),
-    128: ("mm", 0, 0),
-    192: ("mm", 0, 0),
+    # 128-192 re-swept on B300 TP4 (scratch/ar-port/bench_sweep_tp4_sweep1.json):
+    # v5/v3b beat the original "mm" picks; 160 covers EAGLE verify (bs*6).
+    128: ("v5", 0, 1024),
+    160: ("v5", 148, 512),
+    192: ("v3b", 48, 768),
     256: ("v3b", 64, 1024),
     384: ("v3b", 32, 1024),
     512: ("v3b", 32, 1024),
@@ -104,6 +107,7 @@ _AR_TUNED_TP8 = {
     64: ("mm", 0, 0),
     96: ("mm", 0, 0),
     128: ("mm", 0, 0),
+    160: ("mm", 0, 0),  # grid alignment with the TP4 table (unswept at TP8)
     192: ("mm", 0, 0),
     256: ("mm", 0, 0),
     384: ("mm", 0, 0),
