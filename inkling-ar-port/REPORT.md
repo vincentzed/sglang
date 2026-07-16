@@ -150,6 +150,19 @@ the balance. The v1-build numbers stand only as an upper bound on what a
 producer-direct-write integration (get_ar_buffer + audited consumers, the
 Inkling model's approach) could safely recover — filed as follow-up.
 
+**Upstream-alternative control arm (`--enable-torch-symm-mem`, canon flags
+otherwise):** 80k TTFT 3394.4 [3388.4/3394.4/3399.1], 8k-c1 TPOT 3.15,
+8k-c16 TTFT **2672.9** [2819.7/2668.7/2672.9], out tok/s 1433. The EXISTING
+upstream flag captures the same c16 mid-band win as the custom AR (2672.9 vs
+2670.4 — within noise): both fix the same defect (graph-pinned RING_LL at
+mid-band chunks), and although the custom v3b is ~1.5x faster per AR than
+torch's op at those shapes, the delta is e2e-invisible at TP4. What the
+custom port still uniquely provides: the fused bit-identical {AR->norm}
+kernel (no TP4 win, default-OFF), the kernel-level headroom for TP8 and for
+a producer-direct-write integration, and per-AR latency that may matter at
+higher layer counts / different topologies. For immediate TP4 deployment,
+`--enable-torch-symm-mem` is the zero-new-code option with the same result.
+
 ## Step 4 — fused decode A/B (TP4, both flags on vs drop-in only)
 
 | metric | drop-in only | + fused AR->norm | delta |
