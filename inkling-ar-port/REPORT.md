@@ -233,9 +233,9 @@ fused AR+norm kernel got the same entry barrier.
 
 | eval | config | score | gate | verdict |
 |---|---|---|---|---|
-| GSM8K | EAGLE 5-1-6, max-tokens 8192 | **95.68** | >= 0.92 | PASS |
-| AIME25 (n=8, 64k tok, T=1.0/top-p 0.95) | EAGLE 5-1-6 | **92.92 +/- 2.78** | 91.25 +/- 4 | PASS (== flag-off) |
-| GSM8K | no-spec | PENDING | >= 0.92 | - |
+| GSM8K | EAGLE 5-1-6, final banded build | **95.91** | >= 0.92 | PASS |
+| GSM8K | no-spec, final banded build | **95.45** | >= 0.92 | PASS (no hang) |
+| AIME25 (n=8, 64k tok, T=1.0/top-p 0.95) | EAGLE 5-1-6 | **92.92 +/- 2.78** | 91.25 +/- 4 | PASS (== flag-off 92.92 +/- 3.30) |
 
 Eval hygiene notes: (1) the canon `SGLANG_SIMULATE_ACC_LEN=3.5` pin is for
 SPEED benches only (it simulates draft acceptance and corrupts outputs); the
