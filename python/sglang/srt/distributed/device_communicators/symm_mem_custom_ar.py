@@ -59,6 +59,15 @@ AR_WORLD_SIZES = (4, 8)
 # [16384, 6144] bf16 = 192 MiB) plus the rotating v4/v5 tail regions below.
 CUSTOM_AR_BUFFER_BYTES = 256 * 1024 * 1024
 
+# Only intercept payloads in the measured win band. Below the ca communicator's
+# size cap, sglang's own custom allreduce already serves the latency band well
+# (the ladder checks ca first). Above ~40 MiB (~3072 tokens at hidden 6144),
+# graph-pinned NCCL RING_LL runs at the same ~586 GB/s topology wall as the
+# multimem kernels on B300, and the mandatory copy-back (see custom_all_reduce)
+# tips the balance to NCCL: v3b+copy beats NCCL by 1.3-1.5x at 192-3072 tokens
+# but loses ~10% at 8192+. Re-sweep before changing (bench_custom_ar.py).
+CUSTOM_AR_MAX_PAYLOAD_BYTES = 40 * 1024 * 1024
+
 # v4 (full one-shot) is out-of-place and drops the exit barrier, so it needs a
 # double-buffered input: two rotating input regions (A/B) + one output at the
 # tail of the symm buffer. Sized to a few rows at hidden<=6144; v4 only fires
@@ -188,14 +197,20 @@ def custom_all_reduce(
     group_name: str,
     res: SymmMemCustomArResources,
 ) -> torch.Tensor:
-    """All-reduce ``inp`` with the autotuned custom kernel family.
+    """All-reduce ``inp`` with the autotuned custom kernel family, IN PLACE.
 
     The caller must have passed ``should_custom_all_reduce``-style eligibility
-    (bf16, numel % AR_VEC == 0, fits the buffer, resources built). Returns a
-    VIEW of the symm buffer holding the reduced result -- the caller must
-    consume it before issuing the next all-reduce on this group (true for
-    transformer AR->norm->GEMM seams, where every consumer kernel launches
-    before the next AR).
+    (bf16, numel % AR_VEC == 0, fits the buffer, resources built). The reduced
+    result is copied back into ``inp`` (which is returned): callers keep an
+    allocator-owned tensor with a normal lifetime, exactly like the NCCL
+    in-place path. Returning symm-buffer VIEWS instead is NOT safe for a
+    model-agnostic drop-in -- consumers may hold the result across scheduler
+    steps (e.g. EAGLE verify hidden states feed the NEXT step's draft pass),
+    by which time later ARs have overwritten the region. Measured on GLM-5.2
+    TP4 EAGLE AIME25: views of the v5 out region scored 78.3 (vs 92.9
+    baseline) and views of buffer[:n] -- which every extend-chunk AR also
+    clobbers -- scored 25.5. The copy-back costs ~2 us at decode shapes and
+    ~30 us at 8k-token chunks.
     """
     jit = _ar_jit()
     n = inp.numel()
@@ -233,7 +248,8 @@ def custom_all_reduce(
             per_block_barrier=True,
             entry_barrier=True,
         )
-        return out_view.view(inp.shape)
+        inp.copy_(out_view.view(inp.shape))
+        return inp
 
     buf = buffer[:n]
     buf.copy_(inp.view(-1))
@@ -250,7 +266,8 @@ def custom_all_reduce(
             bs,
             per_block_barrier=(kernel == "v3b"),
         )
-        return buf.view(inp.shape)
+        inp.copy_(buf.view(inp.shape))
+        return inp
     if kernel == "v2":
         jit.inkling_two_shot_all_reduce_fused(
             buf,
@@ -263,11 +280,13 @@ def custom_all_reduce(
             nb,
             bs,
         )
-        return buf.view(inp.shape)
+        inp.copy_(buf.view(inp.shape))
+        return inp
     # "mm" bucket (and v5/v4 payloads that outgrew their regions): torch
     # multimem on the symm buffer.
     torch.ops.symm_mem.multimem_all_reduce_(buf, "sum", group_name)
-    return buf.view(inp.shape)
+    inp.copy_(buf.view(inp.shape))
+    return inp
 
 
 def fused_ar_rmsnorm_shape_eligible(

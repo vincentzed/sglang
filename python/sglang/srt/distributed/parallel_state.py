@@ -645,20 +645,21 @@ class GroupCoordinator:
 
         outplace_all_reduce_method = None
         if (
-            self.torch_symm_mem_comm is not None
-            and self.torch_symm_mem_comm.should_custom_all_reduce(input_)
-            and not is_in_tc_piecewise_cuda_graph()
-        ):
-            # JIT symm-mem custom AR (SGLANG_OPT_USE_SYMM_MEM_CUSTOM_AR):
-            # checked first so eligible shapes never fall to ca/NCCL.
-            outplace_all_reduce_method = "symm_mem_custom"
-        elif (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and not should_use_pymscclpp_allreduce
             and self.ca_comm.should_custom_ar(input_)
         ):
             outplace_all_reduce_method = "ca"
+        elif (
+            self.torch_symm_mem_comm is not None
+            and self.torch_symm_mem_comm.should_custom_all_reduce(input_)
+            and not is_in_tc_piecewise_cuda_graph()
+        ):
+            # JIT symm-mem custom AR (SGLANG_OPT_USE_SYMM_MEM_CUSTOM_AR):
+            # serves the payload band the ca communicator declines (its size
+            # cap) but that would otherwise fall to graph-pinned NCCL RING_LL.
+            outplace_all_reduce_method = "symm_mem_custom"
         elif (
             self.qr_comm is not None
             and not self.qr_comm.disabled

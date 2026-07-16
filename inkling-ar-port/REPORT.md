@@ -125,12 +125,30 @@ by `inkling_multimem_one_shot_fused_kernel<bf16,4,false>` (v3) at 258.3 µs/call
 (12.5% faster per AR); total GPU kernel time -2.6% (1849 -> 1801 ms); nothing
 new above 1%. Greedy smoke output identical to baseline.
 
-Verdict vs Step 1b headroom: the custom AR captured ~100% of the (small)
-prefill transport headroom AND the large decode/verify-band headroom NCCL
-could never reach (v5 at 6-14 µs vs 17-23 µs) — the latter drives the -10/-18%
-TPOT and +20% throughput, well past the >=5% bar on the decode-facing
-workloads; the 80k TTFT lands at -4.5% with the shortfall vs 5% fully
-root-caused by the ~586 GB/s topology wall above.
+IMPORTANT: the table above is the INITIAL (v1) build, which was later found
+to violate a tensor-lifetime contract (see Step 6) — its decode-band wins
+were partly an artifact of unsafe buffer-view returns. The FINAL, correct
+build (in-place copy-back + entry-barrier v5 + ca-first ladder + 40 MiB
+payload cap) measures:
+
+| metric | flag OFF | flag ON (final) | delta |
+|---|---|---|---|
+| 80k TTFT ms | 3390.0 | 3389.4 [3389.4/3389.2/3400.2] | 0 |
+| 8k-c1 TPOT ms | 3.15 | 3.14 | 0 |
+| 8k-c16 TTFT ms | 2923.6 | **2670.4** [2668.3/2670.4/2671.7] | **-8.7%** |
+| 8k-c16 output tok/s | 1409 | 1440 | +2.2% |
+
+Final verdict: after correctness, the durable TP4 win is the MID-BAND chunk
+transport (192-3072 tokens — exactly the mixed continuous-batching chunks of
+concurrent serving), where v3b+copy-back beats graph-pinned NCCL RING_LL by
+1.3-1.5x per AR: -8.7% TTFT / +2.2% output tok/s at 8k-c16, strictly neutral
+everywhere else. Decode-band ARs stay with sglang's ca communicator +
+flashinfer fusion (already optimal at TP4; the ladder now checks ca first).
+Huge-chunk prefill (8192+) stays NCCL by the 40 MiB cap: RING_LL already runs
+within ~7% of the topology's ~586 GB/s wall and the mandatory copy-back tips
+the balance. The v1-build numbers stand only as an upper bound on what a
+producer-direct-write integration (get_ar_buffer + audited consumers, the
+Inkling model's approach) could safely recover — filed as follow-up.
 
 ## Step 4 — fused decode A/B (TP4, both flags on vs drop-in only)
 
@@ -174,18 +192,55 @@ grid is capped by barrier co-residency. Expected best case is < 1% e2e on TTFT
 for new two-shot kernel complexity with a new row-aligned partition. Not
 justified; revisit only if TP8 shows a different transport picture.
 
-## Step 6 — accuracy parity (flag-on build, TP4)
+## Step 6 — accuracy parity: a real bug found, root-caused, and fixed
+
+AIME25 exposed a genuine correctness bug in the initial port that GSM8K
+missed. The full bisection (TP4 EAGLE, sgl-eval, n=8 x 64k tokens):
+
+| arm | AIME25 pass@1[avg-8] | GSM8K |
+|---|---|---|
+| flag OFF (baseline) | **92.92 +/- 3.30** | 95.60 |
+| flag ON, v1: rotating single-barrier v5, buffer-VIEW returns | 78.33 +/- 3.09 | 95.53 |
+| flag ON, v2: entry-barrier v5 (rotation removed), VIEW returns | 78.54 (partial) | 95.38 |
+| flag ON, bisect: v5->torch-multimem, VIEW returns | **25.52** (partial) | - |
+| flag ON, FINAL: entry-barrier v5 + IN-PLACE copy-back | **92.92 +/- 2.78** (pass@8 100%) | **95.68** |
+
+Root cause: the port returned the AR result as a VIEW of the shared symm
+buffer. That contract is unsafe for a model-agnostic drop-in: consumers can
+hold the result ACROSS scheduler steps — in the EAGLE pipeline, verify-step
+hidden states feed the NEXT step's draft pass, by which time later ARs have
+overwritten the region. The bisect arm nailed the mechanism: v5's out region
+(clobbered only by other decode v5 calls) lost ~14 pts, while buffer[:0..n]
+views (clobbered by EVERY extend-chunk AR too, e.g. during KV-full
+retraction re-prefills) collapsed to 25.5%. Deterministic reproduction
+(78.33 vs 78.54 across two v5 builds) ruled out a data race and pointed at a
+lifetime bug. GSM8K stayed ~95.5% throughout because its short chains rarely
+cross the step boundaries that recycle the regions.
+
+Fix (final build): `custom_all_reduce` copies the reduced result back into
+the caller's tensor and returns it — exactly the NCCL in-place contract, so
+callers keep an allocator-owned tensor with a normal lifetime. Cost: ~2 us at
+decode shapes, ~30 us at 8k chunks (reflected in the final speed A/B).
+
+A second latent hazard was fixed along the way: the Inkling v5 A/B staging
+rotation requires an EVEN rotated-AR count per captured CUDA graph, but EAGLE
+verify graphs with flashinfer seam-B fusion issue an ODD count (one v5 per
+layer at seam A + a single unfused last-layer seam-B AR). The drop-in v5 now
+takes a per-block ENTRY barrier before its multicast push instead of
+rotating: one staging slot, safe for any AR sequence (+3.6-12 us, which moves
+the v5/torch-multimem crossover from ~128 to ~24 rows; tables re-swept). The
+fused AR+norm kernel got the same entry barrier.
 
 | eval | config | score | gate | verdict |
 |---|---|---|---|---|
-| GSM8K | EAGLE 5-1-6, max-tokens 8192 | **95.53%** | >= 0.92 | PASS |
-| AIME25 (n=8, 64k tok, T=1.0/top-p 0.95) | EAGLE 5-1-6 | RUNNING | 91.25 +/- 4 | - |
+| GSM8K | EAGLE 5-1-6, max-tokens 8192 | **95.68** | >= 0.92 | PASS |
+| AIME25 (n=8, 64k tok, T=1.0/top-p 0.95) | EAGLE 5-1-6 | **92.92 +/- 2.78** | 91.25 +/- 4 | PASS (== flag-off) |
 | GSM8K | no-spec | PENDING | >= 0.92 | - |
 
-Eval hygiene note: the canon `SGLANG_SIMULATE_ACC_LEN=3.5` pin is for SPEED
-benches only (it simulates draft acceptance and corrupts outputs); the serve
-script now gates it behind SIM_ACC=1 so accuracy servers never inherit it.
-GSM8K needs `--max-tokens` bounded (8192): a handful of prompts send the
+Eval hygiene notes: (1) the canon `SGLANG_SIMULATE_ACC_LEN=3.5` pin is for
+SPEED benches only (it simulates draft acceptance and corrupts outputs); the
+serve script gates it behind SIM_ACC=1 so accuracy servers never inherit it.
+(2) GSM8K needs `--max-tokens` bounded (8192): a handful of prompts send the
 thinking model into 400k-token reasoning loops that pin the whole KV pool.
 
 ## Mechanism attribution

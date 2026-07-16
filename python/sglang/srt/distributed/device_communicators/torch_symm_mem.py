@@ -14,6 +14,7 @@ from sglang.srt.distributed.device_communicators.all_reduce_utils import (
 from sglang.srt.distributed.device_communicators.symm_mem_custom_ar import (
     AR_VEC,
     CUSTOM_AR_BUFFER_BYTES,
+    CUSTOM_AR_MAX_PAYLOAD_BYTES,
     build_custom_ar_resources,
     custom_all_reduce,
 )
@@ -187,7 +188,7 @@ class TorchSymmMemCommunicator:
         n = inp.numel()
         if n == 0 or n % AR_VEC != 0:
             return False
-        return n * inp.element_size() < self.max_size
+        return n * inp.element_size() <= CUSTOM_AR_MAX_PAYLOAD_BYTES
 
     def custom_all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """Custom-AR dispatch; caller must have passed should_custom_all_reduce.
