@@ -37,10 +37,13 @@ from typing import TYPE_CHECKING
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from torch.distributed._symmetric_memory import _SymmetricMemory
+
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +108,16 @@ def _ar_jit():
     return inkling_all_reduce
 
 
+@functools.cache
+def _ar_norm_jit():
+    """The fused {AR -> add + RMSNorm} JIT wrapper module."""
+    if not is_cuda():
+        return None
+    from sglang.jit_kernel import inkling_ar_norm
+
+    return inkling_ar_norm
+
+
 def build_custom_ar_resources(
     *,
     buffer: torch.Tensor,
@@ -145,6 +158,10 @@ def build_custom_ar_resources(
     flags_handle.barrier()
     state = torch.zeros(jit.STATE_SIZE, device=device, dtype=torch.uint32)
     jit.compile_inkling_all_reduce(buffer.dtype, world_size)
+    if envs.SGLANG_OPT_USE_SYMM_MEM_FUSED_AR_NORM.get():
+        # Warm the fused {AR -> add + RMSNorm} module too: its first call can
+        # land inside a CUDA-graph capture, which must not pay an nvcc compile.
+        _ar_norm_jit().compile_inkling_ar_norm(buffer.dtype, world_size)
 
     total = buffer.numel()
     v4reg = _AR_V4_REGION
@@ -266,3 +283,86 @@ def custom_all_reduce(
     # multimem on the symm buffer.
     torch.ops.symm_mem.multimem_all_reduce_(buf, "sum", group_name)
     return buf.view(inp.shape)
+
+
+def fused_ar_rmsnorm_shape_eligible(
+    group: "GroupCoordinator",
+    num_tokens: int,
+    hidden: int,
+) -> bool:
+    """Shape-only gate for the fused {AR -> add + RMSNorm} kernel -- what a
+    PRODUCER (should_fuse_mlp_allreduce_with_next_layer) can evaluate before
+    the tensor exists. A pure function of per-forward state: every rank must
+    take the same branch (the in-kernel barrier deadlocks on divergence)."""
+    if not envs.SGLANG_OPT_USE_SYMM_MEM_FUSED_AR_NORM.get():
+        return False
+    comm = group.torch_symm_mem_comm
+    if comm is None or comm.disabled or comm.custom_ar_resources is None:
+        return False
+    if num_tokens < 1 or num_tokens > _ar_jit().MAX_BARRIER_BLOCKS:
+        return False
+    if hidden % AR_VEC != 0 or hidden // AR_VEC > 1024:
+        return False
+    return num_tokens * hidden <= _AR_V5_REGION
+
+
+def fused_ar_rmsnorm_eligible(
+    group: "GroupCoordinator",
+    inp: torch.Tensor,
+    residual: torch.Tensor | None,
+) -> bool:
+    """Full consumer-side gate for the fused {AR -> add + RMSNorm} kernel.
+
+    A consumer-side False after a producer-side (shape-only) True is safe --
+    the caller's unfused branch still performs the all-reduce.
+    """
+    if residual is None or inp.dim() != 2:
+        return False
+    comm = group.torch_symm_mem_comm
+    if comm is None or comm.disabled:
+        return False
+    if inp.dtype != comm.dtype or inp.device != comm.device:
+        return False
+    if not fused_ar_rmsnorm_shape_eligible(group, inp.shape[0], inp.shape[1]):
+        return False
+    if not (inp.is_contiguous() and residual.is_contiguous()):
+        return False
+    return inp.data_ptr() % 16 == 0 and residual.data_ptr() % 16 == 0
+
+
+def fused_ar_add_rmsnorm(
+    inp: torch.Tensor,
+    residual: torch.Tensor,
+    layernorm: torch.nn.Module,
+    group: "GroupCoordinator",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused decode/verify {all-reduce -> residual-add + RMSNorm}: one kernel
+    replacing {custom AR + fused_add_rmsnorm}. ``inp`` holds the UNREDUCED
+    partial sums; returns ``(hidden_states, residual)`` exactly like the
+    unfused ``layernorm(all_reduce(inp), residual)`` chain. The caller must
+    have checked ``fused_ar_rmsnorm_eligible``. Occupies one v5 staging
+    rotation slot (this IS a v5 AR with the epilogue seam filled in; same
+    reuse-distance-2 invariant)."""
+    comm = group.torch_symm_mem_comm
+    res = comm.custom_ar_resources
+    hs_out = torch.empty_like(inp)
+    residual_out = torch.empty_like(residual)
+    cur = res.v5_cur
+    stage_off = res.v5_in[cur]
+    esz = comm.buffer.element_size()
+    _ar_norm_jit().inkling_ar_add_rmsnorm(
+        inp,
+        residual,
+        residual_out,
+        hs_out,
+        layernorm.weight,
+        layernorm.variance_epsilon,
+        res.multicast_ptr + stage_off * esz,
+        comm.buffer.data_ptr() + stage_off * esz,
+        res.flag_ptrs_dev,
+        res.state_ptr,
+        res.rank,
+        res.world,
+    )
+    res.v5_cur = 1 - cur
+    return hs_out, residual_out
