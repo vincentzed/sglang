@@ -75,25 +75,104 @@ experiment measures end-to-end.
 
 ## Step 1 — baseline + NCCL settling experiment
 
-TODO(table): {default, NVLS, Simple} × {AR kernel name, AR ms & share,
-per-AR ms, implied busbw, TTFT, input tok/s} + verdict.
+Canon TP4 EAGLE launch (CPS=8192), 80k workload, 3 reps each, medians [raws].
+Profile: 6-step capture during an 80k prefill; per-AR times from the rank-0 trace.
 
-## Step 3 — transport-only A/B
+| arm | AR kernel (extend) | AR share | per-AR µs (T=8192) | implied busbw | TTFT ms | input tok/s |
+|---|---|---|---|---|---|---|
+| default | `AllReduce_Sum_bf16_RING_LL` | 15.3% | 295.2 | 512 GB/s | 3390.0 [3387.9/3398.5/3390.0] | 23649 |
+| `--enable-nccl-nvls` | `AllReduce_Sum_bf16_RING_LL` (unchanged) | 14.7% | 282.2 | 535 GB/s | 3392.9 [3392.8/3392.9/3398.8] | 23642 |
+| + `NCCL_ALGO=allreduce:nvls` (forced) | `AllReduce_Sum_bf16_RING_LL` (still!) | 18.3% | 364.4 | 414 GB/s | 3506.6 [3506.6/3510.9/3502.7] | 22855 |
+| `NCCL_PROTO=Simple` | `AllReduce_Sum_bf16_RING_LL` (still!) | 14.5% | 276.5 | 547 GB/s | 3389.8 [3406.4/3384.5/3389.8] | 23589 |
 
-TODO(table): flag-off vs flag-on, TP4 workloads 80k/8k-c1/8k-c16, 3 reps,
-medians + raws; flag-on profile shows RING_LL gone.
+**Verdict: the NCCL environment reclaims NOTHING.** Three mechanisms compose:
+1. sglang sets `NCCL_NVLS_ENABLE=0` by default (`entrypoints/engine.py:1262-1267`)
+   unless `--enable-nccl-nvls` — NVLS resources don't even exist in the canon
+   config. (Also: bare `NCCL_ALGO=NVLS` fails comm init with "invalid usage" —
+   the per-collective `allreduce:nvls` syntax is required.)
+2. Even with NVLS resources enabled, these all-reduces execute inside captured
+   CUDA graphs where this NCCL build pins the captured collective to the
+   RING_LL kernel; the algo/proto env never reaches them (forcing NVLS only
+   perturbed the LL tuning and REGRESSED TTFT by 3.4%).
+3. RING_LL at the 8192-token chunk already runs ~547 GB/s effective busbw —
+   within ~7% of the ~586 GB/s wall that BOTH torch multimem and the custom
+   multimem/NVLS kernels hit on this 4-of-8-GPU B300 topology. The pre-work's
+   "LL half-bandwidth" framing does not hold at TP4: there is no big prefill
+   transport win for ANY same-topology kernel, custom or NCCL.
 
-## Step 4 — fused decode A/B
+Headroom calibration for Steps 2-3: prefill-size transport ≈ 12% of the AR
+line (~1.5-2% e2e); the decode/verify band (v5: 1.6-2.9x) and the mid-size
+chunk band (v3b: 1.4-1.5x at 256-4096 tokens) hold the real win.
 
-TODO(table): decode TPOT c1/c16 with SGLANG_SIMULATE_ACC_LEN pinned; kernel
-table showing QuantType-0 + NVFP4Quantize lines collapsed.
-NVFP4 quant epilogue at seam A: deferred as follow-up (norm-only landed at
-both seams first — call made explicitly per plan; the runner-bypass plumbing
-through `quantize_hidden_states_fp4` is the balloon risk item).
+## Step 3 — transport-only A/B (TP4)
 
-## Step 5 — prefill row-aligned fused kernel: go/no-go
+Identical box/image/checkpoint/flags; the ONLY difference is
+`SGLANG_OPT_USE_SYMM_MEM_CUSTOM_AR=1`. Server restarted per arm; 3 reps each,
+medians [raws].
 
-TODO: decision from Step 3 numbers.
+| metric | flag OFF | flag ON | delta |
+|---|---|---|---|
+| 80k TTFT ms | 3390.0 [3387.9/3398.5/3390.0] | 3238.2 [3235.2/3238.2/3247.8] | **-4.5%** |
+| 80k input tok/s | 23649 | 24702 | +4.5% |
+| 8k-c1 TTFT ms | 302.1 | 289.0 | -4.3% |
+| 8k-c1 TPOT ms | 3.15 | 2.83 | **-10.2%** |
+| 8k-c16 TTFT ms | 2923.6 [2673.6/2923.6/2965.4] | 2532.9 [2880.2/2530.9/2532.9] | **-13.4%** |
+| 8k-c16 TPOT ms | 8.49 | 6.96 | **-18.0%** |
+| 8k-c16 output tok/s | 1409 | 1691 | **+20.0%** |
+
+Flag-on profile (80k prefill): `AllReduce_Sum_bf16_RING_LL` is GONE, replaced
+by `inkling_multimem_one_shot_fused_kernel<bf16,4,false>` (v3) at 258.3 µs/call
+(12.5% faster per AR); total GPU kernel time -2.6% (1849 -> 1801 ms); nothing
+new above 1%. Greedy smoke output identical to baseline.
+
+Verdict vs Step 1b headroom: the custom AR captured ~100% of the (small)
+prefill transport headroom AND the large decode/verify-band headroom NCCL
+could never reach (v5 at 6-14 µs vs 17-23 µs) — the latter drives the -10/-18%
+TPOT and +20% throughput, well past the >=5% bar on the decode-facing
+workloads; the 80k TTFT lands at -4.5% with the shortfall vs 5% fully
+root-caused by the ~586 GB/s topology wall above.
+
+## Step 4 — fused decode A/B (TP4, both flags on vs drop-in only)
+
+| metric | drop-in only | + fused AR->norm | delta |
+|---|---|---|---|
+| 8k-c1 TPOT ms | 2.83 | 2.89 | +2.1% (worse) |
+| 8k-c16 TPOT ms | 6.96 | 7.06 | +1.4% (worse) |
+| 8k-c16 output tok/s | 1691 | 1669 | -1.3% |
+| 80k TTFT ms | 3238.2 | 3239.2 | ~0 (prefill untouched by design) |
+
+Decode-window kernel table (isl=1024/osl=512, bs=1 EAGLE): the fused
+`inkling_ar_add_rmsnorm_kernel` (12.2 µs/call incl. in-kernel producer wait)
+replaces {AR + norm} pairs, but flashinfer's lamport-based
+`oneshotAllreduceFusionKernel` (8.7 µs/call) — which the baseline/drop-in arms
+already use at seam B via the auto-enabled allreduce fusion — is competitive
+at these bs<=16 shapes, so displacing it nets slightly negative.
+
+**Call:** the fused kernel is correct (bit-identical, graph-safe) but adds no
+e2e win at TP4-EAGLE where flashinfer's fusion already covers seam B;
+`SGLANG_OPT_USE_SYMM_MEM_FUSED_AR_NORM` stays default-OFF. Win-case to
+revisit: configs where the flashinfer fusion is unavailable (workspace limits,
+disabled backend, no-mnnvl) and TP8. The NVFP4 quant epilogue at seam A is
+filed as follow-up per plan (norm-only landed first; the
+`quantize_hidden_states_fp4` runner-bypass plumbing is the balloon risk).
+
+Also observed: at extend T<=2048 (inside flashinfer's fusion cap) the MNNVL
+`twoshotAllreduceKernel` burns 628 µs/call at T=1024 (62% of that window's GPU
+time, spin-wait heavy). The custom v3b does T=1024 in 44 µs — extending the
+drop-in to displace the flashinfer EXTEND-band fusion is a promising follow-up
+(not wired: my gates deliberately leave extend to the existing path).
+
+## Step 5 — prefill row-aligned fused kernel: NO-GO (data-backed)
+
+Two measured facts close this: (1) at prefill chunk sizes the AR transport is
+at the ~586 GB/s topology wall — a row-aligned fused variant cannot beat the
+wall, it can only fold the separate norm (3.2% of prefill GPU time) into the
+AR's exit phase; (2) Inkling's own extend-shape measurements (comm.py
+docstring) found the in-kernel norm tail 1-18% SLOWER than the standalone
+fused_add_rmsnorm at T=512-16384 — the tail is bandwidth-bound while the AR
+grid is capped by barrier co-residency. Expected best case is < 1% e2e on TTFT
+for new two-shot kernel complexity with a new row-aligned partition. Not
+justified; revisit only if TP8 shows a different transport picture.
 
 ## Step 6 — accuracy parity
 
