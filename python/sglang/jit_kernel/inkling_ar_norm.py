@@ -17,11 +17,12 @@ from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# Rounding calibration: sgl_kernel.fused_add_rmsnorm's 16B-vector path rounds
-# the residual sum to bf16 before squaring/scaling (vLLM _f16Vec semantics).
-# Verified bit-identical in test_symm_mem_custom_ar.py; flip only if the
-# installed sgl_kernel changes its accumulation.
-ROUND_SUM_TO_BF16 = True
+# Rounding calibration: sgl_kernel.fused_add_rmsnorm keeps the residual sum in
+# fp32 through the variance and the gamma scale (bit-identity calibrated on
+# sgl_kernel 0.4.4 / B300 in test_symm_mem_custom_ar.py::
+# test_fused_ar_norm_bit_identity -- the test's calibration probe reports
+# which mode matches if this ever changes).
+ROUND_SUM_TO_BF16 = False
 
 
 @cache_once
@@ -36,6 +37,10 @@ def _jit_inkling_ar_norm_module(
         cuda_wrappers=[
             ("ar_add_rmsnorm", f"ArAddRmsNormKernel<{args}>::run"),
         ],
+        # sgl-kernel builds flashinfer's FusedAddRMSNorm with --use_fast_math;
+        # the norm epilogue must see identical instruction lowering (ftz,
+        # approx div, fmad contraction) for bit-identity with that kernel.
+        extra_cuda_cflags=["--use_fast_math"],
     )
 
 

@@ -158,27 +158,42 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_add_rmsnorm_kernel(
         rj = __bfloat162float(__float2bfloat16_rn(rj));
       }
       r[i][j] = rj;
-      sumsq += rj * rj;
+      // Explicit FMA: flashinfer's `sum_sq += x * x` contracts to FFMA; the
+      // fp32 rounding of the accumulation must match for bit-identity.
+      sumsq = __fmaf_rn(rj, rj, sumsq);
     }
   }
 
-  // ---- 4b. block reduction of sumsq (warp shuffle + one smem slot/warp) ----
+  // ---- 4b. block reduction of sumsq. The tree shape and the rsqrt flavor
+  // replicate flashinfer::norm::FusedAddRMSNormKernel exactly (XOR butterfly
+  // warp reduce, full-width second butterfly, rsqrt.approx.ftz.f32) -- the
+  // fp32 summation ORDER must match for bit-identity with the unfused
+  // sgl_kernel.fused_add_rmsnorm chain. ----
   __shared__ float s_warp[32];
   __shared__ float s_inv;
   const uint32_t lane = threadIdx.x & 31u;
   const uint32_t warp = threadIdx.x >> 5;
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1)
-    sumsq += __shfl_down_sync(~0u, sumsq, off);
+    sumsq += __shfl_xor_sync(~0u, sumsq, off);
   if (lane == 0) s_warp[warp] = sumsq;
   __syncthreads();
   if (warp == 0) {
     const uint32_t nwarps = (blockDim.x + 31u) >> 5;
-    float total = (lane < nwarps && lane < 32u) ? s_warp[lane] : 0.0f;
+    float total = (lane < nwarps) ? s_warp[lane] : 0.0f;
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
-      total += __shfl_down_sync(~0u, total, off);
-    if (lane == 0) s_inv = rsqrtf(total / static_cast<float>(p.D) + p.eps);
+      total += __shfl_xor_sync(~0u, total, off);
+    if (lane == 0) {
+      // sgl-kernel builds flashinfer's norm with --use_fast_math: the
+      // mean division lowers to div.approx (__fdividef), and the rsqrt is
+      // rsqrt.approx.ftz. Both must match for bit-identity.
+      float inv_rt;
+      asm volatile("rsqrt.approx.ftz.f32 %0, %1;"
+                   : "=f"(inv_rt)
+                   : "f"(__fdividef(total, static_cast<float>(p.D)) + p.eps));
+      s_inv = inv_rt;
+    }
   }
   __syncthreads();
   const float inv = s_inv;

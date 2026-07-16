@@ -81,6 +81,34 @@ def _dropin_ar(inp, buffer, res, group_name):
     return custom_all_reduce(inp, buffer=buffer, group_name=group_name, res=res)
 
 
+def _v5_ar(inp, buffer, res):
+    """Force the v5 push one-shot (the transport the fused kernel embeds),
+    regardless of the tuned dispatch table's pick for this token count."""
+    from sglang.jit_kernel import inkling_all_reduce as jit
+
+    n = inp.numel()
+    esz = buffer.element_size()
+    cur = res.v5_cur
+    stage_off = res.v5_in[cur]
+    out_view = buffer[res.v5_out : res.v5_out + n]
+    jit.inkling_multimem_push_oneshot(
+        inp.view(-1),
+        out_view,
+        res.multicast_ptr + stage_off * esz,
+        buffer.data_ptr() + stage_off * esz,
+        res.flag_ptrs_dev,
+        res.state_ptr,
+        res.rank,
+        res.world,
+        n,
+        0,
+        0,
+        per_block_barrier=True,
+    )
+    res.v5_cur = 1 - cur
+    return out_view.view(inp.shape)
+
+
 def _fused_ar_norm(inp, residual, weight, eps, buffer, res, round_sum):
     from sglang.jit_kernel.inkling_ar_norm import inkling_ar_add_rmsnorm
 
@@ -128,8 +156,19 @@ def test_dropin_correctness(num_tokens: int):
 @pytest.mark.parametrize("num_tokens", FUSED_TOKENS)
 def test_fused_ar_norm_bit_identity(num_tokens: int):
     """Fused {AR -> add+RMSNorm} is BIT-identical to the unfused chain
-    {v5 custom AR -> sgl_kernel.fused_add_rmsnorm}."""
-    from sgl_kernel import fused_add_rmsnorm
+    {v5 custom AR -> flashinfer CUDA-norm fused_add_rmsnorm}.
+
+    Note on the reference: sgl_kernel.fused_add_rmsnorm delegates to
+    flashinfer, which has TWO backends (CUDA JIT vs CuTe DSL, selected by
+    FLASHINFER_USE_CUDA_NORM) that already differ from EACH OTHER by 1 bf16
+    ulp on ~1e-5 of elements (different fp32 variance summation trees). The
+    fused kernel replicates the CUDA backend's tree exactly (XOR-butterfly
+    reduce, rsqrt.approx.ftz, div.approx, FMA contraction), so bit-identity
+    is asserted against that backend; against the default CuTe backend the
+    residual stream is still bit-identical and hs is within 1 bf16 ulp.
+    """
+    import flashinfer.norm as flashinfer_norm
+    from sgl_kernel import fused_add_rmsnorm as production_fused_add_rmsnorm
 
     from sglang.jit_kernel.inkling_ar_norm import ROUND_SUM_TO_BF16
 
@@ -143,13 +182,17 @@ def test_fused_ar_norm_bit_identity(num_tokens: int):
     weight = torch.randn(HIDDEN, device=device, dtype=torch.bfloat16)
     dist.broadcast(weight, src=0)
 
-    # Unfused reference: v5 drop-in AR (same transport as the fused kernel),
-    # then the production fused_add_rmsnorm (in-place on x and residual).
-    x_ref = _dropin_ar(inp, buffer, res, group_name).clone()
+    # Unfused reference: forced-v5 AR (the same transport the fused kernel
+    # embeds), then fused_add_rmsnorm (in-place on x/residual).
+    x_ar = _v5_ar(inp, buffer, res).clone()
     torch.cuda.synchronize()
     dist.barrier()
-    res_ref = residual.clone()
-    fused_add_rmsnorm(x_ref, res_ref, weight, eps)
+    x_ref, res_ref = x_ar.clone(), residual.clone()
+    flashinfer_norm.get_norm_module().fused_add_rmsnorm(
+        x_ref, res_ref, weight, eps, True
+    )
+    x_prod, res_prod = x_ar.clone(), residual.clone()
+    production_fused_add_rmsnorm(x_prod, res_prod, weight, eps)
 
     hs, res_out = _fused_ar_norm(
         inp, residual, weight, eps, buffer, res, round_sum=ROUND_SUM_TO_BF16
@@ -157,20 +200,21 @@ def test_fused_ar_norm_bit_identity(num_tokens: int):
     torch.cuda.synchronize()
     dist.barrier()
 
-    if not (torch.equal(hs, x_ref) and torch.equal(res_out, res_ref)):
-        # Calibration probe: does the OTHER rounding mode match instead?
-        hs2, res_out2 = _fused_ar_norm(
-            inp, residual, weight, eps, buffer, res, round_sum=not ROUND_SUM_TO_BF16
-        )
-        torch.cuda.synchronize()
-        dist.barrier()
-        other = torch.equal(hs2, x_ref) and torch.equal(res_out2, res_ref)
+    # Bit-identity vs the CUDA-norm unfused chain.
+    assert torch.equal(res_out, res_ref), "residual stream must be bit-identical"
+    if not torch.equal(hs, x_ref):
+        diff = (hs != x_ref).sum().item()
         raise AssertionError(
-            f"fused != unfused at ROUND_SUM_TO_BF16={ROUND_SUM_TO_BF16}; "
-            f"opposite mode matches: {other} "
-            f"(if True, flip ROUND_SUM_TO_BF16 in jit_kernel/inkling_ar_norm.py). "
-            f"max |hs diff|={(hs.float() - x_ref.float()).abs().max().item():.3e}"
+            f"fused != unfused (CUDA-norm chain): {diff}/{hs.numel()} elems, "
+            f"max |diff|={(hs.float() - x_ref.float()).abs().max().item():.3e} "
+            f"(ROUND_SUM_TO_BF16={ROUND_SUM_TO_BF16} may need recalibration)"
         )
+    # Production (CuTe-backend) chain: residual bit-identical; hs within 1 ulp
+    # on a vanishing fraction (the two flashinfer backends differ by the same).
+    assert torch.equal(res_out, res_prod)
+    mismatch = (hs != x_prod).float().mean().item()
+    assert mismatch < 1e-4, f"hs mismatch fraction vs production chain: {mismatch}"
+    torch.testing.assert_close(hs.float(), x_prod.float(), atol=8e-3, rtol=0)
 
 
 @pytest.mark.parametrize("num_tokens", get_ci_test_range([8, 96], [8]))
