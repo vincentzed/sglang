@@ -143,11 +143,34 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
-        if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
-            raise RuntimeError(
-                "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
-                "(e.g. GQA, MHA). MLA models should not set this flag."
-            )
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+            if self.is_mla_backend:
+                raise RuntimeError(
+                    "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
+                    "(e.g. GQA, MHA). MLA models should not set this flag."
+                )
+            server_args = self.scheduler.server_args
+            page_size = self.scheduler.token_to_kv_pool_allocator.page_size
+            cps = server_args.chunked_prefill_size or 8192
+            # Staging slices each send into a fixed page-aligned grid, so an
+            # unbounded (-1) or non-page-aligned chunk size has no valid grid.
+            if cps <= 0 or cps % page_size != 0:
+                raise RuntimeError(
+                    f"SGLANG_DISAGG_STAGING_BUFFER requires a positive "
+                    f"chunked_prefill_size that is a multiple of page_size "
+                    f"({page_size}); got {server_args.chunked_prefill_size}."
+                )
+            if self.pp_size > 1:
+                # Staging writer accounting has no pp dimension.
+                raise RuntimeError(
+                    "SGLANG_DISAGG_STAGING_BUFFER does not support pp_size > 1."
+                )
+            if server_args.enable_prefill_context_parallel:
+                # CP rewrites index_slice per rank, breaking the chunk grid.
+                raise RuntimeError(
+                    "SGLANG_DISAGG_STAGING_BUFFER does not support "
+                    "prefill context parallelism."
+                )
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> CommonKVManager:
@@ -196,6 +219,12 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_layer_ids = (
+            self.token_to_kv_pool.get_kv_layer_ids()
+            if self.draft_token_to_kv_pool is None
+            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
+            else []
+        )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
@@ -299,7 +328,8 @@ class PrefillBootstrapQueue:
         req.start_send_idx = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
-            num_kv_indices_to_send, self.token_to_kv_pool.page_size
+            num_kv_indices_to_send,
+            self.scheduler.token_to_kv_pool_allocator.page_size,
         )
         req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
         req.pending_bootstrap = False
@@ -1036,7 +1066,11 @@ class SchedulerDisaggregationPrefillMixin:
         cached_end = len(req.prefix_indices) - req.host_hit_length
         if cached_end <= req.start_send_idx:
             return
-        assert cached_end % self.token_to_kv_pool_allocator.page_size == 0
+        if cached_end % self.token_to_kv_pool_allocator.page_size != 0:
+            # DCP radix hits can end on a logical cache-page boundary that is
+            # not a complete physical DCP page. The regular final send covers
+            # the full range; only skip this optional early-send optimization.
+            return
         # Early-send issues the KV read before this step's forward is enqueued,
         # but under overlap scheduling the PRIOR step's prefill forward may still
         # be writing these prefix pages on forward_stream. Record a completion
@@ -1176,7 +1210,11 @@ class SchedulerDisaggregationPrefillMixin:
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
-        req.disagg_kv_sender.send(page_indices, state_indices)
+        req.disagg_kv_sender.send(
+            page_indices,
+            state_indices,
+            num_kv_tokens=end_idx - start_idx,
+        )
         req.start_send_idx = end_idx
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:

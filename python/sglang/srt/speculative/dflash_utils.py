@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.utils import is_cuda, is_musa
+from sglang.srt.utils import is_cuda, is_hip, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -45,6 +45,12 @@ if is_cuda() or is_musa():
         top_k_renorm_prob = None
         top_p_renorm_prob = None
         tree_speculative_sampling_target_only = None
+elif is_hip():
+    from sglang.kernels.ops.sampling.top_p_renorm_triton import (
+        top_p_renorm_probs_triton as top_p_renorm_prob,
+    )
+
+    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
 else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None
@@ -799,16 +805,5 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
 
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
-
-    if (
-        req.sampling_params.json_schema is not None
-        or req.sampling_params.regex is not None
-        or req.sampling_params.ebnf is not None
-        or req.sampling_params.structural_tag is not None
-    ):
-        return (
-            "DFLASH speculative decoding does not support "
-            "grammar-constrained decoding yet."
-        )
 
     return None

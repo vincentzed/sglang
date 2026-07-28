@@ -19,7 +19,6 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
-    get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
@@ -40,6 +39,7 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
     use_intel_xpu_backend,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -107,6 +107,25 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
         _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
 
     _BF16_GEMM_BACKEND = backend
+
+
+def _bf16_gemm_dispatch_fake(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+@register_custom_op(fake_impl=_bf16_gemm_dispatch_fake)
+def bf16_gemm_dispatch(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    if _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
+        x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
+    ):
+        return _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
+            *x.shape[:-1], -1
+        )
+    return F.linear(x, weight, bias)
 
 
 def get_bf16_gemm_backend() -> Bf16GemmBackend:
@@ -214,17 +233,68 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and (bias is None or bias.dtype == torch.bfloat16)
             and not layer.weight.requires_grad
             and (bias is None or not bias.requires_grad)
-            and _use_cutedsl_bf16_gemm(
+        ):
+            if torch.compiler.is_compiling():
+                # The m-dependent kernel heuristic would guard on the symbolic
+                # token dim under Dynamo and recompile per shape bucket; the
+                # opaque op resolves it at runtime with concrete shapes,
+                # keeping the per-shape kernel choice.
+                return bf16_gemm_dispatch(x, layer.weight, bias)
+            if _use_cutedsl_bf16_gemm(
                 x.numel() // x.shape[-1],
                 layer.weight.shape[0],
                 layer.weight.shape[1],
-            )
-        ):
-            x_shapes = x.shape
-            output = _cutedsl_bf16_gemm(x.view(-1, x_shapes[-1]), layer.weight, bias)
-            return output.view(*x_shapes[:-1], -1)
+            ):
+                x_shapes = x.shape
+                output = _cutedsl_bf16_gemm(
+                    x.view(-1, x_shapes[-1]), layer.weight, bias
+                )
+                return output.view(*x_shapes[:-1], -1)
+            return F.linear(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
+
+    def apply_into(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run an inference-only BF16 linear into caller-owned storage."""
+        if (
+            get_bf16_gemm_backend().is_cutedsl()
+            and x.is_cuda
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and (bias is None or bias.dtype == torch.bfloat16)
+            and not layer.weight.requires_grad
+            and (bias is None or not bias.requires_grad)
+            and _use_cutedsl_bf16_gemm(
+                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        ):
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                cutedsl_bf16_gemm_out,
+            )
+
+            return cutedsl_bf16_gemm_out(x, layer.weight, output, bias)
+
+        if x.ndim != 2:
+            raise ValueError("caller-owned linear output currently requires a 2D input")
+        if output.shape != (x.shape[0], layer.weight.shape[0]):
+            raise ValueError(
+                f"linear output has shape {output.shape}, expected "
+                f"{(x.shape[0], layer.weight.shape[0])}"
+            )
+        torch.mm(x, layer.weight.t(), out=output)
+        if bias is not None:
+            output.add_(bias)
+        return output
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
@@ -338,7 +408,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             self.use_deep_gemm
             and layer.w13_weight.dtype == torch.bfloat16
             and get_moe_a2a_backend().is_deepep()
-            and get_deepep_mode().enable_low_latency()
             and not _is_npu
             and not _is_hip
             and hasattr(layer, "dispatcher")

@@ -8,7 +8,7 @@ from array import array
 from collections import defaultdict
 from functools import partial
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
 import torch
 
@@ -592,6 +592,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            full_kv_hit_length,
         ) = self._match_prefix_helper(key)
         return self._match_post_processor(
             params,
@@ -599,6 +600,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            full_kv_hit_length,
         )
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -616,6 +618,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         result = self._insert_helper(self.root_node, key, value, params)
         return result
+
+    @property
+    def is_write_back(self) -> bool:
+        return (
+            self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_back"
+        )
 
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
@@ -639,7 +648,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
         )
 
-    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
+    def inc_lock_ref(
+        self, node: Any, skip_lock_components: Sequence[ComponentType] = ()
+    ) -> IncLockRefResult:
         result = self.session.try_inc_lock_ref(node)
         if result is not None:
             return result
@@ -647,6 +658,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return IncLockRefResult()
         result = IncLockRefResult()
         for component in self._components_tuple:
+            if component.component_type in skip_lock_components:
+                # Leave this component's value evictable and record every
+                # non-root node (incl tombstones) so the matching dec skips a
+                # lock we never took, which may be another req's on a shared node.
+                if node is not self.root_node:
+                    result.skip_lock_node_ids.setdefault(
+                        component.component_type, set()
+                    ).add(node.id)
+                continue
             result = component.acquire_component_lock(node=node, result=result)
 
         self._update_evictable_leaf_sets(node)
@@ -672,10 +692,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
 
+    def _dec_req_lock(self, req: Req, *, skip_swa: bool = False) -> None:
+        """Release the tree lock a request holds on its last_node, honoring the
+        components it skipped locking so it never drops a lock it never took."""
+        self.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                skip_lock_node_ids=req.skip_lock_node_ids,
+            ),
+            skip_swa=skip_swa,
+        )
+
     def dec_swa_lock_only(
         self,
         node: UnifiedTreeNode,
         swa_uuid_for_lock: Optional[int] = None,
+        skip_lock_node_ids: Optional[dict] = None,
     ) -> None:
         """Early-release the SWA portion of a request's tree lock, plus any
         strictly-lower-priority locks (e.g. Mamba) co-located on `node`.
@@ -687,9 +720,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
         swa_component.release_window_lock(node, swa_uuid_for_lock)
 
-        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on `node`.
+        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on `node`,
+        # honoring skip ids so we don't drop a lock a partial inc never took
+        # (matters for FULL+SWA+MAMBA models, e.g. Inkling).
         swa_priority = swa_component.eviction_priority(is_leaf=False)
-        dec_params = DecLockRefParams(swa_uuid_for_lock=swa_uuid_for_lock)
+        dec_params = DecLockRefParams(
+            swa_uuid_for_lock=swa_uuid_for_lock,
+            skip_lock_node_ids=skip_lock_node_ids or {},
+        )
         for comp in self._components_tuple:
             if comp.eviction_priority(is_leaf=False) < swa_priority:
                 comp.release_component_lock(node, dec_params)
@@ -780,11 +818,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-            skip_swa=getattr(req, "swa_prefix_lock_released", False),
-        )
+        self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
         # cleanup
         for comp in self._components_tuple:
@@ -870,11 +904,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        self._dec_req_lock(req)
+        # Opt-in: leave the matched-prefix mamba evictable during decode (it is
+        # already COW'd to the request's own slot, never read from this node again).
+        # Safe only because any future COW source is the COWing request's own
+        # admission-locked last_node (recorded only if still present, locked before
+        # the next alloc) -- not this evictable node. A scheduler that matched a
+        # whole batch before locking would break that. Off = original full lock.
+        skip_lock_components = (
+            (ComponentType.MAMBA,)
+            if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+            else ()
         )
-        lock_result = self.inc_lock_ref(new_last_node)
+        lock_result = self.inc_lock_ref(
+            new_last_node, skip_lock_components=skip_lock_components
+        )
 
         # Update req fields
         if len(new_indices) < len(kv_indices_orig):
@@ -886,6 +930,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        # carry the skip set so this node's dec releases only what we locked
+        req.skip_lock_node_ids = lock_result.skip_lock_node_ids
         # The rematch acquired a new SWA prefix lock.
         req.swa_prefix_lock_released = False
 
@@ -902,7 +948,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _match_prefix_helper(
         self, key: RadixKey
-    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
+    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int, int]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
         # device anchor follows the best match. In HiCache mode, host-backed
         # nodes can also match, so we separately track the best device-resident
@@ -913,6 +959,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node = node
         best_match_device_node = node
         best_match_device_value_len = 0
+        full_kv_hit_length = 0
+
         separate_device_match = self.cache_controller is not None
         if separate_device_match:
             validators = tuple(
@@ -955,6 +1003,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 break
 
             prefix_len = child.key.match(key, page_size=self.page_size)
+            full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
                 node = self._split_node(child.key, child, prefix_len)
                 if not node.evicted:
@@ -975,6 +1024,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            full_kv_hit_length,
         )
 
     def _match_post_processor(
@@ -984,6 +1034,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node: UnifiedTreeNode,
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
+        full_kv_hit_length: int,
     ) -> MatchResult:
         node_update = best_match_node
         for comp in self._components_tuple:
@@ -1017,6 +1068,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_host_node=last_host_node,
             best_match_node=best_match_node,
             host_hit_length=0,
+            full_kv_hit_length=full_kv_hit_length,
         )
 
         for component in self._components_tuple:
@@ -1506,24 +1558,89 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ):
                 written = self.write_backup(node, write_back=True)
                 if written == 0:
+                    if self._drop_subtree_no_host(node, tracker):
+                        logger.warning(
+                            "write_back: KV subtree dropped without backup "
+                            "due to host memory pressure, root node %d",
+                            node.id,
+                        )
+                    else:
+                        logger.warning(
+                            "write_back: backup failed under host memory "
+                            "pressure but subtree drop declined (node "
+                            "locked); root node %d stays device-resident "
+                            "until host space frees",
+                            node.id,
+                        )
                     return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
                 return
             else:
                 # Write-through: node has no backup, delete entirely.
-                self._record_remove_event(node, medium=StorageMedium.GPU)
-                for comp in self._components_tuple:
-                    self._evict_component_and_detach_lru(
-                        node, comp, target=EvictLayer.ALL, tracker=tracker
-                    )
-                self.evictable_device_leaves.discard(node)
-                parent = node.parent
-                self._remove_leaf_from_parent(node)
-                self._update_evictable_leaf_sets(parent)
-                self._iteratively_delete_tombstone_leaf(node, tracker)
+                self._delete_unbacked_device_leaf(node, tracker)
                 return
         self._evict_to_host(node, tracker)
+
+    def _drop_subtree_no_host(
+        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+    ) -> bool:
+        """Write-back fallback when a D-leaf's D->H backup fails under host
+        memory pressure: drop the subtree rooted at the unbacked leaf so
+        device eviction keeps making progress instead of leaving its KV
+        unevictable until host space frees up."""
+
+        assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        # A failed backup never issues the D->H copy, so the subtree root has
+        # no host state and no in-flight DMA reading its device slots.
+        assert not node.backuped and node.write_through_pending_id is None
+        if any(cd.host_lock_ref > 0 for cd in node.component_data):
+            return False
+        descendants: list[UnifiedTreeNode] = []
+        stack = list(node.children.values())
+        while stack:
+            cur = stack.pop()
+            if any(
+                cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+            ):
+                return False
+            descendants.append(cur)
+            stack.extend(cur.children.values())
+        for desc in reversed(descendants):
+            # Host-only by construction: a device descendant would contradict
+            # this node being a D-leaf, and D-leaves evict before ancestors.
+            assert desc.evicted and desc.backuped, f"node {desc.id} not host-only"
+            assert desc.write_through_pending_id is None
+            self._release_all_component_layers(desc, StorageMedium.CPU, tracker)
+            self._remove_leaf_from_parent(desc)
+        self._delete_unbacked_device_leaf(node, tracker)
+        return True
+
+    def _release_all_component_layers(
+        self,
+        node: UnifiedTreeNode,
+        medium: StorageMedium,
+        tracker: dict[ComponentType, int],
+    ) -> None:
+        """Free every component layer on the node and detach it from the LRU
+        lists and evictable leaf sets."""
+        self._record_remove_event(node, medium=medium)
+        for comp in self._components_tuple:
+            self._evict_component_and_detach_lru(
+                node, comp, target=EvictLayer.ALL, tracker=tracker
+            )
+        self.evictable_device_leaves.discard(node)
+        self.evictable_host_leaves.discard(node)
+
+    def _delete_unbacked_device_leaf(
+        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+    ) -> None:
+        """Delete a device leaf that has no host backup, freeing all layers."""
+        self._release_all_component_layers(node, StorageMedium.GPU, tracker)
+        parent = node.parent
+        self._remove_leaf_from_parent(node)
+        self._update_evictable_leaf_sets(parent)
+        self._iteratively_delete_tombstone_leaf(node, tracker)
 
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
