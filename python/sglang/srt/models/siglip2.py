@@ -41,7 +41,19 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_hip
+
+
+def _default_siglip2_qkv_backend() -> Optional[str]:
+    """Return a correctness-safe platform default for packed SigLIP2 attention.
+
+    AITER's ROCm varlen attention can produce isolated large numeric outliers
+    for long packed NaFlex sequences. Keep Triton as the SigLIP2 default on
+    ROCm until that kernel is corrected. ``--mm-attention-backend`` still has
+    higher priority inside :class:`VisionAttention`, so operators can
+    explicitly opt into another backend.
+    """
+    return "triton_attn" if is_hip() else None
 
 
 class Siglip2VisionEmbeddings(nn.Module):
@@ -196,6 +208,7 @@ class Siglip2Attention(nn.Module):
             num_heads=self.num_heads,
             projection_size=self.embed_dim,
             use_qkv_parallel=True,
+            qkv_backend=_default_siglip2_qkv_backend(),
             dropout=config.attention_dropout,
             flatten_batch=True,  # For variable-length sequence support
             quant_config=quant_config,
