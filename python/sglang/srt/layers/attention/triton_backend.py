@@ -10,11 +10,7 @@ from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.configs.hybrid_arch import (
-    hybrid_gdn_config,
-    kimi_linear_config,
-    linear_attn_model_spec,
-)
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -85,6 +81,20 @@ def logit_capping_mod(logit_capping_method, logit_cap):
         return logit_cap
     else:
         raise ValueError()
+
+
+def _resolve_v_head_dims(model_runner, sliding_window_size):
+    """Resolve decode output widths without assuming global layer 0 has KV."""
+    model_config = model_runner.model_config
+    full_v_head_dim = model_config.v_head_dim
+    swa_v_head_dim = model_config.swa_v_head_dim
+    if sliding_window_size is not None and swa_v_head_dim != full_v_head_dim:
+        return full_v_head_dim, swa_v_head_dim
+    if mambaish_config(model_config) is not None:
+        # Hybrid pools expose the full-attention buffer width directly.
+        # Their global layer 0 can be linear/Mamba rather than full attention.
+        return model_runner.token_to_kv_pool.get_v_head_dim(), None
+    return model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1], None
 
 
 @dataclass
@@ -186,24 +196,9 @@ class TritonAttnBackend(AttentionBackend):
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with
         # differing SWA/full v_head_dim need a second buffer for SWA layers.
-        full_v_head_dim = model_runner.model_config.v_head_dim
-        swa_v_head_dim = model_runner.model_config.swa_v_head_dim
-        if self.sliding_window_size is not None and swa_v_head_dim != full_v_head_dim:
-            self.v_head_dim = full_v_head_dim
-            self.swa_v_head_dim = swa_v_head_dim
-        elif (
-            hybrid_gdn_config(model_runner.model_config) is not None
-            or kimi_linear_config(model_runner.model_config) is not None
-            or linear_attn_model_spec(model_runner.model_config) is not None
-        ):
-            # For hybrid linear models, layer_id = 0 may not be full attention
-            self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
-            self.swa_v_head_dim = None
-        else:
-            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
-                -1
-            ]
-            self.swa_v_head_dim = None
+        self.v_head_dim, self.swa_v_head_dim = _resolve_v_head_dims(
+            model_runner, self.sliding_window_size
+        )
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
