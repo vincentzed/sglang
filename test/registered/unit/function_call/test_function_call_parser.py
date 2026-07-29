@@ -3702,6 +3702,26 @@ class TestLfm2Detector(unittest.TestCase):
                     },
                 ),
             ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="Calendar.create_event",
+                    description="Create a calendar event",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "metadata": {
+                                "type": "object",
+                                "properties": {
+                                    "reminder": {"type": "boolean"},
+                                },
+                            },
+                        },
+                        "required": ["title", "metadata"],
+                    },
+                ),
+            ),
         ]
         self.detector = Lfm2Detector()
 
@@ -3791,6 +3811,21 @@ class TestLfm2Detector(unittest.TestCase):
         params2 = json.loads(result.calls[1].parameters)
         self.assertEqual(params1["city"], "Paris")
         self.assertEqual(params2["query"], "restaurants")
+
+    def test_detect_and_parse_dotted_name_with_json_literal(self):
+        """Parse the dotted tool name and lowercase boolean emitted by LFM2."""
+        text = (
+            "<|tool_call_start|>[Calendar.create_event("
+            'title="demo", metadata={"reminder": true})]<|tool_call_end|>'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "Calendar.create_event")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters),
+            {"title": "demo", "metadata": {"reminder": True}},
+        )
 
     def test_detect_and_parse_with_normal_text_before(self):
         """Test parsing with normal text before the tool call."""
