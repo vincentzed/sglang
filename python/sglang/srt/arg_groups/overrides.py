@@ -785,11 +785,26 @@ def _granite_moe_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     return {}
 
 
-@_register_for("Lfm2ForCausalLM", "Lfm2MoeForCausalLM")
+@_register_for(
+    "Lfm2ForCausalLM",
+    "Lfm2MoeForCausalLM",
+    "Lfm2VlForConditionalGeneration",
+)
 def _lfm2_overrides(server_args: Any, hf_config: Any) -> dict:
-    if is_sm100_supported() and server_args.attention_backend is None:
-        return {"attention_backend": "flashinfer"}
-    return {}
+    if not is_sm100_supported():
+        return {}
+
+    # FA4 remains the SM100 vision default. The hybrid language model needs
+    # page_size=1, so use FlashInfer instead of FA4's page_size=128.
+    overrides = {}
+    if server_args.attention_backend is None:
+        overrides["attention_backend"] = "flashinfer"
+    model_arch = (getattr(hf_config, "architectures", None) or [None])[0]
+    if model_arch == "Lfm2VlForConditionalGeneration":
+        # Chunked multimodal prefill can misalign one encoder item per
+        # request on SM100, so keep each request in one forward.
+        overrides["chunked_prefill_size"] = -1
+    return overrides
 
 
 @_register_for("DeepseekV4ForCausalLM")
