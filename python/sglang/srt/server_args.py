@@ -5040,9 +5040,6 @@ class ServerArgs:
             is_deepseek_dsa,
         )
 
-        if self.enable_deterministic_inference:
-            self.enforce_disable_flashinfer_allreduce_fusion = True
-
         self.uses_mamba_radix_cache = False
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             self._resolved_overrides = []
@@ -5050,6 +5047,17 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+
+        # LFM2-VL has batch-shape-dependent greedy outputs on SM100 unless the
+        # standard deterministic-inference policy is applied as a unit.
+        if is_sm100_supported() and model_arch == "Lfm2VlForConditionalGeneration":
+            self.enable_deterministic_inference = True
+            # Repeated concurrent images can otherwise return a stale
+            # wrong-length encoder entry and terminate the scheduler.
+            envs.SGLANG_VLM_CACHE_SIZE_MB.set(0)
+
+        if self.enable_deterministic_inference:
+            self.enforce_disable_flashinfer_allreduce_fusion = True
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(
