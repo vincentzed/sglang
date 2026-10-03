@@ -10,7 +10,9 @@ from inspect import Parameter, signature
 
 def maybe_cache_mxfp8_dispatch(raw_mm, gemm_module, version):
     """Keep unsupported FlashInfer versions and APIs on the original path."""
-    if version.split("+", 1)[0] != "0.7.0" or not callable(
+    # 0.7.0.postN ships the same runner factory and skip_check contract.
+    base_version = version.split("+", 1)[0].split(".post", 1)[0]
+    if base_version != "0.7.0" or not callable(
         getattr(gemm_module, "_cute_dsl_gemm_mxfp8_runner", None)
     ):
         return raw_mm
