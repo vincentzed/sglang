@@ -8,7 +8,7 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -59,7 +59,7 @@ class DsparkDraftSampler:
             if (
                 folded_sampling
                 or not envs.SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV.get()
-                or get_tensor_model_parallel_world_size() != 1
+                or get_parallel().tp_size != 1
                 or type(self.markov_head) is not VanillaMarkov
             ):
                 raise ValueError(
