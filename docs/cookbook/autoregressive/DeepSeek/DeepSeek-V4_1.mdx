@@ -108,6 +108,30 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 Overriding them is the most common cause of a disappointing measurement: it leaves the 32-wide ue8m0 blocks on the Triton `_w8a8_block_fp8_matmul` fallback, which dominates the decode step and costs most of the model's bs=1 throughput. If your decode rate looks like a small fraction of what you expected, check the resolved backends first.
 
+### B300 low-concurrency tuning
+
+The B300 Low-Latency cell differs from the GB300 one in two places, both of which work on unmodified `main`:
+
+- `--ep-size 1` instead of `--ep-size 4`.
+- `SGLANG_DSPARK_FOLDED_SAMPLING=2`. In the default `AUTO` mode V4.1 folds only the greedy draft proposal into the CUDA graph, because its Markov head is TP-sharded; a request with `temperature > 0` then samples its draft block eagerly on the host every step. `2` forces the sampling fold.
+
+`--enable-decoder-swa-bounded-replay` (the "Decoder SWA Bounded Replay" selector above) is the third lever. It cuts TTFT the most, but it is not numerically equivalent to full prefill, so it stays opt-in.
+
+Measured on 4x B300, TP4, DSpark block 5, synthetic 8192-token prompts and 1024 output tokens, `temperature=1.0`, `top_p=0.95`, a fresh prompt per request, and the accept length pinned with `SGLANG_SIMULATE_ACC_LEN=5.4` so every arm does the same work per step. Run-to-run noise is about 2%.
+
+Decode tokens/s per request (TTFT p50 in ms):
+
+| Concurrency | `main`, GB300 recipe | `main`, this recipe | This branch, this recipe | `main` + bounded replay | This branch + bounded replay |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1031 (156) | 1113 (156) | 1115 (151) | 1116 (139) | 1123 (101) |
+| 2 | 799 (302) | 859 (293) | 877 (255) | 863 (245) | 904 (177) |
+| 4 | 678 (534) | 724 (543) | 728 (501) | 733 (478) | 746 (322) |
+| 8 | 522 (943) | 549 (962) | 535 (861) | 556 (792) | 564 (569) |
+
+Reading it: the recipe is worth 5-8% on decode and that gain is the flags, not the branch. What the branch adds over flag-matched `main` is prefill: TTFT is 3-13% lower without bounded replay and 27-33% lower with it. Both bounded-replay columns also set `SGLANG_FLASHINFER_AUTOTUNE_EXTEND=1`; the branch column adds `SGLANG_OPT_ENGRAM_EXTEND_HASH=1`, which `main` does not have.
+
+GSM8K (500 questions, `temperature=1.0`, `top_p=0.95`, real DSpark acceptance): 0.982 on `main` with the GB300 recipe, 0.976 on this branch with this recipe plus bounded replay; the difference is inside the sampling error of 500 questions. Mean accept length was 4.22 in both.
+
 ## 3. Advanced Usage
 
 ### 3.1 Reasoning

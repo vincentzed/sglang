@@ -9,7 +9,8 @@
 // fraction; the B200 / B300 / GB300 High-Throughput cells start without either.
 //
 // DP-Attention, DeepEP and MegaMoE are absent by design: they have never been
-// enabled on this model. EP is set equal to TP on every shape here.
+// enabled on this model. EP is set equal to TP on every shape except the B300
+// Low-Latency cell, which runs EP1.
 
 export const config = {
   modelName: "DeepSeek-V4.1",
@@ -302,17 +303,21 @@ export const config = {
       ],
     },
 
-    // ---------- B300: 4x B300, TP4 + EP4. Same recipe as GB300 — the kernels
-    // dispatch by architecture family. ----------
+    // ---------- B300: 4x B300, TP4. High-Throughput mirrors GB300 (EP4). The
+    // Low-Latency cell is tuned for 1-8 concurrent requests, measured on 4x B300:
+    // EP1 and in-graph draft sampling; see "B300 low-concurrency tuning" on the page. ----------
     {
       match: { hw: "b300", strategy: "low-latency" },
       nnodes: 1,
       verified: true,
+      // AUTO keeps V4.1 on greedy-only folding (its Markov head is TP-sharded), so
+      // sampling requests would draft eagerly on the host; 2 forces in-graph sampling.
+      env: ["SGLANG_DSPARK_FOLDED_SAMPLING=2"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--ep-size 4",
+        "--ep-size 1",
         "--mem-fraction-static 0.8",
         "--speculative-algorithm DSPARK",
         "--speculative-dspark-block-size 5",
