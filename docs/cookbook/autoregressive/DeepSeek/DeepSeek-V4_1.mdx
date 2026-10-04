@@ -113,7 +113,7 @@ Overriding them is the most common cause of a disappointing measurement: it leav
 The B300 Low-Latency cell differs from the GB300 one in two places, both of which work on unmodified `main`:
 
 - `--ep-size 1` instead of `--ep-size 4`.
-- `SGLANG_DSPARK_FOLDED_SAMPLING=2`. In the default `AUTO` mode V4.1 folds only the greedy draft proposal into the CUDA graph, because its Markov head is TP-sharded; a request with `temperature > 0` then samples its draft block eagerly on the host every step. `2` forces the sampling fold.
+- `SGLANG_DSPARK_FOLDED_SAMPLING=2`. In the default `AUTO` mode V4.1 folds only the greedy draft proposal into the CUDA graph, because its Markov head is TP-sharded; a request with `temperature > 0` then samples its draft block eagerly on the host every step. `2` forces the sampling fold. It trades against greedy traffic: `temperature=0` requests lose the compact sharded-argmax path and ran 2-3% slower with it forced (1173 vs 1206 tokens/s at concurrency 1, on `main`), so leave it on `AUTO` if most requests are greedy.
 
 `--enable-decoder-swa-bounded-replay` (the "Decoder SWA Bounded Replay" selector above) is the third lever. It cuts TTFT the most, but it is not numerically equivalent to full prefill, so it stays opt-in.
 
