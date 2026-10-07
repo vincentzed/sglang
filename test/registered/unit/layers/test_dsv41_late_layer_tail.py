@@ -1,10 +1,11 @@
-"""The DeepSeek-V4.1 late-layer tail a prefill CUDA graph captures, padded to a fixed row count."""
+"""DeepSeek-V4.1 bounded replay state a prefill CUDA graph captures, padded to fixed row counts."""
 
 import unittest
 
 import torch
 
 from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
+from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -55,6 +56,45 @@ class TestGraphPaddedLateLayerTail(CustomTestCase):
         self.assertIs(refreshed.swa_out_cache_loc, captured.swa_out_cache_loc)
         self.assertEqual(refreshed.swa_out_cache_loc.tolist(), [2, 3, 0, 0])
         self.assertEqual(refreshed.extend_seq_lens_cpu, [2])
+
+
+class TestGraphPaddedWindowLayout(CustomTestCase):
+    def test_padding_rows_leave_every_request_window_unchanged(self):
+        """Two requests padded to a graph bucket and to more window groups than
+        requests: the live rows keep their unpadded layout shifted by the extra
+        history rows, and padding rows read nothing and commit nowhere."""
+        req = torch.tensor([3, 3, 3, 7, 7])
+        pos = torch.tensor([200, 201, 202, 5, 6])
+        window, live, groups, padded = 4, 5, 3, 8
+        plain = window_layout(req, pos, window=window, capacity=8, num_groups=2)
+        graph = window_layout(
+            req,
+            pos,
+            window=window,
+            capacity=8,
+            num_groups=groups,
+            padded_rows=padded,
+        )
+
+        extra_history = (groups - 2) * window
+        self.assertEqual(graph.size, groups * window + padded)
+        self.assertEqual(
+            graph.write_loc[:live].tolist(), (plain.write_loc + extra_history).tolist()
+        )
+        # History slots keep their place; this batch's own rows move past the padding groups.
+        shifted = torch.where(
+            plain.indices >= 2 * window, plain.indices + extra_history, plain.indices
+        )
+        self.assertEqual(graph.indices[:live].tolist(), shifted.tolist())
+        self.assertEqual(graph.commit_mask[:live].tolist(), plain.commit_mask.tolist())
+        self.assertEqual(
+            graph.history_valid[: 2 * window].tolist(), plain.history_valid.tolist()
+        )
+        self.assertFalse(graph.history_valid[2 * window :].any())
+
+        self.assertFalse(graph.commit_mask[live:].any())
+        self.assertEqual(graph.lengths[live:].tolist(), [0] * (padded - live))
+        self.assertEqual(len(set(graph.write_loc.tolist())), padded)
 
 
 if __name__ == "__main__":
