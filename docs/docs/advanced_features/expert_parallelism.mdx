@@ -90,14 +90,42 @@ The published `sgl-deep-ep` dependency currently contains DeepEP 2.1. To test
 2.5, install SGLang first, then build DeepEP in the same environment:
 
 ```bash
-git clone --recursive https://github.com/deepseek-ai/DeepEP.git
+git clone --recursive https://github.com/vincentzed/DeepEP.git
 cd DeepEP
-git checkout 93eb6eb238127e96c6d7a4a625a6dad158348509
+git checkout 7c963aca9355076df83deb967e5fec4e4a289a46
 git submodule update --init --recursive
 python -m pip uninstall -y deep-ep sgl-deep-ep
 python -m pip install --no-deps nvidia-nccl-cu13==2.32.3
 bash install.sh
 ```
+
+This checkout includes the
+[initialization barrier fix](https://github.com/vincentzed/DeepEP/commit/7c963aca9355076df83deb967e5fec4e4a289a46).
+It waits for every rank to finish clearing its communication workspace before
+the first dispatch.
+
+For NCCL 2.32.3 on Blackwell NVLink, the following SDK overlay includes the
+[peer-address metadata load fix](https://github.com/vincentzed/nccl/commit/3668bf79f03cd9352f49fa06baa764b293bd8764).
+It changes two device-header loads and uses the official NCCL shared library.
+Run these commands from the DeepEP checkout, and keep `EP_NCCL_ROOT_DIR` set
+when launching SGLang so DeepJIT compiles against the patched headers:
+
+```bash
+git clone https://github.com/vincentzed/nccl.git nccl-source
+git -C nccl-source checkout 3668bf79f03cd9352f49fa06baa764b293bd8764
+NCCL_PACKAGE_DIR="$(python -c 'import importlib.metadata; print(importlib.metadata.distribution("nvidia-nccl-cu13").locate_file("nvidia/nccl"))')"
+mkdir nccl-sdk
+cp -a "${NCCL_PACKAGE_DIR}/include" nccl-sdk/include
+ln -s "${NCCL_PACKAGE_DIR}/lib" nccl-sdk/lib
+cp nccl-source/src/include/nccl_device/impl/core__funcs.h \
+    nccl-sdk/include/nccl_device/impl/core__funcs.h
+export EP_NCCL_ROOT_DIR="${PWD}/nccl-sdk"
+export EP_JIT_CACHE_DIR="${PWD}/.jit-nccl-lsa-readonly"
+```
+
+The overlay has been tested on B300 (SM103), including dispatch/combine with
+real expert GEMMs and CUDA graph serving. Hopper and multi-node RDMA still
+need runtime validation.
 
 PyTorch and DeepEP must load the same NCCL shared library. Reinstalling SGLang
 may restore its published DeepEP dependency, so replace the DeepEP wheel last.
