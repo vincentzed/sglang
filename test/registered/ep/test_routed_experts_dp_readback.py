@@ -173,7 +173,7 @@ class TestRoutedExpertsReadbackDeepEP(_ReadbackMixin, CustomTestCase):
 
 
 @unittest.skipUnless(
-    _deep_ep_has("ElasticBuffer"), "DeepEP v2 (ElasticBuffer) not installed"
+    _deep_ep_has("EPBuffer") or _deep_ep_has("ElasticBuffer"), "DeepEP v2 not installed"
 )
 @unittest.skipUnless(
     _deep_ep_nccl_compatible(), "DeepEP v2 requires NCCL runtime >= 2.30.7"

@@ -61,6 +61,49 @@ _CHILD = textwrap.dedent(
 
 
 class TestDeepEPImportGuard(CustomTestCase):
+    def test_deepep_v2_selects_supported_buffer(self):
+        for symbols, selected in (
+            (("EPBuffer",), "EPBuffer"),
+            (("ElasticBuffer",), "ElasticBuffer"),
+            (("EPBuffer", "ElasticBuffer"), "EPBuffer"),
+        ):
+            with (
+                self.subTest(symbols=symbols),
+                tempfile.TemporaryDirectory() as fake_root,
+            ):
+                pkg = os.path.join(fake_root, "deep_ep")
+                os.makedirs(pkg)
+                with open(os.path.join(pkg, "__init__.py"), "w") as f:
+                    f.write("import torch\ntopk_idx_t = torch.int64\n")
+                    for symbol in symbols:
+                        f.write(f"class {symbol}: pass\n")
+                child = textwrap.dedent(
+                    f"""
+                    import torch
+                    import deep_ep
+                    from sglang.srt.layers.moe.token_dispatcher import deepep_v2
+                    assert deepep_v2.use_deepep_v2
+                    assert deepep_v2.EPBuffer is deep_ep.{selected}
+                    assert deepep_v2.topk_idx_t == torch.int64
+                    """
+                )
+                env = dict(os.environ)
+                env["PYTHONPATH"] = os.pathsep.join(
+                    p for p in (fake_root, env.get("PYTHONPATH")) if p
+                )
+                result = subprocess.run(
+                    [sys.executable, "-c", child],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr[-4000:]}",
+                )
+
     def test_deep_ep_import_assertion_is_deferred(self):
         with tempfile.TemporaryDirectory() as fake_root:
             pkg = os.path.join(fake_root, "deep_ep")

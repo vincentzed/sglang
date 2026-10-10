@@ -74,6 +74,41 @@ DeepEP and Mooncake backends support two modes for token dispatch: `normal` mode
 
 Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep`, `pplx` and MORI only support cases where `ep_size = tp_size`. For hybrid EP and TP (i.e., `ep_size < tp_size`), only the `none` backend (All-Reduce or All-Gather-based dispatching) is supported. Note that `pplx` additionally requires DP attention with at least 2 attention DP groups (i.e., `--attn-dp-size` > 1, so `tp_size / attention_tp_size > 1`); otherwise pplx-kernels' AllToAll cannot be constructed.
 
+### DeepEP 2.5
+
+Use `--moe-a2a-backend deepep_v2 --moe-runner-backend deep_gemm` for
+DeepEP 2.5. SGLang uses its `EPBuffer` API for both prefill and decode.
+The existing DeepEP 2.1 wheels remain supported through `ElasticBuffer`.
+
+DeepEP 2.5 requires Hopper or newer GPUs, including Blackwell SM100/SM103,
+CUDA toolkit 13.1 or newer, NCCL 2.32.3 or newer, and a C++20 compiler with
+`std::format`. Keep the toolkit and compiler available at runtime for DeepJIT.
+PyTorch's CUDA 13.0 runtime can be used with the CUDA 13.4 toolkit.
+See the [upstream requirements](https://github.com/deepseek-ai/DeepEP#requirements).
+
+The published `sgl-deep-ep` dependency currently contains DeepEP 2.1. To test
+2.5, install SGLang first, then build DeepEP in the same environment:
+
+```bash
+git clone --recursive https://github.com/deepseek-ai/DeepEP.git
+cd DeepEP
+git checkout 93eb6eb238127e96c6d7a4a625a6dad158348509
+git submodule update --init --recursive
+python -m pip uninstall -y deep-ep sgl-deep-ep
+python -m pip install --no-deps nvidia-nccl-cu13==2.32.3
+bash install.sh
+```
+
+PyTorch and DeepEP must load the same NCCL shared library. Reinstalling SGLang
+may restore its published DeepEP dependency, so replace the DeepEP wheel last.
+For NVLink-only testing on a host without RDMA devices, set `EP_DISABLE_GIN=1`.
+Leave GIN enabled for RDMA workloads.
+
+DeepEP 2.5 removes the legacy `Buffer` and `Config` APIs used by
+`--moe-a2a-backend deepep`. The `deepep_v2` integration retains its existing
+restrictions on overlap, speculative draft execution, and quantization.
+Blackwell keeps non-expanded prefill by default and uses expanded decode.
+
 ### Backends for MoE Computation
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

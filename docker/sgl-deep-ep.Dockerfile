@@ -5,6 +5,7 @@ FROM ${BASE_IMAGE}:cuda${CUDA_VERSION}
 
 ARG ARCHITECTURE=x86_64
 ARG CUDA_TAG=cu130
+ARG TORCH_CUDA_TAG=cu130
 ARG CUDA_VERSION=13.0
 ARG NCCL_VERSION=2.30.7
 ARG PYTHON_TAG=cp312-cp312
@@ -19,6 +20,8 @@ ENV PYTHON_BIN=/opt/python/${PYTHON_TAG}/bin/python
 RUN yum install -y --nogpgcheck --enablerepo=powertools \
         cmake \
         curl \
+        elfutils-devel \
+        elfutils-libelf-devel \
         gcc \
         gcc-c++ \
         git \
@@ -54,7 +57,7 @@ RUN --mount=type=cache,id=sgl-deep-ep-pip-${CUDA_TAG}-${PYTHON_TAG}-${ARCHITECTU
     "${PYTHON_BIN}" -m pip install --upgrade pip; \
     "${PYTHON_BIN}" -m pip install --force-reinstall \
         "torch==${TORCH_VERSION}" \
-        --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"; \
+        --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_TAG}"; \
     "${PYTHON_BIN}" -m pip install --force-reinstall --no-deps \
         "nvidia-nccl-cu13==${NCCL_VERSION}"; \
     "${PYTHON_BIN}" -m pip install \
