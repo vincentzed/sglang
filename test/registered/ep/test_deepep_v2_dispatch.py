@@ -1,7 +1,6 @@
 """DeepEP dispatch/combine parity across prefill, decode, and CUDA graphs."""
 
 import itertools
-import socket
 import unittest
 
 import torch
@@ -101,7 +100,7 @@ def _worker(rank, world_size, port):
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        store=dist.TCPStore("127.0.0.1", port),
         rank=rank,
         world_size=world_size,
         device_id=torch.device("cuda", rank),
@@ -115,6 +114,8 @@ def _worker(rank, world_size, port):
         for fp8, extend, ue8m0 in itertools.product(
             (False, True), (False, True), scale_formats
         ):
+            if not fp8 and ue8m0:
+                continue
             get_forward().set("is_extend_in_batch", extend)
             with envs.SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND.override(
                 False if major >= 10 else None
@@ -181,12 +182,10 @@ def _worker(rank, world_size, port):
 
 class TestDeepEPv2Dispatch(CustomTestCase):
     def test_dispatch_combine_and_graph(self):
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
+        store = dist.TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
         mp.spawn(
             _worker,
-            args=(torch.cuda.device_count(), port),
+            args=(torch.cuda.device_count(), store.port),
             nprocs=torch.cuda.device_count(),
         )
 
