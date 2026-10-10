@@ -1,4 +1,4 @@
-"""CPU-only tests for the DeepEP v2 ElasticBuffer ownership facade."""
+"""CPU-only tests for the DeepEP v2 EPBuffer ownership facade."""
 
 import unittest
 from unittest.mock import patch
@@ -33,7 +33,8 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
         _FakeBuffer.instances = []
         self._patches = [
             patch.object(deepep_v2, "use_deepep_v2", True),
-            patch.object(deepep_v2, "ElasticBuffer", _FakeBuffer, create=True),
+            patch.object(deepep_v2, "topk_idx_t", torch.int64, create=True),
+            patch.object(deepep_v2, "EPBuffer", _FakeBuffer, create=True),
             patch.object(deepep_v2.dist, "get_world_size", return_value=8),
         ]
         for item in self._patches:
@@ -111,7 +112,7 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
             def __init__(self, *args, **kwargs):
                 raise RuntimeError("construct failed")
 
-        with patch.object(deepep_v2, "ElasticBuffer", _FailingBuffer):
+        with patch.object(deepep_v2, "EPBuffer", _FailingBuffer):
             with self.assertRaisesRegex(RuntimeError, "construct failed"):
                 self._get()
 

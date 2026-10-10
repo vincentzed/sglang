@@ -14,7 +14,7 @@ usage() {
 Usage: build_sgl_deepep.sh <python-version> <cuda-version> <deepep-source> [architecture]
 
   python-version:     3.10, 3.11, 3.12, or 3.13
-  cuda-version:       13.0
+  cuda-version:       13.0 or 13.4
   deepep-source:      DeepEP checkout containing the sgl_deep_ep package
   architecture:       x86_64 or aarch64 (defaults to the current machine)
 
@@ -47,6 +47,11 @@ esac
 case "${CUDA_VERSION}" in
     13.0)
         CUDA_TAG=cu130
+        NCCL_VERSION=2.30.7
+        ;;
+    13.4)
+        CUDA_TAG=cu134
+        NCCL_VERSION=2.32.3
         ;;
     *)
         echo "Unsupported CUDA version: ${CUDA_VERSION}" >&2
@@ -102,6 +107,8 @@ docker build \
     --build-arg BASE_IMAGE="${BASE_IMAGE}" \
     --build-arg CUDA_VERSION="${CUDA_VERSION}" \
     --build-arg CUDA_TAG="${CUDA_TAG}" \
+    --build-arg TORCH_CUDA_TAG="${TORCH_CUDA_TAG:-cu130}" \
+    --build-arg NCCL_VERSION="${NCCL_VERSION}" \
     --build-arg PYTHON_TAG="${PYTHON_TAG}" \
     --build-arg ARCHITECTURE="${ARCHITECTURE}" \
     --build-arg TORCH_VERSION="${TORCH_VERSION:-2.14.1}" \
@@ -156,32 +163,28 @@ auditwheel repair \
     --exclude libnvToolsExt.so.1 \
     "${raw_wheels[0]}"
 
-if [[ "${CUDA_TAG}" == cu130 ]]; then
-    tagged_wheels=(/output/dist/sgl_deep_ep-*+cu130-*.whl)
-    if [[ ${#tagged_wheels[@]} -ne 1 ]]; then
-        echo "Expected exactly one CUDA 13 wheel, found ${#tagged_wheels[@]}" >&2
-        exit 1
-    fi
-    unpack_root="$(mktemp -d -t sgl-deep-ep-pypi.XXXXXX)"
-    python -m wheel unpack "${tagged_wheels[0]}" --dest "${unpack_root}"
-    unpacked="$(find "${unpack_root}" -mindepth 1 -maxdepth 1 -type d | head -1)"
-    dist_info="$(find "${unpacked}" -maxdepth 1 -type d -name "*.dist-info" | head -1)"
-    metadata="${dist_info}/METADATA"
-    original_version="$(sed -n "s/^Version:[[:space:]]*//p" "${metadata}" | head -1)"
-    public_version="${original_version%+cu130}"
-    if [[ "${original_version}" == "${public_version}" ]]; then
-        echo "CUDA 13 wheel metadata lacks the +cu130 local version" >&2
-        exit 1
-    fi
-    sed -i "s/^Version:.*/Version: ${public_version}/" "${metadata}"
-    old_dist_info="$(basename "${dist_info}")"
-    new_dist_info="${old_dist_info/${original_version}/${public_version}}"
-    mv "${dist_info}" "$(dirname "${dist_info}")/${new_dist_info}"
-    python -m wheel pack "${unpacked}" --dest-dir /output/dist-pypi
+tagged_wheels=(/output/dist/sgl_deep_ep-*+"${CUDA_TAG}"-*.whl)
+if [[ ${#tagged_wheels[@]} -ne 1 ]]; then
+    echo "Expected exactly one CUDA 13 wheel, found ${#tagged_wheels[@]}" >&2
+    exit 1
 fi
+unpack_root="$(mktemp -d -t sgl-deep-ep-pypi.XXXXXX)"
+python -m wheel unpack "${tagged_wheels[0]}" --dest "${unpack_root}"
+unpacked="$(find "${unpack_root}" -mindepth 1 -maxdepth 1 -type d | head -1)"
+dist_info="$(find "${unpacked}" -maxdepth 1 -type d -name "*.dist-info" | head -1)"
+metadata="${dist_info}/METADATA"
+original_version="$(sed -n "s/^Version:[[:space:]]*//p" "${metadata}" | head -1)"
+public_version="${original_version%+"${CUDA_TAG}"}"
+if [[ "${original_version}" == "${public_version}" ]]; then
+    echo "CUDA 13 wheel metadata lacks the +${CUDA_TAG} local version" >&2
+    exit 1
+fi
+sed -i "s/^Version:.*/Version: ${public_version}/" "${metadata}"
+old_dist_info="$(basename "${dist_info}")"
+new_dist_info="${old_dist_info/${original_version}/${public_version}}"
+mv "${dist_info}" "$(dirname "${dist_info}")/${new_dist_info}"
+python -m wheel pack "${unpacked}" --dest-dir /output/dist-pypi
 
 ls -lh /output/dist/*.whl
-if [[ "${CUDA_TAG}" == cu130 ]]; then
-    ls -lh /output/dist-pypi/*.whl
-fi
+ls -lh /output/dist-pypi/*.whl
 '

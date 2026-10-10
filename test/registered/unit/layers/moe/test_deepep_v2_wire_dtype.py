@@ -52,6 +52,7 @@ class _FakeBuffer:
         self.dispatch_x = x
         num_recv = (x[0] if isinstance(x, tuple) else x).shape[0]
         topk_idx = kwargs["topk_idx"]
+        self.sent_topk_idx = topk_idx
         topk_weights = kwargs["topk_weights"]
         if kwargs["do_expand"]:
             if isinstance(x, tuple):
@@ -82,7 +83,8 @@ class _DeepEPv2WireDtypeBase(CustomTestCase):
         _FakeBuffer.last = None
         self._patches = [
             patch.object(deepep_v2, "use_deepep_v2", True),
-            patch.object(deepep_v2, "ElasticBuffer", _FakeBuffer, create=True),
+            patch.object(deepep_v2, "topk_idx_t", torch.int64, create=True),
+            patch.object(deepep_v2, "EPBuffer", _FakeBuffer, create=True),
             patch.object(deepep_v2, "sglang_per_token_group_quant_fp8", _fake_quant),
             patch.object(deepep_v2.dist, "get_world_size", return_value=4),
             patch.object(deepep_v2.dist, "get_rank", return_value=0),
@@ -162,6 +164,32 @@ class TestDeepEPv2WireDtype(_DeepEPv2WireDtypeBase):
                 self.assertEqual(out.is_expanded, want_expanded)
                 self.assertFalse(out.use_masked_gemm)
 
+    def test_router_ids_are_owned_until_combine(self):
+        hidden_states = torch.randn((8, HIDDEN), dtype=torch.bfloat16)
+        original_ids = torch.arange(TOPK).expand(hidden_states.shape[0], -1).clone()
+        topk_output = SimpleNamespace(
+            topk_ids=original_ids,
+            topk_weights=torch.ones_like(original_ids, dtype=torch.float32),
+        )
+        dispatcher = deepep_v2.DeepEPv2Dispatcher(
+            group=_FakeGroup(),
+            router_topk=TOPK,
+            num_experts=NUM_EXPERTS,
+            num_local_experts=NUM_LOCAL_EXPERTS,
+            hidden_size=HIDDEN,
+            params_dtype=torch.bfloat16,
+            use_fp8_dispatch=False,
+        )
+        with patch.object(deepep_v2, "get_is_extend_in_batch", lambda: True):
+            out = dispatcher.dispatch(hidden_states, topk_output)
+        original_ids.fill_(-1)
+        torch.testing.assert_close(
+            out.topk_ids
+            if out.topk_ids is not None
+            else _FakeBuffer.last.sent_topk_idx,
+            torch.arange(TOPK).expand(hidden_states.shape[0], -1),
+        )
+
     def test_bf16_dispatch_sends_unquantized_activations(self):
         hidden_states, out = self._dispatch(use_fp8_dispatch=False)
         self.assertIs(_FakeBuffer.last.dispatch_x, hidden_states)
@@ -182,7 +210,7 @@ class TestDeepEPv2WireDtype(_DeepEPv2WireDtypeBase):
         self.assertTrue(out.use_masked_gemm)
         self.assertIsNone(out.hidden_states_scale)
 
-    def test_wire_dtype_selects_the_elastic_buffer_layout(self):
+    def test_wire_dtype_selects_the_ep_buffer_layout(self):
         for use_fp8_dispatch in (True, False):
             with self.subTest(use_fp8_dispatch=use_fp8_dispatch):
                 _FakeBuffer.last = None

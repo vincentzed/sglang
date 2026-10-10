@@ -38,7 +38,13 @@ sglang_per_token_group_quant_fp8 = None
 
 
 try:
-    from deep_ep import ElasticBuffer
+    from deep_ep import topk_idx_t
+
+    try:
+        from deep_ep import EPBuffer
+    except ImportError:
+        # Published sgl-deep-ep wheels still expose the DeepEP 2.1 interface.
+        from deep_ep import ElasticBuffer as EPBuffer
 
     use_deepep_v2 = True
 except Exception as exc:  # deep_ep's import-time host checks; see deepep.py
@@ -94,7 +100,7 @@ def _raise_deepep_v2_import_error() -> None:
         else ""
     )
     raise ImportError(
-        "DeepEP v2 (ElasticBuffer) is not available. Install DeepEP v2 from "
+        "DeepEP v2 (EPBuffer) is not available. Install DeepEP v2 from "
         "https://github.com/deepseek-ai/DeepEP." + detail
     )
 
@@ -140,7 +146,7 @@ def _quantize_for_deepep_v2_dispatch(
 
 
 class DeepEPv2Buffer:
-    """Facade for the process-wide ElasticBuffer stored in runtime resources."""
+    """Facade for the process-wide EPBuffer stored in runtime resources."""
 
     _STATE_KEY = "deepep_v2_ep_state"
 
@@ -164,13 +170,13 @@ class DeepEPv2Buffer:
         num_max_dispatch_tokens_per_rank: int,
         use_fp8_dispatch: bool,
         allow_hybrid_mode: Optional[bool] = None,
-    ) -> ElasticBuffer:
+    ) -> EPBuffer:
         _ensure_deepep_v2_available()
 
         if allow_hybrid_mode is None:
             allow_hybrid_mode = _get_allow_hybrid_mode()
         state = cls._state()
-        # A key change rebuilds ElasticBuffer collectively on every rank.
+        # A key change rebuilds EPBuffer collectively on every rank.
         key = (
             group,
             hidden_size,
@@ -188,7 +194,7 @@ class DeepEPv2Buffer:
 
         # Communicator reuse requires a device-bound process group.
         os.environ.setdefault("EP_REUSE_NCCL_COMM", "0")
-        buffer = ElasticBuffer(
+        buffer = EPBuffer(
             group,
             num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
             hidden=hidden_size,
@@ -202,7 +208,7 @@ class DeepEPv2Buffer:
         state.buffer = buffer
         state.key = key
         logger.info(
-            "Initialized DeepEP v2 ElasticBuffer: world_size=%s hidden_size=%s "
+            "Initialized DeepEP v2 EPBuffer: world_size=%s hidden_size=%s "
             "num_topk=%s max_dispatch_tokens_per_rank=%s use_fp8_dispatch=%s "
             "allow_hybrid_mode=%s num_bytes=%s",
             dist.get_world_size(group),
@@ -256,7 +262,7 @@ class _DeepEPv2Impl:
     def _destroy_handle(self) -> None:
         self._handle = None
 
-    def _get_buffer(self) -> ElasticBuffer:
+    def _get_buffer(self) -> EPBuffer:
         return DeepEPv2Buffer.get_buffer(
             self.group,
             self.hidden_size,
@@ -266,12 +272,7 @@ class _DeepEPv2Impl:
         )
 
     def prebuild_buffer(self) -> None:
-        """Build the ElasticBuffer now instead of lazily on the first dispatch.
-
-        Avoids the ~2GB alloc + cross-rank NCCL barrier stalling the first request
-        when decode CUDA-graph capture did not already build it. Needs only
-        host-known config already on this impl; key-cached so dispatch reuses it.
-        """
+        """Build the EPBuffer before serving the first request."""
         self._get_buffer()
 
     def _validate_common(
@@ -310,7 +311,8 @@ class _DeepEPv2Impl:
             )
         _ensure_deepep_v2_available()
         topk_weights = topk_output.topk_weights
-        topk_ids = topk_output.topk_ids.to(torch.int64)
+        # DeepEP 2.5 retains these indices by reference until combine completes.
+        topk_ids = topk_output.topk_ids.to(topk_idx_t, copy=True)
         self._validate_common(hidden_states, topk_ids)
         is_decode = not get_is_extend_in_batch()
         use_masked = is_decode
@@ -365,6 +367,7 @@ class _DeepEPv2Impl:
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
             do_cpu_sync=do_cpu_sync_val,
             do_expand=use_expand_layout,
+            do_handle_copy=False,
         )
         local_tokens = hidden_states.shape[0]
         if event.event is not None:
@@ -394,7 +397,7 @@ class _DeepEPv2Impl:
             if recv_hidden_states_scale is not None:
                 recv_hidden_states_scale = recv_hidden_states_scale[:num_recv_tokens]
 
-            # ElasticBuffer already converts global router IDs to receiver-local
+            # EPBuffer already converts global router IDs to receiver-local
             # expert IDs; applying this rank's offset again would discard routes.
             local_topk_ids = recv_topk_idx
 
@@ -506,5 +509,5 @@ class DeepEPv2Dispatcher(BaseDispatcher):
         return self._impl.combine(combine_input)
 
     def prebuild(self) -> None:
-        """Build the ElasticBuffer eagerly at deployment time (no forward needed)."""
+        """Build the EPBuffer eagerly at deployment time (no forward needed)."""
         self._impl.prebuild_buffer()
