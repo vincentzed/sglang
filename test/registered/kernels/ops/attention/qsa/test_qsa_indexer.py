@@ -542,6 +542,61 @@ def test_tilelang_mqa_decode_skips_rows_that_fit_topk():
         torch.testing.assert_close(a, b, rtol=2e-3, atol=2e-3)
 
 
+@pytest.mark.parametrize("rows_per_request", [1, 4])
+def test_cuda_decode_scoring_equals_tilelang(rows_per_request, monkeypatch):
+    """The CUDA decode scoring kernel writes the TileLang kernel's fp32 values bit
+    for bit and nothing past a row's length. Verify rows share a page table and
+    grow by one token, so lengths end mid-page and differ inside a request."""
+    from sglang.srt.layers.attention.qsa import mqa
+    from sglang.srt.utils.device import is_sm100_supported
+
+    if not mqa.HAS_TILELANG or not is_sm100_supported():
+        pytest.skip("needs TileLang and an SM100 GPU")
+    monkeypatch.setenv("SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_CUDA", "1")
+    cuda_calls = []
+    cuda_scoring = mqa.cuda_qsa_mqa_decode
+    monkeypatch.setattr(
+        mqa,
+        "cuda_qsa_mqa_decode",
+        lambda *args, **kwargs: cuda_calls.append(1) or cuda_scoring(*args, **kwargs),
+    )
+    device = torch.device("cuda")
+    torch.manual_seed(13)
+    requests, max_pages, page_size, block_topk = 20, 400, 16, 512
+    max_model_len = max_pages * page_size
+    base = torch.randint(4 * 600, 4 * max_model_len - 8, (requests,))
+    # A request that fits k, one whose last row alone exceeds k, the first
+    # length past k, and a full page table.
+    base[:4] = torch.tensor([300, 2048, 2051, 4 * max_model_len - 4])
+    seq_lens = (base[:, None] + torch.arange(1, rows_per_request + 1)).reshape(-1)
+    lens = (seq_lens // RATIO).to(device=device, dtype=torch.int32)
+    rows = lens.numel()
+    q = torch.zeros(rows, 8, HEAD_DIM, device=device)
+    q[:, :NUM_Q_HEADS] = torch.randn(rows, NUM_Q_HEADS, HEAD_DIM, device=device)
+    q = q.to(torch.float8_e4m3fn)
+    cache = torch.randn(1024, page_size, 1, HEAD_DIM, device=device).to(
+        torch.float8_e4m3fn
+    )
+    page_table = torch.randint(
+        0, 1024, (requests, max_pages), device=device, dtype=torch.int32
+    ).repeat_interleave(rows_per_request, dim=0)
+    columns = torch.arange(max_model_len, device=device)
+    for min_scored_len in (0, block_topk):
+        args = (q, cache, page_table, lens, max_model_len)
+        kwargs = dict(
+            min_scored_len=min_scored_len,
+            rows_per_request=rows_per_request,
+            num_query_heads=NUM_Q_HEADS,
+        )
+        out = mqa.qsa_mqa_decode(*args, **kwargs)
+        ref = mqa.tilelang_qsa_mqa_decode(*args, **kwargs)
+        scored = (columns < lens[:, None]) & (lens[:, None] > min_scored_len)
+        assert torch.equal(out[scored].view(torch.int32), ref[scored].view(torch.int32))
+        if min_scored_len == 0:
+            assert torch.isneginf(out[~scored]).all()
+    assert len(cuda_calls) == 2
+
+
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_expand_block_indices_int_inputs(dtype):
     device = torch.device("cuda")
