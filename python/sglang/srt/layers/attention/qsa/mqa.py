@@ -7,7 +7,13 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils.device import is_gfx942_supported, is_hip, is_npu
+from sglang.srt.environ import envs
+from sglang.srt.utils.device import (
+    is_gfx942_supported,
+    is_hip,
+    is_npu,
+    is_sm100_supported,
+)
 
 _is_npu = is_npu()
 
@@ -682,6 +688,21 @@ def _decode_ctas_per_row(rows: int, device: torch.device) -> int:
     return _DECODE_CTAS_PER_ROW_LEVELS[-1]
 
 
+def _decode_logits(
+    q: torch.Tensor, max_model_len: int, min_scored_len: int
+) -> torch.Tensor:
+    if min_scored_len > 0:
+        return torch.empty(
+            (q.shape[0], max_model_len), dtype=torch.float32, device=q.device
+        )
+    return torch.full(
+        (q.shape[0], max_model_len),
+        -float("inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+
 def tilelang_qsa_mqa_decode(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -710,17 +731,7 @@ def tilelang_qsa_mqa_decode(
             "TileLang QSA decode requires a compressed page size of "
             f"8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
         )
-    if min_scored_len > 0:
-        logits = torch.empty(
-            (q.shape[0], max_model_len), dtype=torch.float32, device=q.device
-        )
-    else:
-        logits = torch.full(
-            (q.shape[0], max_model_len),
-            -float("inf"),
-            dtype=torch.float32,
-            device=q.device,
-        )
+    logits = _decode_logits(q, max_model_len, min_scored_len)
     if not q.shape[0] or not max_model_len:
         return logits
     # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
@@ -773,6 +784,56 @@ def tilelang_qsa_mqa_decode(
         context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
         logits,
         float(score_scale or math.sqrt(head_dim)),
+    )
+    return logits
+
+
+def _use_cuda_decode(
+    q: torch.Tensor, k_cache: torch.Tensor, num_query_heads: Optional[int]
+) -> bool:
+    return (
+        envs.SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_CUDA.get()
+        and q.is_cuda
+        and is_sm100_supported()
+        and q.dtype == torch.float8_e4m3fn
+        and k_cache.dtype == torch.float8_e4m3fn
+        and q.shape[-1] == 128
+        and k_cache.shape[1] == 16
+        and (q.shape[1] if num_query_heads is None else num_query_heads) == 4
+    )
+
+
+def cuda_qsa_mqa_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_model_len: int,
+    score_scale: Optional[float] = None,
+    *,
+    min_scored_len: int = 0,
+    rows_per_request: int = 1,
+) -> torch.Tensor:
+    """FP8 paged decode scoring with the contract and the values of
+    ``tilelang_qsa_mqa_decode``. The ``rows_per_request`` consecutive rows of a
+    request are scored against the pages of its last (longest) row."""
+
+    from sglang.kernels.ops.attention.qsa_index_score import qsa_index_score_decode
+
+    _validate_decode_inputs(q, k_cache, page_table, context_lens)
+    logits = _decode_logits(q, max_model_len, min_scored_len)
+    if not q.shape[0] or not max_model_len:
+        return logits
+    grouped = 1 <= rows_per_request <= 4 and q.shape[0] % rows_per_request == 0
+    qsa_index_score_decode(
+        q.contiguous(),
+        k_cache.contiguous(),
+        page_table.to(device=q.device, dtype=torch.int32).contiguous(),
+        context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
+        logits,
+        float(score_scale or math.sqrt(q.shape[-1])),
+        group_rows=rows_per_request if grouped else 1,
+        min_scored_len=min_scored_len,
     )
     return logits
 
@@ -831,6 +892,17 @@ def qsa_mqa_decode(
         from sgl_kernel_npu.operators.indexer import qsa_mqa_paged
 
         return qsa_mqa_paged(q, k_cache, page_table, context_lens, max_model_len)
+    if _use_cuda_decode(q, k_cache, num_query_heads):
+        return cuda_qsa_mqa_decode(
+            q,
+            k_cache,
+            page_table,
+            context_lens,
+            max_model_len,
+            score_scale,
+            min_scored_len=min_scored_len,
+            rows_per_request=rows_per_request,
+        )
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q,
@@ -850,6 +922,7 @@ def qsa_mqa_decode(
 
 __all__ = [
     "HAS_TILELANG",
+    "cuda_qsa_mqa_decode",
     "qsa_mqa_decode",
     "qsa_mqa_prefill",
     "qsa_mqa_prefill_relative",

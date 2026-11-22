@@ -1467,6 +1467,9 @@ class Envs:
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
     # layout. The scheduler continues to allocate 256-token logical pages.
     SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
+    # QSA (Qwen4-Exp) decode / target verify index scoring with an fp8_e4m3
+    # indexer cache on SM100 in a CUDA kernel instead of the TileLang kernels.
+    SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_CUDA = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
