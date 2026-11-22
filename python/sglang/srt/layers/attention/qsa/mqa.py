@@ -751,7 +751,7 @@ def tilelang_qsa_mqa_decode(
         and page_size == 16
         and not is_hip()
         and q.is_cuda
-        and torch.cuda.get_device_capability(q.device) == (10, 7)
+        and torch.cuda.get_device_capability(q.device) in ((10, 7), (10, 3))
     )
     kernel = (
         _tilelang_qsa_mqa_decode_grouped_kernel
