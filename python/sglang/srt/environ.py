@@ -2000,6 +2000,10 @@ class Envs:
     # still writes. Requires --enable-hierarchical-cache. Off keeps the
     # donated GPU slot and the previous ratio.
     SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT = EnvBool(False)
+    # GDN ReplaySSM spec-verify with a 16-bit checkpoint: fold the ring into the
+    # checkpoint only when it fills (as fp32 checkpoints do) instead of after every
+    # accepted verify window.
+    SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
