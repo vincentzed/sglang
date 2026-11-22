@@ -16,7 +16,10 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.attention.qsa_sparse_decode import qsa_sparse_decode
+from sglang.kernels.ops.attention.qsa_sparse_decode import (
+    qsa_sparse_decode,
+    qsa_sparse_decode_sm100,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
@@ -315,6 +318,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     needs_cpu_seq_lens: bool = False
     _kv_shard_pool: Optional[PageInterleaveKVPoolMixin] = None
     _use_sparse_decode_cuda: bool = False
+    _use_sparse_decode_sm100: bool = False
 
     def __init__(self, runner=None) -> None:
         self.runner = runner
@@ -328,11 +332,20 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
         if self._kv_shard_pool is not None:
             self.needs_cpu_seq_lens = True
+        fp8_pool = (
+            self._fused_kv_pool_eligible
+            and self.token_to_kv_pool.dtype == torch.float8_e4m3fn
+        )
+        self._use_sparse_decode_sm100 = (
+            envs.SGLANG_ENABLE_QSA_SPARSE_DECODE_SM100.get()
+            and fp8_pool
+            and is_sm100_supported()
+        )
         self._use_sparse_decode_cuda = (
             envs.SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA.get()
-            and self._fused_kv_pool_eligible
-            and self.token_to_kv_pool.dtype == torch.float8_e4m3fn
+            and fp8_pool
             and (is_sm120() or is_sm100_supported())
+            and not self._use_sparse_decode_sm100
         )
         self.device = getattr(runner, "device", None)
         model_config = getattr(runner, "model_config", None)
@@ -1556,6 +1569,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if (
             not self._fused_kv_pool_eligible
             or self._use_sparse_decode_cuda
+            or self._use_sparse_decode_sm100
             or not q.is_cuda
             or k is None
             or v is None
@@ -2126,8 +2140,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             return output.reshape(q.shape[0], -1)
 
         topk_indices = topk_indices.to(torch.int32).contiguous()
-        if self._use_sparse_decode_cuda:
-            output = qsa_sparse_decode(
+        if self._use_sparse_decode_cuda or self._use_sparse_decode_sm100:
+            pool_read = dict(
                 q=q,
                 k_cache=k_buffer,
                 v_cache=v_buffer,
@@ -2141,6 +2155,16 @@ class QwenSparseAttnBackend(AttentionBackend):
                 seq_lens=metadata.sequence_lengths.to(torch.int32),
                 sm_scale=layer.scaling,
             )
+            if self._use_sparse_decode_sm100:
+                verify = forward_batch.forward_mode.is_target_verify()
+                output = qsa_sparse_decode_sm100(
+                    **pool_read,
+                    rows_per_request=(
+                        int(forward_batch.spec_info.draft_token_num) if verify else 1
+                    ),
+                )
+            else:
+                output = qsa_sparse_decode(**pool_read)
             return output.reshape(q.shape[0], -1)
         trtllm_decode = _resolve_trtllm_sparse_decode()
         if trtllm_decode is not None:

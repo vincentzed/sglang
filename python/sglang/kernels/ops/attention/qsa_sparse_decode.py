@@ -31,6 +31,9 @@ if TYPE_CHECKING:
 _HEAD_DIM = 256
 _HEADS_PER_TILE = 16
 _NUM_SPLITS = 8
+_TILE = 128
+_MAX_ROWS_PER_CTA = 4
+_MAX_SHARED_HEADS = 14
 
 
 @cache_once
@@ -41,6 +44,17 @@ def _jit_qsa_sparse_decode_module(stages: int, q_in_smem: bool) -> Module:
         *args,
         cuda_files=["attention/qsa_sparse_decode.cuh"],
         cuda_wrappers=[("run", f"QsaSparseDecode<{args}>::run")],
+    )
+
+
+@cache_once
+def _jit_qsa_sparse_decode_sm100_module(rows_per_cta: int, heads: int) -> Module:
+    args = make_cpp_args(rows_per_cta, heads, is_arch_support_pdl())
+    return load_jit(
+        "qsa_sparse_decode_sm100",
+        *args,
+        cuda_files=["attention/qsa_sparse_decode_sm100.cuh"],
+        cuda_wrappers=[("run", f"QsaSparseDecodeSm100<{args}>::run")],
     )
 
 
@@ -100,6 +114,57 @@ def qsa_sparse_decode(
         part_acc,
         part_m,
         part_l,
+        out,
+        float(sm_scale),
+    )
+    return out
+
+
+def qsa_sparse_decode_sm100(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    req_to_token: torch.Tensor,
+    row_req_pool_indices: torch.Tensor,
+    indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    sm_scale: float,
+    rows_per_request: int = 1,
+) -> torch.Tensor:
+    """``qsa_sparse_decode`` on SM100 tensor cores. Consecutive rows of a request
+    (a verify chain of ``rows_per_request``) share a CTA per KV head, and the KV
+    rows they have in common, in the smallest groups that fit one CTA per SM."""
+    rows, q_heads, head_dim = q.shape
+    kv_heads = k_cache.shape[1]
+    heads = q_heads // kv_heads
+    if head_dim != _HEAD_DIM or k_cache.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "qsa_sparse_decode_sm100 needs head_dim 256 and a float8_e4m3fn KV cache, "
+            f"got head_dim {head_dim} and {k_cache.dtype}"
+        )
+    sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    rows_per_cta = 1
+    if heads <= _MAX_SHARED_HEADS and rows % rows_per_request == 0:
+        for size in range(2, _MAX_ROWS_PER_CTA + 1):
+            if rows * kv_heads <= rows_per_cta * sms:
+                break
+            if rows_per_request % size == 0:
+                rows_per_cta = size
+    groups = rows // rows_per_cta
+    capacity = -(-rows_per_cta * indices.shape[1] // _TILE) * _TILE
+    entries = torch.empty((groups, capacity), dtype=torch.int32, device=q.device)
+    counts = torch.empty(groups, dtype=torch.int32, device=q.device)
+    out = torch.empty_like(q)
+    _jit_qsa_sparse_decode_sm100_module(rows_per_cta, heads).run(
+        q,
+        k_cache.view(torch.uint8),
+        v_cache.view(torch.uint8),
+        req_to_token,
+        row_req_pool_indices,
+        indices,
+        seq_lens,
+        entries,
+        counts,
         out,
         float(sm_scale),
     )
