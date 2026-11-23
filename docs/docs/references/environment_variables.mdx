@@ -1732,6 +1732,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_NORM_ROW_TILES</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run two norm kernels on multi-row tiles: the gated RMSNorm (GDN output norm) with 16 rows per program on 4 warps once a launch has at least 64 rows per SM, and the QSA q/k GemmaRMSNorm + RoPE + gate with 16 tokens of one head per program. The gated norm is bit-identical; QSA q/k may differ by one bf16 ulp (row-sum order).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force FA3 metadata updates on MThreads MUSA.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>

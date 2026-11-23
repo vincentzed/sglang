@@ -18,6 +18,7 @@ from einops import rearrange
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -35,6 +36,8 @@ _is_npu = is_npu()
 
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
+WIDE_ROWS_PER_BLOCK = 16
+_wide_rows = envs.SGLANG_OPT_NORM_ROW_TILES.get()
 
 _GATE_ACTIVATION_FNS = {
     "swish": F.silu,
@@ -264,6 +267,8 @@ def calc_rows_per_block(M: int, device: torch.device) -> int:
     sm_count = _get_sm_count(device)
     rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))
     rows_per_block = min(rows_per_block, MAX_ROWS_PER_BLOCK)
+    if _wide_rows and M >= 4 * WIDE_ROWS_PER_BLOCK * sm_count:
+        rows_per_block = WIDE_ROWS_PER_BLOCK
     return rows_per_block
 
 
@@ -320,6 +325,7 @@ def _layer_norm_fwd(
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     # Calculate rows per block based on SM count
     rows_per_block = calc_rows_per_block(M, x.device)
+    num_warps = max(num_warps, rows_per_block // MAX_ROWS_PER_BLOCK)
     quant = {}
     # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
     if quant_heads:

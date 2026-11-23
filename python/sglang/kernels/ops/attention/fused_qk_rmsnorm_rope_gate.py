@@ -15,6 +15,10 @@ import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
 from sglang.kernels.arch import current_arch
+from sglang.srt.environ import envs
+
+QK_NORM_ROWS_BLOCK_T = 16
+_qk_norm_rows = envs.SGLANG_OPT_NORM_ROW_TILES.get()
 
 
 @triton.jit
@@ -136,6 +140,123 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+@triton.jit(do_not_specialize=["num_tokens"])
+def _fused_qk_rmsnorm_rope_gate_rows_kernel(
+    q_gate_ptr,
+    k_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    gate_out_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    cos_sin_cache_ptr,
+    positions_ptr,
+    mrope_axis_map_ptr,
+    num_tokens,
+    stride_qg_t,
+    stride_k_t,
+    stride_qo_t,
+    stride_ko_t,
+    stride_gate_t,
+    stride_cos_t,
+    stride_pos_axis,
+    NUM_Q_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ROTARY_DIM: tl.constexpr,
+    HALF_ROTARY: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    ROT_HALF_BLOCK: tl.constexpr,
+    EPS: tl.constexpr,
+    FP16: tl.constexpr,
+    HAS_PASS: tl.constexpr,
+    HAS_GATE: tl.constexpr,
+    MROPE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    tokens = tl.program_id(0).to(tl.int64) * BLOCK_T + tl.arange(0, BLOCK_T)
+    head = tl.program_id(1)
+    is_k = head >= NUM_Q_HEADS
+    out_dtype = tl.float16 if FP16 else tl.bfloat16
+    if is_k:
+        in_base = k_ptr + tokens * stride_k_t + (head - NUM_Q_HEADS) * HEAD_DIM
+        w_ptr = k_weight_ptr
+        out_base = k_out_ptr + tokens * stride_ko_t + (head - NUM_Q_HEADS) * HEAD_DIM
+    else:
+        if HAS_GATE:
+            in_base = q_gate_ptr + tokens * stride_qg_t + head * 2 * HEAD_DIM
+        else:
+            in_base = q_gate_ptr + tokens * stride_qg_t + head * HEAD_DIM
+        w_ptr = q_weight_ptr
+        out_base = q_out_ptr + tokens * stride_qo_t + head * HEAD_DIM
+    token_ok = tokens < num_tokens
+
+    cols = tl.arange(0, HEAD_BLOCK)
+    col_ok = cols < HEAD_DIM
+    mask = token_ok[:, None] & col_ok[None, :]
+    x = tl.load(in_base[:, None] + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + cols, mask=col_ok, other=0.0).to(tl.float32)
+    inv_rms = tl.rsqrt(tl.sum(x * x, axis=1) / HEAD_DIM + EPS)
+    if HAS_PASS:
+        x_norm = (x * inv_rms[:, None] * (w[None, :] + 1.0)).to(out_dtype)
+        tl.store(
+            out_base[:, None] + cols[None, :],
+            x_norm,
+            mask=mask & (cols >= ROTARY_DIM)[None, :],
+        )
+
+    rot = tl.arange(0, ROT_HALF_BLOCK)
+    rot_ok = rot < HALF_ROTARY
+    rmask = token_ok[:, None] & rot_ok[None, :]
+    xr1 = tl.load(in_base[:, None] + rot[None, :], mask=rmask, other=0.0).to(tl.float32)
+    xr2 = tl.load(
+        in_base[:, None] + HALF_ROTARY + rot[None, :], mask=rmask, other=0.0
+    ).to(tl.float32)
+    wr1 = tl.load(w_ptr + rot, mask=rot_ok, other=0.0).to(tl.float32)
+    wr2 = tl.load(w_ptr + HALF_ROTARY + rot, mask=rot_ok, other=0.0).to(tl.float32)
+    xr1 = (xr1 * inv_rms[:, None] * (wr1[None, :] + 1.0)).to(out_dtype).to(tl.float32)
+    xr2 = (xr2 * inv_rms[:, None] * (wr2[None, :] + 1.0)).to(out_dtype).to(tl.float32)
+    if MROPE:
+        axis = tl.load(mrope_axis_map_ptr + rot, mask=rot_ok, other=0)
+        pos = tl.load(
+            positions_ptr + axis[None, :] * stride_pos_axis + tokens[:, None],
+            mask=rmask,
+            other=0,
+        )
+    else:
+        pos = tl.load(positions_ptr + tokens, mask=token_ok, other=0)[:, None]
+    cache_off = pos.to(tl.int64) * stride_cos_t
+    cos = tl.load(
+        cos_sin_cache_ptr + cache_off + rot[None, :], mask=rmask, other=0.0
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_cache_ptr + cache_off + HALF_ROTARY + rot[None, :],
+        mask=rmask,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(out_base[:, None] + rot[None, :], xr1 * cos - xr2 * sin, mask=rmask)
+    tl.store(
+        out_base[:, None] + HALF_ROTARY + rot[None, :],
+        xr2 * cos + xr1 * sin,
+        mask=rmask,
+    )
+
+    if HAS_GATE and not is_k:
+        g = tl.load(in_base[:, None] + HEAD_DIM + cols[None, :], mask=mask, other=0.0)
+        tl.store(
+            gate_out_ptr
+            + tokens[:, None] * stride_gate_t
+            + head * HEAD_DIM
+            + cols[None, :],
+            g,
+            mask=mask,
+        )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
 def fused_qk_gemma_rmsnorm_rope_gate(
     q_gate: torch.Tensor,
     k: torch.Tensor,
@@ -188,9 +309,48 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     head_block = triton.next_power_of_2(head_dim)
     rot_half_block = triton.next_power_of_2(half_rotary)
 
-    grid = (T, num_q_heads + num_kv_heads)
     use_pdl = current_arch().supports_pdl
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
+    if _qk_norm_rows:
+        _fused_qk_rmsnorm_rope_gate_rows_kernel[
+            (triton.cdiv(T, QK_NORM_ROWS_BLOCK_T), num_q_heads + num_kv_heads)
+        ](
+            q_gate,
+            k,
+            q_out,
+            k_out,
+            gate_out,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            positions,
+            mrope_axis_map,
+            T,
+            q_gate.stride(0),
+            k.stride(0),
+            q_out.stride(0),
+            k_out.stride(0),
+            gate_out.stride(0),
+            cos_sin_cache.stride(0),
+            positions.stride(0),
+            NUM_Q_HEADS=num_q_heads,
+            HEAD_DIM=head_dim,
+            ROTARY_DIM=rotary_dim,
+            HALF_ROTARY=half_rotary,
+            HEAD_BLOCK=head_block,
+            ROT_HALF_BLOCK=rot_half_block,
+            EPS=eps,
+            FP16=q_gate.dtype == torch.float16,
+            HAS_PASS=rotary_dim < head_dim,
+            HAS_GATE=has_gate,
+            MROPE=mrope,
+            ENABLE_PDL=use_pdl,
+            BLOCK_T=QK_NORM_ROWS_BLOCK_T,
+            num_warps=4,
+            **pdl_kwargs,
+        )
+        return q_out, k_out, gate_out if has_gate else None
+    grid = (T, num_q_heads + num_kv_heads)
     _fused_qk_rmsnorm_rope_gate_kernel[grid](
         q_gate,
         k,

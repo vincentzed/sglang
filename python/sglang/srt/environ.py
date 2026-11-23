@@ -2641,6 +2641,9 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    # Norms on multi-row tiles: gated RMSNorm 16 rows on 4 warps (from 64 rows per SM),
+    # QSA q/k GemmaRMSNorm + RoPE + gate 16 tokens of one head per program.
+    SGLANG_OPT_NORM_ROW_TILES = EnvBool(False)
 
     # ===================================================================
     # Plugin system
