@@ -1523,6 +1523,9 @@ class Qwen4ExpPLELayer(nn.Module):
         self._prefetch_state = None
         return embeddings
 
+    def drop_prefetch(self) -> None:
+        self._prefetch_state = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2368,41 +2371,48 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             )
         aux_hidden_states = AuxHiddenStateList()
         normalized_input = None
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            if i + 1 < self.end_layer:
-                next_ple = self.layers[i + 1].ple
-                if next_ple is not None:
-                    if breakable_ple:
-                        _breakable_ple_prefetch(ple=next_ple, batch=ple_batch)
-                    else:
-                        next_ple.start_prefetch(
-                            batch=ple_batch, forward_batch=forward_batch
-                        )
-            next_norm = None
-            if i + 1 < self.end_layer:
-                next_layer = self.layers[i + 1]
-                if next_layer.ple is None:
-                    next_norm = next_layer.attn_hyper_connection.hc_norm
-            elif self.pp_group.is_last_rank:
-                next_norm = self.hyper_connection_mixer.hc_norm
-            with (
-                get_global_expert_distribution_recorder().with_current_layer(i),
-                layer.hc_norms(normalized_input, next_norm) as norms,
-            ):
-                hidden_states = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    ple_batch=ple_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
-                )
+        try:
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                if i + 1 < self.end_layer:
+                    next_ple = self.layers[i + 1].ple
+                    if next_ple is not None:
+                        if breakable_ple:
+                            _breakable_ple_prefetch(ple=next_ple, batch=ple_batch)
+                        else:
+                            next_ple.start_prefetch(
+                                batch=ple_batch, forward_batch=forward_batch
+                            )
+                next_norm = None
+                if i + 1 < self.end_layer:
+                    next_layer = self.layers[i + 1]
+                    if next_layer.ple is None:
+                        next_norm = next_layer.attn_hyper_connection.hc_norm
+                elif self.pp_group.is_last_rank:
+                    next_norm = self.hyper_connection_mixer.hc_norm
+                with (
+                    get_global_expert_distribution_recorder().with_current_layer(i),
+                    layer.hc_norms(normalized_input, next_norm) as norms,
+                ):
+                    hidden_states = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                        ple_batch=ple_batch,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states
+                            if getattr(layer, "_is_layer_to_capture", False)
+                            else None
+                        ),
+                    )
 
-            normalized_input = norms.output
+                normalized_input = norms.output
+        except Exception:
+            for i in range(self.start_layer, self.end_layer):
+                ple = self.layers[i].ple
+                if ple is not None:
+                    ple.drop_prefetch()
+            raise
 
         if breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
