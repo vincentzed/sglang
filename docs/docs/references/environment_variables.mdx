@@ -1752,6 +1752,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_QSA_SPARSE_PREFILL_SM100</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>QSA (Qwen4-Exp) chunked prefill of 256+ rows with an <code>fp8_e4m3</code> KV cache on SM100 / SM103: tcgen05 attention over the union of what a group of consecutive rows selected, on packed fp8 K and bf16 V.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_FP8_BLOCK_GEMV</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On SM90, route small-M (decode) blockwise-FP8 linears and router-gate logits to the Hopper GEMV kernels, and tune the KDA recurrent decode tiling.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
