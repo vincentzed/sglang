@@ -1446,6 +1446,12 @@ class Envs:
     SGLANG_TRTLLM_MLA_WORKSPACE_MB = EnvInt(_k31_gb_best(256, 150))
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
+    # Qwen MoE fused finalize gate: gate the shared output on the shared-expert
+    # stream and finalize with the CUDA moe_finalize_fuse_shared kernel.
+    SGLANG_OPT_MOE_FINALIZE_GATE_CUDA = EnvBool(False)
+    # Run the FlashInfer CuTe DSL MoE without swap-AB on SM100/SM103 (gather GEMM1
+    # with fused SwiGLU, contiguous GEMM2).
+    SGLANG_OPT_CUTEDSL_MOE_NO_SWAP_AB = EnvBool(False)
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
     SGLANG_OPT_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every

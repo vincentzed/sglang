@@ -152,6 +152,18 @@ class TestNvfp4MoeScaleLoading(CustomTestCase):
             self.assertFalse(use_cutedsl_moe_swap_ab(torch.device("cpu")))
             get_capability.assert_not_called()
 
+    def test_cutedsl_no_swap_ab_switch_overrides_sm(self):
+        self.addCleanup(_use_cutedsl_moe_swap_ab.cache_clear)
+        _use_cutedsl_moe_swap_ab.cache_clear()
+        with (
+            mock.patch.dict("os.environ", {"SGLANG_OPT_CUTEDSL_MOE_NO_SWAP_AB": "1"}),
+            mock.patch(
+                "torch.cuda.get_device_capability", return_value=(10, 3)
+            ) as get_capability,
+        ):
+            self.assertFalse(use_cutedsl_moe_swap_ab(torch.device("cuda:0")))
+            get_capability.assert_not_called()
+
     def test_global_scales_keep_gate_up_order_across_weight_layouts(self):
         """Changing backend layout must not change which projection an alpha scales.
 

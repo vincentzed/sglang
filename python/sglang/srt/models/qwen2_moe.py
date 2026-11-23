@@ -774,6 +774,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_fused_gate: bool = False,
         defer_finalize: bool = False,
         fused_finalize_gate: bool = False,
+        gate_shared_output: bool = False,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
 
@@ -788,7 +789,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = self._forward_shared_experts(
                     hidden_states, apply_gate=False
                 )
-                if defer_finalize and shared_output is not None:
+                if gate_shared_output and shared_output is not None:
                     shared_output = self._gate_shared_output_out_of_place(
                         hidden_states, shared_output
                     )
@@ -871,6 +872,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and self.topk.topk_config.output_format == TopKOutputFormat.BYPASSED
         )
 
+        finalize_gated_shared = (
+            fused_finalize_gate and envs.SGLANG_OPT_MOE_FINALIZE_GATE_CUDA.get()
+        )
+        gate_shared_output = defer_finalize or finalize_gated_shared
+
         if hidden_states.shape[0] == 0:
             # M=0 guard for idle DP ranks: skip shared_experts and gate
             # (which crash on empty tensors in FP4 GEMM), but still call
@@ -893,12 +899,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 use_fused_gate=use_fused_gate,
                 defer_finalize=defer_finalize,
                 fused_finalize_gate=fused_finalize_gate,
+                gate_shared_output=gate_shared_output,
             )
         else:
             shared_output = self._forward_shared_experts(
                 hidden_states, apply_gate=not use_fused_gate and not defer_finalize
             )
-            if defer_finalize and shared_output is not None:
+            if gate_shared_output and shared_output is not None:
                 shared_output = self._gate_shared_output_out_of_place(
                     hidden_states, shared_output
                 )
@@ -906,7 +913,27 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states, defer_finalize=defer_finalize or fused_finalize_gate
             )
 
-        if fused_finalize_gate:
+        if finalize_gated_shared:
+            from sglang.kernels.ops.moe.moe_finalize_fuse_shared import (
+                moe_finalize_fuse_shared,
+            )
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                trtllm_moe_enable_pdl,
+            )
+
+            deferred = final_hidden_states
+            final_hidden_states = moe_finalize_fuse_shared(
+                deferred.gemm2_out.view(-1, deferred.gemm2_out.shape[-1]),
+                deferred.expanded_idx_to_permuted_idx.view(-1)[
+                    : num_tokens * deferred.top_k
+                ],
+                deferred.expert_weights.view(-1, deferred.top_k)[:num_tokens],
+                shared_output,
+                deferred.top_k,
+                enable_pdl=trtllm_moe_enable_pdl(num_tokens),
+            )
+            shared_output = None
+        elif fused_finalize_gate:
             from sglang.kernels.ops.moe.moe_finalize_gate_add import (
                 moe_finalize_gate_add,
             )
