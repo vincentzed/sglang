@@ -1485,6 +1485,10 @@ class Envs:
     # QSA (Qwen4-Exp) prefill block selection with an fp8_e4m3 indexer cache on
     # SM100 in one CUDA kernel that never stores the [rows, keys] score matrix.
     SGLANG_ENABLE_QSA_PREFILL_SELECT_CUDA = EnvBool(False)
+    # The same as a sampled-threshold scoring + collect pass and an exact pick, for
+    # forwards of more than 8192 rows or 8192 keys per row; ties at the cut go to
+    # the lower key index. Takes precedence over the switch above.
+    SGLANG_ENABLE_QSA_PREFILL_TOPK_CUDA = EnvBool(False)
     # The same on SM100 / SM103 with tcgen05; the tokens of a verify chain share
     # the KV reads of their request.
     SGLANG_ENABLE_QSA_SPARSE_DECODE_SM100 = EnvBool(False)
