@@ -14,13 +14,13 @@ Speculative acceptance is pinned at 2.32 in both engines (benchmark rule), so th
 |---|---|---|---|
 | TokenSpeed 0.1.1.post20261117 (its recipe) | 108 | 318,463 / 317,617 | 318,040 |
 | TokenSpeed | 128 | 278,755 | |
-| SGLang, this branch | 124 | 374,659 / 374,673 | 374,666 (117.8% of TokenSpeed) |
-| SGLang, this branch | 136 | 372,469 | |
+| SGLang, this branch | 124 | 395,685 / 395,141 / 389,827 | 393,551 (123.7% of TokenSpeed) |
 | SGLang main, published recipe (600 s) | 108 | 170,086 | |
 
-124 users is the knee for this branch (136 is lower); TokenSpeed's best is 108.
-Accuracy on this exact tree is not yet re-measured. Each change was checked on its own (GSM8K with real
-speculative verification within noise of 97.7 +- 0.4, or bit-identical outputs; see the per-branch bodies).
+124 users is the knee for this stack (136 was lower on earlier trees); TokenSpeed's best is 108.
+Accuracy on this exact tree, real speculative verification (no simulated acceptance): GSM8K 97.8 +- 0.4
+(strict and flexible), mean accept length 2.892. The MXFP8 projections were also checked on GPQA-diamond
+(81.3 vs 80.3 BF16).
 
 ## How to run
 
@@ -69,6 +69,12 @@ env \
   SGLANG_OPT_GDN_PREFILL_ALPHA_GATES=1 \
   SGLANG_OPT_GDN_PREFILL_CONV_L2NORM=1 \
   SGLANG_OPT_GDN_PREFILL_SPARSE_CHECKPOINTS=1 \
+  SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_SM100=1 \
+  SGLANG_OPT_SPEC_FUSED_TOP_P_MASS=1 \
+  SGLANG_QSA_SPARSE_DECODE_SM100_FP8_PV=1 \
+  SGLANG_ONLINE_MXFP8_GDN_PROJ=1 \
+  SGLANG_ONLINE_MXFP8_QSA_PROJ=1 \
+  SGLANG_ONLINE_MXFP8_LM_HEAD=1 \
   python -m sglang.launch_server \
   --model-path nvidia/Qwen3.8-Flash-Next-NVFP4 \
   --served-model-name nvidia/Qwen3.8-Flash-Next-NVFP4 \
@@ -146,27 +152,24 @@ SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token`. Leave them out for accuracy ru
 
 | Branch | Switch | What it does |
 |---|---|---|
-| `pr/qwen4-ple-prefetch-abort` | `SGLANG_FLASHINFER_AUTOTUNE_EXTEND` (existing) | fix a dirty PLE prefetch after an aborted forward; extend autotune works |
+| `pr/qwen4-ple-prefetch-abort` | `SGLANG_FLASHINFER_AUTOTUNE_EXTEND` (existing) | fix a dirty PLE prefetch after an aborted forward |
 | `pr/qsa-index-score-fp8` | `SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_CUDA` | CUDA decode index scoring for the FP8 indexer cache |
-| `pr/qsa-decode-topk` | `SGLANG_ENABLE_QSA_DECODE_TOPK_CUDA` | exact decode top-512 from a sampled threshold |
-| `pr/qsa-sparse-decode-sm100` | `SGLANG_ENABLE_QSA_SPARSE_DECODE_SM100` | tcgen05 sparse decode/verify attention, one KV read per request |
-| `pr/qsa-sparse-prefill-sm100` | `SGLANG_ENABLE_QSA_SPARSE_PREFILL_SM100` | tcgen05 sparse prefill attention, 8 rows per union |
-| `pr/qsa-prefill-topk` | `SGLANG_ENABLE_QSA_PREFILL_TOPK_CUDA` | tcgen05 prefill scoring + exact top-512, scores never in HBM |
-| `pr/qsa-qk-norm-rows` | `SGLANG_OPT_QSA_QK_NORM_ROWS` | QSA q/k norm + rope + gate at bandwidth |
+| `pr/qsa-decode-scoring` | `SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_SM100`, `SGLANG_ENABLE_QSA_DECODE_TOPK_CUDA` | exact tcgen05 decode scorer + exact top-512 |
+| `pr/qsa-sparse-decode-sm100` | `SGLANG_ENABLE_QSA_SPARSE_DECODE_SM100` | tcgen05 sparse decode/verify attention |
+| `pr/qsa-sparse-decode-fp8-pv` | `SGLANG_QSA_SPARSE_DECODE_SM100_FP8_PV` | block-scaled FP8 PV, split long lists |
+| `pr/qsa-sparse-prefill-sm100` | `SGLANG_ENABLE_QSA_SPARSE_PREFILL_SM100` | tcgen05 sparse prefill attention |
+| `pr/qsa-prefill-topk` | `SGLANG_ENABLE_QSA_PREFILL_TOPK_CUDA` | prefill scoring + exact top-512 |
 | `pr/gdn-replayssm-verify-cuda` | `SGLANG_ENABLE_GDN_REPLAYSSM_VERIFY_CUDA` | tcgen05 GDN speculative verify |
-| `pr/gdn-prefill-split-conv` | `SGLANG_OPT_GDN_PREFILL_SPLIT_CONV` | conv writes q/k/v planes, no copy kernel |
-| `pr/gdn-prefill-conv-l2norm` | `SGLANG_OPT_GDN_PREFILL_CONV_L2NORM` | tiled conv with the q/k l2norm folded in |
-| `pr/gdn-prefill-alpha-gates` | `SGLANG_OPT_GDN_PREFILL_ALPHA_GATES` | gating + exp in one launch |
-| `pr/gdn-prefill-sparse-checkpoints` | `SGLANG_OPT_GDN_PREFILL_SPARSE_CHECKPOINTS` | store only the state checkpoints the cache reads |
-| `pr/gated-norm-wide-rows` | `SGLANG_OPT_GATED_NORM_WIDE_ROWS` | GDN gated RMSNorm, 16 rows per program at prefill sizes |
-| `pr/mamba-path-cap-grid` | `SGLANG_MAMBA_PATH_CAP_GRID` | keep one state per 16k-token span under the per-path cap |
-| `pr/hc-sum-ws-mix` | `SGLANG_ENABLE_HC_SUM_WS_MIX` | warp-specialized hyper-connection up + mix, logits never written |
-| `pr/moe-finalize-gate-cuda` | `SGLANG_OPT_MOE_FINALIZE_GATE_CUDA` | CUDA MoE finalize with the shared-expert gate |
-| `pr/gdn-verify-proj-views` | `SGLANG_OPT_GDN_VERIFY_PROJ_VIEWS` | verify reads q/k/v/z/b/a as views |
-| `pr/qwen4-verify-conv-one-pass` | `SGLANG_OPT_QWEN4_VERIFY_CONV_ONE_PASS` | PLE verify conv in one kernel |
-| `pr/draft-top1-bf16-logits` | `SGLANG_OPT_DRAFT_TOP1_BF16_LOGITS` | draft argmax on BF16 logits |
-| `pr/conv-window-scatter-wide-blocks` | `SGLANG_OPT_CONV_WINDOW_SCATTER_WIDE_BLOCKS` | wider conv-state scatter programs |
-| `pr/cutedsl-moe-no-swap-ab` | `SGLANG_OPT_CUTEDSL_MOE_NO_SWAP_AB` | prefill-heavy option, not used here |
+| `pr/gdn-prefill-glue` | `SGLANG_OPT_GDN_FLASHINFER_PREFILL_FUSION` | GDN prefill conv/l2norm/gates/checkpoints |
+| `pr/prefill-norm-retile` | `SGLANG_OPT_NORM_ROW_TILES` | GDN gated norm + QSA q/k norm tiles |
+| `pr/verify-path-glue` | `SGLANG_OPT_SPEC_VERIFY_FUSION` | four bit-identical decode fusions |
+| `pr/mamba-path-cap-grid` | `SGLANG_MAMBA_PATH_CAP_GRID` | one state per 16k span under the path cap |
+| `pr/hc-sum-ws-mix` | `SGLANG_ENABLE_HC_SUM_WS_MIX` | warp-specialized hyper-connection up + mix |
+| `pr/moe-finalize-gate-cuda` | `SGLANG_OPT_MOE_FINALIZE_GATE_CUDA` | shared-expert gate folded into gate_up |
+| `pr/online-mxfp8-dense` | `SGLANG_ENABLE_ONLINE_MXFP8_DENSE` | online MXFP8 GDN/QSA projections + LM heads |
+
+The integration tree runs the pre-bundle switch names (`SGLANG_OPT_GATED_NORM_WIDE_ROWS`, `SGLANG_OPT_GDN_PREFILL_*`,
+`SGLANG_OPT_QSA_QK_NORM_ROWS`, the four verify-path switches, `SGLANG_ONLINE_MXFP8_*`); the launch command above is exact.
 
 ## Configuration findings (existing switches)
 
@@ -176,6 +179,7 @@ SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token`. Leave them out for accuracy ru
 | `--max-mamba-cache-size 224 --hicache-mamba-size 220 --hicache-size 690` | GPU state slots sized to use; host caches hold the agents' history |
 | `--mem-fraction-static 0.92 --cuda-graph-max-bs-prefill 4096`, 124 users | +3.3%: bigger KV pool, bigger decode batches |
 | `--chunked-prefill-size 32768` | +0.7%: half the fixed cost per prefill chunk |
+| post-verify CUDA graphs off | lazy capture during serving stalls the server (-1.2% when on) |
 | FlashInfer 0.7.5 + `SGLANG_ENABLE_FLASHINFER_HC_SUM=1` | +2-3% |
 
 ## Open pull requests merged here
