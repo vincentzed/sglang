@@ -53,6 +53,7 @@ struct Params {
   int64_t stride_qr, stride_qh, stride_kslot, stride_kh, stride_or, stride_oh;
   float qk_scale;
   int32_t cap, HKV;
+  int32_t groups;
 };
 
 SGL_DEVICE void cp_async4(uint32_t dst, const void* src) {
@@ -117,8 +118,13 @@ SGL_DEVICE uint32_t used_nibbles(const uint32_t w) {
   return (w | (w >> 1) | (w >> 2) | (w >> 3)) & 0x11111111u;
 }
 
+// Words of the union kernel's staging area: slots and row masks of an unmerged list, or the offsets of a merged one.
+constexpr int64_t union_stage_words(const int64_t cap, const int64_t map_words, const int64_t threads) {
+  return cap + cap / 4 > map_words / 4 + threads ? cap + cap / 4 : map_words / 4 + threads;
+}
+
 // Shared memory, in words: [map_words] a 4-bit row mask per position; [kRows][row_words] the rows' top-k, each at
-// the 16-byte phase of its global row; [cap] slots and [cap / 4] row masks of the merged list; [48] scratch.
+// the 16-byte phase of its global row; [union_stage_words] staging; [48] scratch.
 template <int kRows, bool kRowReq64, bool kUsePDL>
 __global__ void __launch_bounds__(kUnionThreads) union_kernel(const __grid_constant__ UnionParams p) {
   extern __shared__ __align__(16) uint32_t smem_union[];
@@ -133,7 +139,8 @@ __global__ void __launch_bounds__(kUnionThreads) union_kernel(const __grid_const
   uint32_t* const s_idx = s_map + p.map_words;
   uint32_t* const s_slot = s_idx + kRows * row_words;
   uint8_t* const s_mask = reinterpret_cast<uint8_t*>(s_slot + p.cap);
-  uint32_t* const s_aux = s_slot + p.cap + p.cap / 4;  // [32] warp sums, twice, count, [6] seq lens, [8] requests
+  // [32] warp sums, twice, count, [6] seq lens, [8] requests
+  uint32_t* const s_aux = s_slot + union_stage_words(p.cap, p.map_words, threads);
 
   device::PDLWaitPrimary<kUsePDL>();
   device::PDLTriggerSecondary<kUsePDL>();
@@ -180,7 +187,7 @@ __global__ void __launch_bounds__(kUnionThreads) union_kernel(const __grid_const
     const int64_t low = kRowReq64 ? static_cast<int64_t>(s_aux[40 + 2 * j]) : static_cast<int32_t>(s_aux[40 + 2 * j]);
     return kRowReq64 ? low | (static_cast<int64_t>(s_aux[41 + 2 * j]) << 32) : low;
   };
-  const int words = (maxlen + 7) >> 3;
+  const int words = (((maxlen + 7) >> 3) + 1) & -2;
   bool merged = kRows > 1 && words <= p.map_words;
 #pragma unroll
   for (int j = 1; j < kRows; ++j)
@@ -217,13 +224,19 @@ __global__ void __launch_bounds__(kUnionThreads) union_kernel(const __grid_const
     merged = s_aux[32] == 0;
   }
   if (merged) {
+    // a thread counts 2^shift pairs of words: s_pre[q] entries precede pair q among them, s_first[t] precede thread t's
     const int32_t* r2t = p.req_to_token + request(0) * p.stride_r2t;
-    const int per = (words + threads - 1) / threads;
-    const int w0 = min(tid * per, words);
-    const int w1 = min(w0 + per, words);
+    uint16_t* const s_pre = reinterpret_cast<uint16_t*>(s_slot);
+    uint32_t* const s_first = s_slot + p.map_words / 4;
+    const int pairs = words >> 1;
+    int shift = 0;
+    while ((threads << shift) < pairs)
+      ++shift;
     int n = 0;
-    for (int w = w0; w < w1; ++w)
-      n += __popc(used_nibbles(s_map[w]));
+    for (int q = tid << shift; q < min((tid + 1) << shift, pairs); ++q) {
+      s_pre[q] = static_cast<uint16_t>(n);
+      n += __popc(used_nibbles(s_map[2 * q])) + __popc(used_nibbles(s_map[2 * q + 1]));
+    }
     const int scan = device::warp::inclusive_sum(n);
     if (lane == 31) s_aux[warp] = scan;
     __syncthreads();
@@ -234,17 +247,58 @@ __global__ void __launch_bounds__(kUnionThreads) union_kernel(const __grid_const
       if (lane == 31) s_aux[33] = before;
     }
     __syncthreads();
-    int o = static_cast<int>(s_aux[warp]) + scan - n;
-    for (int w = w0; w < w1; ++w) {
-      const uint32_t word = s_map[w];
-      uint32_t used = used_nibbles(word);
-      while (used != 0) {
-        const int b = __ffs(used) - 1;
-        used &= used - 1;
-        cp_async4(device::ptx::to_shared(s_slot + o), r2t + 8 * w + (b >> 2));
-        s_mask[o++] = static_cast<uint8_t>((word >> b) & 15u);
+    s_first[tid] = s_aux[warp] + static_cast<uint32_t>(scan - n);
+    __syncthreads();
+    const int count = static_cast<int>(s_aux[33]);
+    int32_t* const out = p.entries + static_cast<int64_t>(group) * p.cap;
+    // entries before position `pos`, and the row masks of the 8 positions of its word
+    const auto locate = [&](const int pos, uint32_t& word) {
+      const int w = pos >> 3;
+      word = s_map[w];
+      int o = static_cast<int>(s_first[w >> (shift + 1)]) + s_pre[w >> 1];
+      if ((w & 1) != 0) o += __popc(used_nibbles(s_map[w - 1]));
+      return o + __popc(used_nibbles(word) & ((1u << (4 * (pos & 7))) - 1u));
+    };
+    // the lowest row that selected a position writes its entry: the slots of a thread's blocks are read together
+    for (int c = 4 * tid; c < p.topk; c += 4 * threads) {
+      int at[kRows][4];
+      int slot[kRows][4];
+      uint32_t mask[kRows][4];
+#pragma unroll
+      for (int j = 0; j < kRows; ++j) {
+        int pos[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+          pos[e] = c + e < p.topk ? static_cast<int>(s_row[j][c + e]) : -1;
+        const bool block = pos[0] >= 0 && (pos[0] & 3) == 0 && pos[1] == pos[0] + 1 && pos[2] == pos[0] + 2 &&
+                           pos[3] == pos[0] + 3 && pos[3] < seqlen[j];
+        uint32_t word = 0;
+        const int first = block ? locate(pos[0], word) : 0;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const bool valid = pos[e] >= 0 && pos[e] < seqlen[j];
+          at[j][e] = first + e;
+          if (!block && valid) at[j][e] = locate(pos[e], word);
+          mask[j][e] = valid ? (word >> (4 * (pos[e] & 7))) & 15u : 0u;
+          const bool mine = __ffs(mask[j][e]) - 1 == j;
+          slot[j][e] = mine ? r2t[pos[e]] : -1;
+          mask[j][e] = mine ? mask[j][e] : 0u;
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < kRows; ++j) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          if (mask[j][e] != 0) {
+            out[at[j][e]] = slot[j][e] >= 0 ? static_cast<int32_t>((mask[j][e] << kSlotBits) | slot[j][e]) : 0;
+          }
+        }
       }
     }
+    for (int i = count + tid; i < ((count + kTile - 1) & -kTile); i += threads)
+      out[i] = 0;
+    if (tid == 0) p.counts[group] = count;
+    return;
   } else {
     int last = 0;
 #pragma unroll
@@ -412,7 +466,31 @@ SGL_DEVICE void issue_mmas(const int tiles, const uint32_t t_s, uint8_t* const s
   } while (*s_more != 0);
 }
 
-template <int kRows, int kHeads, bool kUsePDL>
+// Every thread of the CTA: the group with the `rank`-th most slots, ties in group order. s_count holds p.groups + 1
+// words.
+SGL_DEVICE int group_of_rank(const Params& p, const int rank, uint32_t* const s_count) {
+  const int tid = threadIdx.x;
+  for (int g = tid; g < p.groups; g += kThreads)
+    cp_async4(device::ptx::to_shared(s_count + g), p.counts + g);
+  cp_async_commit();
+  cp_async_wait<0>();
+  __syncthreads();
+  for (int g = tid; g < p.groups; g += kThreads) {
+    const uint32_t mine = s_count[g];
+    int before = 0;
+    for (int h = 0; h < p.groups; ++h) {
+      const uint32_t other = s_count[h];
+      before += other > mine || (other == mine && h < g) ? 1 : 0;
+    }
+    if (before == rank) s_count[p.groups] = static_cast<uint32_t>(g);
+  }
+  __syncthreads();
+  return static_cast<int>(s_count[p.groups]);
+}
+
+// kSorted: block b attends the group with the b / HKV-th most slots instead of group b / HKV, so that with more
+// CTAs than SMs the short lists are the ones that wait for an SM.
+template <int kRows, int kHeads, bool kUsePDL, bool kSorted>
 __global__ void __launch_bounds__(kThreads, 1) attn_kernel(const __grid_constant__ Params p) {
   using Lay = Layout<kRows, kHeads>;
   static_assert(Lay::bytes <= kMaxSmem && Lay::kPer <= 16);
@@ -428,9 +506,9 @@ __global__ void __launch_bounds__(kThreads, 1) attn_kernel(const __grid_constant
   const int lane = tid & 31;
   const int wg = warp >> 2;
   const int tl = tid & 127;
-  const int group = blockIdx.x / p.HKV;
+  int group = blockIdx.x / p.HKV;
   const int kvh = blockIdx.x % p.HKV;
-  const int row0 = group * kRows;
+  int row0 = group * kRows;
   uint8_t* const s_opv = smem + Lay::op_v;
   uint8_t* const s_opk = smem + Lay::op_k;
   uint8_t* const s_stg = smem + Lay::stg;
@@ -453,8 +531,10 @@ __global__ void __launch_bounds__(kThreads, 1) attn_kernel(const __grid_constant
   }
   float sc = 0.f;
   if (worker) {
-    sc = split_q<kRows, kHeads>(p, row0, kvh, smem + Lay::q, s_red);
-    device::ptx::fence_proxy_async_shared();
+    if constexpr (!kSorted) {
+      sc = split_q<kRows, kHeads>(p, row0, kvh, smem + Lay::q, s_red);
+      device::ptx::fence_proxy_async_shared();
+    }
   } else {
     tcgen05::alloc(s_tmem, Lay::kTmemCols);
     tcgen05::relinquish_alloc_permit();
@@ -465,6 +545,14 @@ __global__ void __launch_bounds__(kThreads, 1) attn_kernel(const __grid_constant
 
   const uint32_t t_s = *s_tmem + (static_cast<uint32_t>((warp & 3) * 32) << 16);
   device::PDLWaitPrimary<kUsePDL>();
+  if constexpr (kSorted) {
+    group = group_of_rank(p, group, reinterpret_cast<uint32_t*>(s_p));
+    row0 = group * kRows;
+    if (worker) {
+      sc = split_q<kRows, kHeads>(p, row0, kvh, smem + Lay::q, s_red);
+      device::ptx::fence_proxy_async_shared();
+    }
+  }
   const int32_t* entries = p.entries + static_cast<int64_t>(group) * p.cap;
   const int tiles = (p.counts[group] + kTile - 1) / kTile;
 
@@ -475,11 +563,13 @@ __global__ void __launch_bounds__(kThreads, 1) attn_kernel(const __grid_constant
   }
 
   // a worker moves 16-byte chunk gc of the K rows of slots gk + 32 i of a tile, and chunk vc of the V rows of
-  // slots vk and vk + 64 of an item: one cache line per copy
+  // slots vk and vk + 64 of an item: one cache line per copy. A warp has 4 chunks of 8 V rows, all of one f16
+  // plane, and its lanes 8 j to 8 j + 7 have rows j and j ^ 5: their 8 copies fill the 32 banks once, staged or
+  // converted
   const int gk = tid >> 4;
   const int gc = tid & 15;
-  const int vk = tid >> 3;
-  const int vc = tid & 7;
+  const int vk = ((tid >> 6) << 3) | (((tid >> 3) & 3) ^ (((tid >> 2) & 1) * 5));
+  const int vc = (tid & 3) | (((tid >> 5) & 1) << 2);
   const int first = wg * kPer;  // this thread's heads: first + i, i < heads
   const int heads = min(max(kReal - first, 0), kPer);
   const int j0 = first / kHeads;  // their query rows: j0, then j0 + 1 from head i = split
@@ -842,8 +932,10 @@ struct QsaSparseDecodeSm100 {
     const DLDevice dev = device.unwrap();
     // without room for 4 bits per position of the context the rows of a request are not merged
     const int64_t map_words = kRows > 1 ? ((CTX_.unwrap() + 7) / 8 + 3) & -4 : 0;
-    const int64_t list_words = kRows * ((topk + 7) & -4) + cap + cap / 4 + 48;
-    const bool mapped = (map_words + list_words) * 4 <= kMaxSmem;
+    const int union_threads = kRows > 1 ? kUnionThreads : 256;
+    const int64_t row_words = kRows * ((topk + 7) & -4) + 48;
+    const bool mapped =
+        (map_words + row_words + union_stage_words(cap, map_words, union_threads)) * 4 <= kMaxSmem && cap < 65536;
     const auto union_params = UnionParams{
         .idx = static_cast<const int32_t*>(idx.data_ptr()),
         .seqlen = static_cast<const int32_t*>(seqlen.data_ptr()),
@@ -873,21 +965,36 @@ struct QsaSparseDecodeSm100 {
         .qk_scale = static_cast<float>(qk_scale),
         .cap = static_cast<int32_t>(cap),
         .HKV = static_cast<int32_t>(hkv),
+        .groups = static_cast<int32_t>(groups),
     };
-    const std::size_t union_smem = static_cast<std::size_t>(union_params.map_words + list_words) * 4;
-    const int union_threads = kRows > 1 ? kUnionThreads : 256;
+    const std::size_t union_smem =
+        static_cast<std::size_t>(
+            union_params.map_words + row_words + union_stage_words(cap, union_params.map_words, union_threads)) *
+        4;
     if (is_type<int64_t>(row_req.dtype())) {
       launch_union<true>(groups, union_threads, union_smem, union_params, dev);
     } else {
       launch_union<false>(groups, union_threads, union_smem, union_params, dev);
     }
-    constexpr int smem = Layout<kRows, kHeads>::bytes;
-    runtime::set_max_dynamic_smem_per_device<attn_kernel<kRows, kHeads, kUsePDL>>(dev, smem);
-    LaunchKernel(static_cast<uint32_t>(groups * hkv), kThreads, dev, smem)
-        .enable_pdl(kUsePDL)(attn_kernel<kRows, kHeads, kUsePDL>, params);
+    // the rows of a request make lists of different lengths; single rows all have their top-k
+    if (kRows > 1 && groups * hkv > runtime::get_sm_count(dev.device_id) && groups < kTile * 32) {
+      launch_attn<true>(groups * hkv, params, dev);
+    } else {
+      launch_attn<false>(groups * hkv, params, dev);
+    }
   }
 
  private:
+  template <bool kSorted>
+  static void launch_attn(const int64_t blocks, const qsa_sparse_decode_sm100::Params& params, const DLDevice dev) {
+    using namespace host;
+    using namespace qsa_sparse_decode_sm100;
+    constexpr int smem = Layout<kRows, kHeads>::bytes;
+    runtime::set_max_dynamic_smem_per_device<attn_kernel<kRows, kHeads, kUsePDL, kSorted>>(dev, smem);
+    LaunchKernel(static_cast<uint32_t>(blocks), kThreads, dev, smem)
+        .enable_pdl(kUsePDL)(attn_kernel<kRows, kHeads, kUsePDL, kSorted>, params);
+  }
+
   template <bool kRowReq64>
   static void launch_union(
       const int64_t groups,
