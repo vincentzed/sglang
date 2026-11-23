@@ -45,7 +45,7 @@ constexpr int kSampleEvery = 8;
 constexpr int kSampleRank = 112;
 constexpr int kCapacity = 1664;
 constexpr int kTieLimit = kCapacity - kTopK - kTileKeys;
-constexpr int kPickWarps = 4;
+constexpr int kPickRowThreads = 128;
 constexpr int kExactPickWarps = 8;
 constexpr int kPickBytes = kCapacity * 8 + kBins * 4;
 constexpr int kMaxSplits = 64;
@@ -662,33 +662,169 @@ SGL_DEVICE void pick_row(
   __syncwarp();
 }
 
-template <bool kUsePDL>
-__global__ void __launch_bounds__(kPickWarps * 32) pick_kernel(const __grid_constant__ Params p) {
-  extern __shared__ __align__(1024) uint8_t smem[];
-  device::PDLWaitPrimary<kUsePDL>();
+SGL_DEVICE uint32_t block_sum(uint32_t v, uint32_t* red) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  const int row = blockIdx.x * kPickWarps + warp;
-  if (row < p.rows) {
-    const int start = p.starts[row];
-    const int len = min(p.ends[row], p.keys) - start;
-    int32_t* out = p.out + static_cast<int64_t>(row) * kTopK;
-    if (len <= kTopK) {
-      for (int c = lane; c < kTopK; c += 32) out[c] = c < len ? c : -1;
-    } else {
-      const uint32_t* seg_counts = p.work + static_cast<int64_t>(row) * kWorkStride + kBins + 2;
-      uint32_t total = 0, worst = 0;
-      for (int seg = 0; seg < p.splits; ++seg) {
-        total += seg_counts[seg];
-        worst = max(worst, seg_counts[seg]);
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(kFull, v, o);
+  __syncthreads();
+  if (lane == 0) red[warp] = v;
+  __syncthreads();
+  uint32_t total = 0;
+#pragma unroll
+  for (int w = 0; w < kPickRowThreads / 32; ++w) total += red[w];
+  return total;
+}
+
+SGL_DEVICE void pick_row_block(
+    const Params& p, const int row, uint32_t* keys, uint32_t* idx, uint32_t* bins, uint32_t* red, const uint32_t* seg_counts) {
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const unsigned below = (1u << lane) - 1;
+  uint32_t k_or = 0, k_and = 0xffffffffu;
+  int count = 0;
+  for (int seg = 0; seg < p.splits; ++seg) {
+    const int n = static_cast<int>(seg_counts[seg]);
+    const uint64_t* cand = p.cand + static_cast<int64_t>(row) * p.cand_stride + seg * p.split_cap;
+    for (int i0 = 0; i0 < n; i0 += 4 * kPickRowThreads) {
+      uint64_t v[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int i = i0 + j * kPickRowThreads + tid;
+        v[j] = i < n ? cand[i] : 0;
       }
-      if (total < kTopK || total > kCapacity || worst > static_cast<uint32_t>(p.split_cap)) {
-        if (lane == 0) count_of(p, row)[1] = total < kTopK ? 1 : 2;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int i = i0 + j * kPickRowThreads + tid;
+        if (i < n) {
+          const uint32_t key = static_cast<uint32_t>(v[j] >> 32);
+          keys[count + i] = key;
+          idx[count + i] = static_cast<uint32_t>(v[j]);
+          k_or |= key;
+          k_and &= key;
+        }
+      }
+    }
+    count += n;
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    k_or |= __shfl_xor_sync(kFull, k_or, o);
+    k_and &= __shfl_xor_sync(kFull, k_and, o);
+  }
+  if (lane == 0) {
+    red[warp] = k_or;
+    red[4 + warp] = k_and;
+  }
+  __syncthreads();
+  k_or = red[0] | red[1] | red[2] | red[3];
+  k_and = red[4] & red[5] & red[6] & red[7];
+  int need = kTopK;
+  uint32_t prefix = k_and;
+  const uint32_t diff = k_or ^ k_and;
+  if (diff != 0) {
+    int top = 31 - __clz(diff);
+    uint32_t mask = ~((2u << top) - 1);
+    prefix = k_and & mask;
+    while (true) {
+      const int shift = max(top - 7, 0);
+      const uint32_t digit = (2u << (top - shift)) - 1;
+      for (int i = tid; i < kBins; i += kPickRowThreads) bins[i] = 0;
+      __syncthreads();
+      for (int i = tid; i < count; i += kPickRowThreads) {
+        if ((keys[i] & mask) == prefix) atomicAdd(bins + ((keys[i] >> shift) & digit), 1u);
+      }
+      __syncthreads();
+      if (warp == 0) {
+        uint32_t h[8];
+        uint32_t sum = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          h[i] = bins[kBins - 1 - 8 * lane - i];
+          sum += h[i];
+        }
+        uint32_t incl = sum;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+          const uint32_t v = __shfl_up_sync(kFull, incl, o);
+          if (lane >= o) incl += v;
+        }
+        const int src = __ffs(__ballot_sync(kFull, incl >= static_cast<uint32_t>(need))) - 1;
+        if (lane == src) {
+          uint32_t cum = incl - sum;
+          int i = 0;
+          while (cum + h[i] < static_cast<uint32_t>(need)) cum += h[i++];
+          red[8] = kBins - 1 - 8 * lane - i;
+          red[9] = cum;
+        }
+      }
+      __syncthreads();
+      need -= static_cast<int>(red[9]);
+      prefix |= red[8] << shift;
+      mask |= digit << shift;
+      if (shift == 0) break;
+      top = shift - 1;
+    }
+  }
+  uint32_t local = 0;
+  for (int i = tid; i < count; i += kPickRowThreads) local += keys[i] == prefix;
+  const int ties = static_cast<int>(block_sum(local, red));
+  uint32_t cut = 0xffffffffu;
+  if (ties > need) {
+    uint32_t a = 0, b = 0xffffffffu;
+    while (a < b) {
+      const uint32_t mid = a + (b - a) / 2;
+      uint32_t n = 0;
+      for (int i = tid; i < count; i += kPickRowThreads) n += keys[i] == prefix && idx[i] <= mid;
+      if (static_cast<int>(block_sum(n, red + 12)) >= need) {
+        b = mid;
       } else {
-        uint8_t* base = smem + warp * kPickBytes;
-        uint32_t* keys = reinterpret_cast<uint32_t*>(base);
-        pick_row(p, row, keys, keys + kCapacity, keys + 2 * kCapacity, p.splits, p.split_cap, seg_counts);
+        a = mid + 1;
       }
+    }
+    cut = a;
+  }
+  int32_t* out = p.out + static_cast<int64_t>(row) * kTopK;
+  uint32_t* written = red + 10;
+  if (tid == 0) *written = 0;
+  __syncthreads();
+  for (int i0 = 0; i0 < count; i0 += kPickRowThreads) {
+    const int i = i0 + tid;
+    const uint32_t key = i < count ? keys[i] : 0u;
+    const bool take = i < count && (key > prefix || (key == prefix && idx[i] <= cut));
+    const unsigned m = __ballot_sync(kFull, take);
+    uint32_t base = 0;
+    if (lane == 0 && m) base = atomicAdd(written, static_cast<uint32_t>(__popc(m)));
+    base = __shfl_sync(kFull, base, 0);
+    if (take) out[base + __popc(m & below)] = static_cast<int32_t>(idx[i]);
+  }
+}
+
+template <bool kUsePDL>
+__global__ void __launch_bounds__(kPickRowThreads) pick_kernel(const __grid_constant__ Params p) {
+  extern __shared__ __align__(1024) uint8_t smem[];
+  __shared__ uint32_t red[16];
+  device::PDLWaitPrimary<kUsePDL>();
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int start = p.starts[row];
+  const int len = min(p.ends[row], p.keys) - start;
+  int32_t* out = p.out + static_cast<int64_t>(row) * kTopK;
+  if (len <= kTopK) {
+    for (int c = tid; c < kTopK; c += kPickRowThreads) out[c] = c < len ? c : -1;
+  } else {
+    const uint32_t* seg_counts = p.work + static_cast<int64_t>(row) * kWorkStride + kBins + 2;
+    uint32_t total = 0, worst = 0;
+    for (int seg = 0; seg < p.splits; ++seg) {
+      total += seg_counts[seg];
+      worst = max(worst, seg_counts[seg]);
+    }
+    if (total < kTopK || total > kCapacity || worst > static_cast<uint32_t>(p.split_cap)) {
+      if (tid == 0) count_of(p, row)[1] = total < kTopK ? 1 : 2;
+    } else {
+      uint32_t* keys = reinterpret_cast<uint32_t*>(smem);
+      pick_row_block(p, row, keys, keys + kCapacity, keys + 2 * kCapacity, red, seg_counts);
     }
   }
   device::PDLTriggerSecondary<kUsePDL>();
@@ -899,16 +1035,11 @@ struct QsaPrefillTopk {
     const auto exact = exact_kernel<kUsePDL>;
     RuntimeDeviceCheck(cudaFuncSetAttribute(sample, cudaFuncAttributeMaxDynamicSharedMemorySize, kSampleSmem));
     RuntimeDeviceCheck(cudaFuncSetAttribute(collect, cudaFuncAttributeMaxDynamicSharedMemorySize, kCollectSmem));
-    RuntimeDeviceCheck(
-        cudaFuncSetAttribute(pick, cudaFuncAttributeMaxDynamicSharedMemorySize, kPickWarps * kPickBytes));
+    RuntimeDeviceCheck(cudaFuncSetAttribute(pick, cudaFuncAttributeMaxDynamicSharedMemorySize, kPickBytes));
     RuntimeDeviceCheck(cudaFuncSetAttribute(exact, cudaFuncAttributeMaxDynamicSharedMemorySize, kExactSmem));
     LaunchKernel(split_grid, kThreads, device.unwrap(), kSampleSmem).enable_pdl(kUsePDL)(sample, params);
     LaunchKernel(split_grid, kThreads, device.unwrap(), kCollectSmem).enable_pdl(kUsePDL)(collect, params);
-    LaunchKernel(
-        static_cast<uint32_t>((rows + kPickWarps - 1) / kPickWarps),
-        kPickWarps * 32,
-        device.unwrap(),
-        kPickWarps * kPickBytes)
+    LaunchKernel(static_cast<uint32_t>(rows), kPickRowThreads, device.unwrap(), kPickBytes)
         .enable_pdl(kUsePDL)(pick, params);
     LaunchKernel(min(tiles, static_cast<uint32_t>(runtime::get_sm_count(device.unwrap().device_id))), kThreads, device.unwrap(), kExactSmem).enable_pdl(kUsePDL)(exact, params);
   }
