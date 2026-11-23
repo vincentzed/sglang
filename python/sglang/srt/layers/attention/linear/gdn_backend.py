@@ -16,6 +16,11 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
+from sglang.kernels.ops.mamba.gdn_prefill_conv import (
+    GDN_PREFILL_CONV_BLOCK_M,
+    GDN_PREFILL_CONV_BLOCK_N,
+    gdn_prefill_conv_qkv,
+)
 from sglang.kernels.ops.mamba.gdn_prefill_track import (
     gdn_track_conv_window,
     gdn_track_ssm_state,
@@ -664,6 +669,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
     supports_mis: bool = True
     requires_contiguous_prefill_state: bool = True
     _split_prefill_conv: bool = False
+    _fused_prefill_conv: bool = False
+    _prefill_conv_block_m: int = CAUSAL_CONV1D_FWD_BLOCK_M
 
     # Set while a breakable prefill CUDA graph captures or replays a bucket:
     # forward_extend then runs the graph-safe chain on these static tables.
@@ -698,6 +705,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._use_strided_target_verify_qkv = False
         self._split_prefill_conv = (
             envs.SGLANG_OPT_GDN_PREFILL_SPLIT_CONV.get() and is_cuda()
+        )
+        self._fused_prefill_conv = (
+            envs.SGLANG_OPT_GDN_PREFILL_CONV_L2NORM.get()
+            and is_cuda()
+            and self.kernel_dispatcher.extend_kernel.accepts_normalized_qk
+        )
+        self._prefill_conv_block_m = (
+            GDN_PREFILL_CONV_BLOCK_M
+            if self._fused_prefill_conv
+            else CAUSAL_CONV1D_FWD_BLOCK_M
         )
         if envs.SGLANG_ENABLE_GDN_REPLAYSSM_VERIFY_CUDA.get() and is_cuda():
             from sglang.kernels.ops.attention.linear.gdn_replayssm_verify_cuda import (
@@ -955,10 +972,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         seq_lens = forward_batch.extend_seq_lens_cpu
         if seq_lens is None or len(seq_lens) != metadata.query_start_loc.numel() - 1:
             return
-        block_counts = [
-            (length + CAUSAL_CONV1D_FWD_BLOCK_M - 1) // CAUSAL_CONV1D_FWD_BLOCK_M
-            for length in seq_lens
-        ]
+        block_m = self._prefill_conv_block_m
+        block_counts = [(length + block_m - 1) // block_m for length in seq_lens]
         # Amortize table construction only when most of the rectangular grid
         # would be empty: a 4x ratio means over 75% of its blocks do no work.
         # This conservative crossover avoids charging mildly ragged batches
@@ -1300,8 +1315,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states: torch.Tensor,
         cache_indices: torch.Tensor,
         split_qkv: bool = False,
+        fused: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         block_table = self.forward_metadata.conv_block_table
+        if fused:
+            return gdn_prefill_conv_qkv(
+                mixed_qkv,
+                layer.conv_weights,
+                layer.bias,
+                conv_states,
+                self.forward_metadata.query_start_loc,
+                cache_indices,
+                forward_batch.extend_prefix_lens > 0,
+                layer.q_dim,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                block_table=block_table,
+                activation=layer.activation,
+            )
+        if self._prefill_conv_block_m != CAUSAL_CONV1D_FWD_BLOCK_M:
+            block_table = None
         conv_kwargs = {"block_table": block_table} if block_table is not None else {}
         # The compiled CUDA conv assumes packed slots; Triton follows the strides.
         conv_fn = (
@@ -1327,6 +1359,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if split_qkv:
             return output
         return output.transpose(0, 1)[: mixed_qkv.shape[0]]
+
+    def _fuses_prefill_conv(
+        self, layer: RadixLinearAttention, forward_batch: ForwardBatch
+    ) -> bool:
+        seq_lens = forward_batch.extend_seq_lens_cpu
+        return (
+            self._fused_prefill_conv
+            and seq_lens is not None
+            and sum(seq_lens) >= GDN_PREFILL_CONV_BLOCK_M * len(seq_lens)
+            and layer.q_dim == layer.k_dim
+            and layer.head_k_dim == GDN_PREFILL_CONV_BLOCK_N
+            and layer.q_dim % GDN_PREFILL_CONV_BLOCK_N == 0
+            and layer.v_dim % GDN_PREFILL_CONV_BLOCK_N == 0
+        )
 
     def _splits_prefill_conv(self, layer: RadixLinearAttention) -> bool:
         return (
@@ -1518,7 +1564,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
 
-        split_qkv = not is_target_verify and self._splits_prefill_conv(layer)
+        fused_conv = not is_target_verify and self._fuses_prefill_conv(
+            layer, forward_batch
+        )
+        split_qkv = fused_conv or (
+            not is_target_verify and self._splits_prefill_conv(layer)
+        )
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
@@ -1555,6 +1606,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_states_contig,
                 state_cache_indices,
                 split_qkv=split_qkv,
+                fused=fused_conv,
             )
 
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
@@ -1683,6 +1735,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_checkpoint_every_n_tokens=(
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
+                state_checkpoint_indices=forward_metadata.state_checkpoint_indices,
                 a=a,
                 b=b,
                 A_log=layer.A_log,
@@ -1690,6 +1743,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 output=kwargs.get("linear_attn_output"),
                 layer_id=layer.layer_id,
                 extend_prefix_lens=forward_batch.extend_prefix_lens,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                qk_normalized=fused_conv,
                 track_state=h_track_buf,
                 needs_track_state=(
                     forward_metadata.has_mamba_track_mask

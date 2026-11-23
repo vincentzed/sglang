@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _FLASHINFER_GDN_ALIGNMENT = 32
+_TWO_WAY_MIN_TOKENS = 4096
 
 
 def copy_verify_intermediate_rows(
@@ -132,13 +133,22 @@ def maybe_build_flashinfer_checkpoint_plan(
         raise ValueError("Tracked GDN state precedes the first FlashInfer checkpoint.")
     assert track_checkpoint_src.numel() == forward_metadata.track_ssm_h_dst.numel()
 
+    num_state_checkpoints = int(checkpoint_cu_starts[-1])
+    if envs.SGLANG_OPT_GDN_PREFILL_SPARSE_CHECKPOINTS.get():
+        rows = torch.full((num_state_checkpoints,), -1, dtype=torch.int32)
+        rows[track_checkpoint_src] = torch.arange(
+            track_checkpoint_src.numel(), dtype=torch.int32
+        )
+        forward_metadata.state_checkpoint_indices = rows.to(device, non_blocking=True)
+        track_checkpoint_src = torch.arange(track_checkpoint_src.numel())
+        num_state_checkpoints = track_checkpoint_src.numel()
     forward_metadata.track_ssm_h_src = track_checkpoint_src.to(
         device, non_blocking=True
     )
     forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.to(
         device, non_blocking=True
     )
-    forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
+    forward_metadata.num_state_checkpoints = num_state_checkpoints
     forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
 
 
@@ -252,7 +262,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     # extend() gathers each request's state by pool index and scatters the
     # final state back the same way, so any slot pitch works.
     extend_honors_slot_pitch = True
+    accepts_normalized_qk = True
     _joint_qk_l2norm: bool = False
+    _two_way: bool = False
 
     def __init__(self):
         (
@@ -284,6 +296,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self._verify_intermediate_buffers: dict[tuple, torch.Tensor] = {}
         self._alignment_fallback_warned = False
         self._joint_qk_l2norm = envs.SGLANG_OPT_GDN_PREFILL_SPLIT_CONV.get()
+        self.defers_prefill_gates = envs.SGLANG_OPT_GDN_PREFILL_ALPHA_GATES.get()
+        self._two_way = envs.SGLANG_OPT_GDN_PREFILL_TWO_WAY.get() and sm_major == 10
+        self._two_way_zero_v: Optional[torch.Tensor] = None
         # FlashInfer writes through mutable state/workspace pointers, so misaligned
         # inputs must fall back to Triton rather than use temporary copies.
         from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
@@ -569,14 +584,20 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         from sglang.kernels.ops.attention.fla.l2norm import (
             gdn_prefill_qkv_prepare_fwd,
         )
+        from sglang.kernels.ops.attention.linear.fused_gdn_gating import (
+            fused_gdn_alpha_beta,
+        )
 
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
 
-        q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(
-            q[0], k[0], v[0], joint_qk=self._joint_qk_l2norm
-        )
+        if kwargs.get("qk_normalized"):
+            q_fi, k_fi, v_fi = q[0], k[0], v[0]
+        else:
+            q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(
+                q[0], k[0], v[0], joint_qk=self._joint_qk_l2norm
+            )
 
         output = kwargs.get("output")
         output_fi = None
@@ -602,9 +623,14 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if not output_fi.is_contiguous():
                 raise ValueError("FlashInfer GDN prefill output must be contiguous")
 
-        # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
-        alpha_fi = torch.exp(g[0].to(torch.float32))
-        beta_fi = beta[0].to(torch.float32)
+        if g is None:
+            alpha_fi, beta_fi = fused_gdn_alpha_beta(
+                kwargs["A_log"], kwargs["a"], kwargs["b"], kwargs["dt_bias"]
+            )
+        else:
+            # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
+            alpha_fi = torch.exp(g[0].to(torch.float32))
+            beta_fi = beta[0].to(torch.float32)
 
         ssm_cache_indices, live_rows, initial_state_fi = gather_pool_states(
             ssm_states, cache_indices
@@ -622,19 +648,41 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if num_state_checkpoints > 0
             else None
         )
-        output_fi, output_state_fi = self._run_prefill(
-            q=q_fi,
-            k=k_fi,
-            v=v_fi,
-            alpha=alpha_fi,
-            beta=beta_fi,
-            initial_state=initial_state_fi,
-            cu_seqlens=cu_seqlens,
-            output=output_fi,
-            state_checkpoints=state_checkpoints,
-            checkpoint_cu_starts=state_checkpoint_cu_starts,
-            checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
-        )
+        seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
+        if (
+            self._two_way
+            and state_checkpoints is None
+            and seq_lens_cpu is not None
+            and len(seq_lens_cpu) == 1
+            and seq_lens_cpu[0] >= _TWO_WAY_MIN_TOKENS
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            output_fi, output_state_fi = self._run_prefill_two_way(
+                q=q_fi,
+                k=k_fi,
+                v=v_fi,
+                alpha=alpha_fi,
+                beta=beta_fi,
+                initial_state=initial_state_fi,
+                cu_seqlens=cu_seqlens,
+                output=output_fi,
+                num_tokens=seq_lens_cpu[0],
+            )
+        else:
+            output_fi, output_state_fi = self._run_prefill(
+                q=q_fi,
+                k=k_fi,
+                v=v_fi,
+                alpha=alpha_fi,
+                beta=beta_fi,
+                initial_state=initial_state_fi,
+                cu_seqlens=cu_seqlens,
+                output=output_fi,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=state_checkpoint_cu_starts,
+                checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+                checkpoint_state_indices=kwargs.get("state_checkpoint_indices"),
+            )
 
         # Write back state to pool
         scatter_pool_states(ssm_states, ssm_cache_indices, live_rows, output_state_fi)
@@ -666,7 +714,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         checkpoint_cu_starts: Optional[torch.Tensor],
         checkpoint_every_n_tokens: int,
         use_cp: str | bool = "auto",
+        checkpoint_state_indices: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if checkpoint_state_indices is not None:
+            kwargs = {"checkpoint_state_indices": checkpoint_state_indices}
+        else:
+            kwargs = {}
         return self._prefill_fn(
             q=q,
             k=k,
@@ -684,7 +737,83 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             use_cp=use_cp,
+            **kwargs,
         )
+
+    def _run_prefill_two_way(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        output: Optional[torch.Tensor],
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        half = num_tokens // 128 * 64
+        tail = num_tokens - half
+        num_v_heads, head_v_dim, head_k_dim = initial_state.shape[1:]
+        if self._two_way_zero_v is None or self._two_way_zero_v.shape[0] < tail:
+            self._two_way_zero_v = v.new_zeros((tail, *v.shape[1:]))
+            self._two_way_eye = (
+                torch.eye(head_k_dim, dtype=torch.float32, device=v.device)
+                .expand(1, num_v_heads, head_v_dim, head_k_dim)
+                .contiguous()
+            )
+            self._two_way_stream = torch.cuda.Stream(v.device)
+        states = torch.empty(
+            (2, num_v_heads, head_v_dim, head_k_dim),
+            dtype=torch.float32,
+            device=v.device,
+        )
+        states[0].copy_(initial_state[0])
+        states[1].zero_()
+        if output is None:
+            output = torch.empty_like(v)
+        tail_q = torch.empty_like(v[:tail])
+        halves = torch.cat((cu_seqlens[:1], cu_seqlens[:1] + half, cu_seqlens[1:]))
+        tail_seqlens = (cu_seqlens - half).clamp_min(0)
+        main = torch.cuda.current_stream(v.device)
+        side = self._two_way_stream
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            _, transition = self._run_prefill(
+                q=q[half:num_tokens],
+                k=k[half:num_tokens],
+                v=self._two_way_zero_v[:tail],
+                alpha=alpha[half:num_tokens],
+                beta=beta[half:num_tokens],
+                initial_state=self._two_way_eye,
+                cu_seqlens=tail_seqlens,
+                output=tail_q,
+                state_checkpoints=None,
+                checkpoint_cu_starts=None,
+                checkpoint_every_n_tokens=0,
+                use_cp=False,
+            )
+        _, final = self._run_prefill(
+            q=q,
+            k=k,
+            v=v,
+            alpha=alpha,
+            beta=beta,
+            initial_state=states,
+            cu_seqlens=halves,
+            output=output,
+            state_checkpoints=None,
+            checkpoint_cu_starts=None,
+            checkpoint_every_n_tokens=0,
+            use_cp=False,
+        )
+        main.wait_stream(side)
+        mid = final[0]
+        output[half:num_tokens].transpose(0, 1).baddbmm_(
+            tail_q.transpose(0, 1), mid.to(v.dtype).transpose(1, 2)
+        )
+        return output, torch.baddbmm(final[1], mid, transition[0]).unsqueeze(0)
 
     def prewarm_extend(
         self,
@@ -767,6 +896,32 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 **inputs,
                 **checkpoints,
                 checkpoint_every_n_tokens=every_n_tokens,
+                use_cp=False,
+            )
+            num_runs += 1
+        if envs.SGLANG_OPT_GDN_PREFILL_SPARSE_CHECKPOINTS.get() and (
+            checkpoint_every_n_tokens > 0
+        ):
+            checkpoints = modes[checkpoint_every_n_tokens]
+            self._run_prefill(
+                **inputs,
+                **checkpoints,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                use_cp=False,
+                checkpoint_state_indices=torch.full(
+                    (checkpoints["state_checkpoints"].shape[0],),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            )
+            num_runs += 1
+        if self._two_way:
+            inputs["initial_state"] = inputs["initial_state"].float()
+            self._run_prefill(
+                **inputs,
+                **modes[0],
+                checkpoint_every_n_tokens=0,
                 use_cp=False,
             )
             num_runs += 1
