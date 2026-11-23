@@ -60,6 +60,19 @@ def _jit_qsa_sparse_decode_sm100_module(
     )
 
 
+_SPLIT_COUNTERS: dict = {}
+
+
+def _split_counters(device: torch.device, sms: int) -> torch.Tensor:
+    """Per-device int32 counters of the split-list handshake; the kernel leaves them zero."""
+    key = (device.type, device.index)
+    counters = _SPLIT_COUNTERS.get(key)
+    if counters is None or counters.numel() < sms:
+        counters = torch.zeros(max(sms, 256), dtype=torch.int32, device=device)
+        _SPLIT_COUNTERS[key] = counters
+    return counters
+
+
 def _launch_config(rows: int) -> tuple:
     """(pipeline stages, q fragments in shared memory) per architecture."""
     if current_arch().is_sm_at_least(12):
@@ -138,7 +151,9 @@ def qsa_sparse_decode_sm100(
     (a verify chain of ``rows_per_request``) share a CTA per KV head, and the KV
     rows they have in common, in the smallest groups that fit one CTA per SM.
     With ``fp8_pv`` the PV product runs on the fp8 V rows as stored, with the
-    softmax weights as two e4m3 terms scaled per head and 32 KV rows."""
+    softmax weights as two e4m3 terms scaled per head and 32 KV rows, and below one
+    CTA per SM the longest lists are split over the idle SMs (a row may then round
+    differently from a batch where its list is not split)."""
     rows, q_heads, head_dim = q.shape
     kv_heads = k_cache.shape[1]
     heads = q_heads // kv_heads
@@ -160,6 +175,13 @@ def qsa_sparse_decode_sm100(
     entries = torch.empty((groups, capacity), dtype=torch.int32, device=q.device)
     counts = torch.empty(groups, dtype=torch.int32, device=q.device)
     out = torch.empty_like(q)
+    splits = 0
+    if fp8_pv and rows_per_cta > 1 and groups * kv_heads <= sms:
+        splits = min((sms - groups * kv_heads) // kv_heads, groups)
+    record = rows_per_cta * heads * (_HEAD_DIM + 2) + 4
+    partials = torch.empty(
+        max(splits, 1) * kv_heads * 2 * record, dtype=torch.float32, device=q.device
+    )
     _jit_qsa_sparse_decode_sm100_module(rows_per_cta, heads, fp8_pv).run(
         q,
         k_cache.view(torch.uint8),
@@ -171,6 +193,8 @@ def qsa_sparse_decode_sm100(
         entries,
         counts,
         out,
+        partials,
+        _split_counters(q.device, sms),
         float(sm_scale),
     )
     return out

@@ -54,6 +54,9 @@ struct Params {
   float qk_scale;
   int32_t cap, HKV;
   int32_t groups;
+  float* part;         // [splits][HKV][2] partials of split lists
+  int32_t* split_cnt;  // [splits][HKV] halves done, zero between launches
+  int32_t splits;
 };
 
 SGL_DEVICE void cp_async4(uint32_t dst, const void* src) {
@@ -488,6 +491,19 @@ SGL_DEVICE int group_of_rank(const Params& p, const int rank, uint32_t* const s_
   return static_cast<int>(s_count[p.groups]);
 }
 
+// Every thread of the CTA: how many groups have more slots than `group` (ties in group order); groups <= kThreads.
+SGL_DEVICE int rank_of_group(const Params& p, const int group, uint32_t* const s_count) {
+  const int tid = threadIdx.x;
+  for (int g = tid; g < p.groups; g += kThreads)
+    cp_async4(device::ptx::to_shared(s_count + g), p.counts + g);
+  cp_async_commit();
+  cp_async_wait<0>();
+  __syncthreads();
+  const uint32_t mine = s_count[group];
+  const uint32_t other = tid < p.groups ? s_count[tid] : 0u;
+  return __syncthreads_count(tid < p.groups && (other > mine || (other == mine && tid < group)));
+}
+
 // kSorted: block b attends the group with the b / HKV-th most slots instead of group b / HKV, so that with more
 // CTAs than SMs the short lists are the ones that wait for an SM.
 template <int kRows, int kHeads, bool kUsePDL, bool kSorted>
@@ -894,10 +910,12 @@ struct LayoutPv8 {
   static constexpr int red = ent + 8 * kTile * 4;
   static constexpr int fac = red + kNP * 16;
   static constexpr int nmr = fac + kNP * 4;
-  static constexpr int flag = nmr + kNP * 4;
-  static constexpr int bar = flag + 24;
+  static constexpr int fo = nmr + kNP * 4;
+  static constexpr int flag = fo + kNP * 4;
+  static constexpr int bar = flag + 56;
   static constexpr int tmem = bar + 11 * 8;
   static constexpr int bytes = tmem + 8;
+  static constexpr int kRec = kReal * (kD + 2) + 4;  // O [kReal][kD], sum [kReal], reference [kReal], NaN flag
 };
 
 SGL_DEVICE bool bar_red_or(const uint32_t id, const uint32_t threads, const bool pred) {
@@ -923,7 +941,7 @@ SGL_DEVICE float ex2_ftz(const float x) {
 // The MMA warp. Barrier 1 brackets a pass; mbarrier 9 + g % 2: P, scales and O of tile g are written, S of g is read.
 // Tile g of the CTA's sequence: V in slot g % 3, K and S and P in slot g % 2.
 template <int kRows, int kHeads>
-SGL_DEVICE void issue_mmas_pv8(const int tiles, const uint32_t t_base, uint8_t* const smem) {
+SGL_DEVICE void issue_mmas_pv8(const uint32_t t_base, uint8_t* const smem) {
   using Lay = LayoutPv8<kRows, kHeads>;
   uint64_t* const s_bar = reinterpret_cast<uint64_t*>(smem + Lay::bar);
   uint64_t* const qk_bar = s_bar;
@@ -962,6 +980,7 @@ SGL_DEVICE void issue_mmas_pv8(const int tiles, const uint32_t t_base, uint8_t* 
   };
   do {
     device::ptx::bar_sync(1, kThreads);
+    const int tiles = static_cast<int>(*(s_more + 1));
     if (tiles > 0) qk(g0);
     if (tiles > 1) qk(g0 + 1);
     for (int t = 0; t < tiles; ++t) {
@@ -995,6 +1014,121 @@ SGL_DEVICE void issue_mmas_pv8(const int tiles, const uint32_t t_base, uint8_t* 
   } while (*s_more != 0);
 }
 
+// Every thread: the list half this CTA attends when the longest lists are split over spare SMs. s_split gets
+// {half (-1 = whole list), split index, group}.
+__noinline__ __device__ void split_assign(const Params& p, const bool spare, const int group, int32_t* const s_split,
+                                          uint32_t* const s_count) {
+  int seg = -1;
+  int sidx = 0;
+  int g = group;
+  if (spare) {
+    sidx = (static_cast<int>(blockIdx.x) - p.groups * p.HKV) / p.HKV;
+    g = group_of_rank(p, sidx, s_count);
+    seg = 1;
+  } else {
+    sidx = rank_of_group(p, group, s_count);
+    seg = sidx < p.splits ? 0 : -1;
+  }
+  if (threadIdx.x == 0) {
+    s_split[0] = seg;
+    s_split[1] = sidx;
+    s_split[2] = g;
+  }
+  __syncthreads();
+}
+
+// Workers of a CTA that attended one half of a split list: its unnormalized O, sums and references go to its partial,
+// and the second half to finish gets the factors of both halves in s_fac (first half) and s_fo (second half).
+template <int kRows, int kHeads>
+__noinline__ __device__ void split_partial(const Params& p, uint8_t* const smem, const int kvh, const int tiles) {
+  using Lay = LayoutPv8<kRows, kHeads>;
+  constexpr int kReal = Lay::kReal;
+  constexpr int kNP = Lay::kNP;
+  constexpr int kSeg = Lay::kSeg;
+  constexpr int kBlk = Lay::kBlk;
+  constexpr int kPer = Lay::kPer;
+  const int tid = threadIdx.x;
+  const int wg = tid >> 7;
+  const int tl = tid & 127;
+  const int first = wg * kPer;
+  const int heads = kReal == 4 * kPer ? kPer : min(max(kReal - first, 0), kPer);
+  float* const s_red = reinterpret_cast<float*>(smem + Lay::red);
+  float* const s_fac = reinterpret_cast<float*>(smem + Lay::fac);
+  float* const s_nm = reinterpret_cast<float*>(smem + Lay::nmr);
+  float* const s_fo = reinterpret_cast<float*>(smem + Lay::fo);
+  uint32_t* const s_any = reinterpret_cast<uint32_t*>(smem + Lay::flag + 16);
+  uint32_t* const s_last = s_any + 3;
+  const int32_t* const s_split = reinterpret_cast<const int32_t*>(s_any + 4);
+  const int seg = s_split[0];
+  const int sidx = s_split[1];
+  float* const rec = p.part + static_cast<int64_t>((sidx * p.HKV + kvh) * 2 + (seg & 1)) * Lay::kRec;
+  const float* const other = p.part + static_cast<int64_t>((sidx * p.HKV + kvh) * 2 + ((seg & 1) ^ 1)) * Lay::kRec;
+  const uint32_t t_o0 = *reinterpret_cast<const uint32_t*>(smem + Lay::tmem) +
+                        (static_cast<uint32_t>(((tid >> 5) & 3) * 32) << 16) + Lay::kOCol;
+  if (tl < heads) {
+    const float4 r4 = *reinterpret_cast<const float4*>(s_red + (first + tl) * 4);
+    rec[kReal * kD + first + tl] = (r4.x + r4.y) + (r4.z + r4.w);
+    rec[kReal * kD + kReal + first + tl] = -s_nm[first + tl];
+  }
+  bool poisoned = false;
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const int dd = h * 128 + tl;
+#pragma unroll
+    for (int b = 0; b < kSeg; b += kBlk) {
+      float o[kBlk];
+      float o2[kBlk];
+#pragma unroll
+      for (int e = 0; e < kBlk; ++e) {
+        o[e] = 0.f;
+        o2[e] = 0.f;
+      }
+      if (tiles > 0) {
+        tcgen05::ld_32x32b<kBlk>(t_o0 + h * kNP + wg * kSeg + b, o);
+        tcgen05::ld_32x32b<kBlk>(t_o0 + h * kNP + 4 * kSeg + wg * kSeg + b, o2);
+        tcgen05::wait_ld();
+      }
+#pragma unroll
+      for (int e = 0; e < kBlk; ++e) {
+        if (b + e < heads) {
+          rec[(first + b + e) * kD + dd] = o[e] + o2[e];
+        } else if (kRows > 1 && wg == 3 && b + e == kSeg - 1) {
+          poisoned |= o[e] != o[e];
+        }
+      }
+    }
+  }
+  if (poisoned) *s_any = 1;
+  device::ptx::bar_sync(3, kWorkers);
+  if (tid == 0) {
+    rec[kReal * (kD + 2)] = *s_any != 0 ? 1.f : 0.f;
+    __threadfence();
+    const int done = atomicAdd(p.split_cnt + sidx * p.HKV + kvh, 1);
+    if (done != 0) p.split_cnt[sidx * p.HKV + kvh] = 0;
+    *s_last = static_cast<uint32_t>(done);
+    __threadfence();
+  }
+  device::ptx::bar_sync(3, kWorkers);
+  if (*s_last != 0) {
+    if (tid == 0 && other[kReal * (kD + 2)] != 0.f) *s_any = 1;
+    if (tl < heads) {
+      const int n = first + tl;
+      const bool first_half = seg == 0;
+      const float ls0 = first_half ? rec[kReal * kD + n] : other[kReal * kD + n];
+      const float ref0 = first_half ? rec[kReal * kD + kReal + n] : other[kReal * kD + kReal + n];
+      const float ls1 = first_half ? other[kReal * kD + n] : rec[kReal * kD + n];
+      const float ref1 = first_half ? other[kReal * kD + kReal + n] : rec[kReal * kD + kReal + n];
+      const float m = fmaxf(ref0, ref1);
+      const float f0 = ex2_ftz(ref0 - m);
+      const float f1 = ex2_ftz(ref1 - m);
+      const float l = fmaf(ls0, f0, ls1 * f1);
+      const float inv = l > 0.f ? 1.f / l : 0.f;
+      s_fac[n] = f0 * inv;
+      s_fo[n] = f1 * inv;
+    }
+  }
+}
+
 template <int kRows, int kHeads, bool kUsePDL, bool kSorted>
 __global__ void __launch_bounds__(kThreads, 1) attn_pv8_kernel(const __grid_constant__ Params p) {
   using Lay = LayoutPv8<kRows, kHeads>;
@@ -1011,7 +1145,8 @@ __global__ void __launch_bounds__(kThreads, 1) attn_pv8_kernel(const __grid_cons
   const int lane = tid & 31;
   const int wg = warp >> 2;
   const int tl = tid & 127;
-  int group = blockIdx.x / p.HKV;
+  const bool spare = !kSorted && static_cast<int>(blockIdx.x) >= p.groups * p.HKV;
+  int group = spare ? 0 : blockIdx.x / p.HKV;
   const int kvh = blockIdx.x % p.HKV;
   int row0 = group * kRows;
   uint8_t* const s_k = smem + Lay::k;
@@ -1022,9 +1157,13 @@ __global__ void __launch_bounds__(kThreads, 1) attn_pv8_kernel(const __grid_cons
   float* const s_red = reinterpret_cast<float*>(smem + Lay::red);
   float* const s_fac = reinterpret_cast<float*>(smem + Lay::fac);
   float* const s_nm = reinterpret_cast<float*>(smem + Lay::nmr);
+  float* const s_fo = reinterpret_cast<float*>(smem + Lay::fo);
   uint32_t* const s_anyw = reinterpret_cast<uint32_t*>(smem + Lay::flag);
   uint32_t* const s_any = reinterpret_cast<uint32_t*>(smem + Lay::flag + 16);
   uint32_t* const s_more = s_any + 1;
+  uint32_t* const s_tiles = s_any + 2;
+  uint32_t* const s_last = s_any + 3;
+  int32_t* const s_split = reinterpret_cast<int32_t*>(s_any + 4);
   uint64_t* const s_bar = reinterpret_cast<uint64_t*>(smem + Lay::bar);
   uint64_t* const qk_bar = s_bar;
   uint64_t* const pv_bar = s_bar + 2;
@@ -1045,7 +1184,7 @@ __global__ void __launch_bounds__(kThreads, 1) attn_pv8_kernel(const __grid_cons
   if (worker) {
     for (int i = tid; i < 3 * 128; i += kWorkers)
       reinterpret_cast<uint32_t*>(s_sf)[i] = 0x7F7F7F7Fu;
-    if constexpr (!kSorted) sc = split_q<kRows, kHeads>(p, row0, kvh, smem + Lay::q, s_red);
+    if (!kSorted && !spare) sc = split_q<kRows, kHeads>(p, row0, kvh, smem + Lay::q, s_red);
     device::ptx::fence_proxy_async_shared();
   } else {
     tcgen05::alloc(s_tmem, Lay::kTmemCols);
@@ -1061,12 +1200,26 @@ __global__ void __launch_bounds__(kThreads, 1) attn_pv8_kernel(const __grid_cons
   if constexpr (kSorted) {
     group = group_of_rank(p, group, reinterpret_cast<uint32_t*>(s_p));
     row0 = group * kRows;
+  } else {
+    if (tid == 0) s_split[0] = -1;
+    if (p.splits > 0) split_assign(p, spare, group, s_split, reinterpret_cast<uint32_t*>(s_p));
+    __syncthreads();
+    group = s_split[0] >= 0 ? s_split[2] : group;
+    row0 = group * kRows;
   }
-  const int32_t* entries = p.entries + static_cast<int64_t>(group) * p.cap;
-  const int tiles = (p.counts[group] + kTile - 1) / kTile;
+  if (tid == 0) {
+    const int seg = kSorted ? -1 : s_split[0];
+    const int all_tiles = (p.counts[group] + kTile - 1) / kTile;
+    const int half = (all_tiles + 1) / 2;
+    if constexpr (kSorted) s_split[0] = -1;
+    s_split[3] = all_tiles;
+    s_split[4] = seg < 0 ? all_tiles : seg == 0 ? half : all_tiles - half;
+    s_split[5] = seg == 1 ? half : 0;
+  }
+  __syncthreads();
 
   if (!worker) {
-    issue_mmas_pv8<kRows, kHeads>(tiles, t_base, smem);
+    issue_mmas_pv8<kRows, kHeads>(t_base, smem);
     tcgen05::dealloc(t_base, Lay::kTmemCols);
     return;
   }
@@ -1091,6 +1244,8 @@ __global__ void __launch_bounds__(kThreads, 1) attn_pv8_kernel(const __grid_cons
 #pragma unroll 1
   for (int pass = 0; pass < (repeat ? 1 + kRows : 1); ++pass) {
     const uint32_t rowmask = pass == 0 ? (1u << kRows) - 1 : 1u << (pass - 1);
+    const int tiles = s_split[4];
+    const int32_t* const ents = p.entries + static_cast<int64_t>(row0 / kRows) * p.cap + s_split[5] * kTile;
 
     const auto gather_k = [&](const int t) {
       const int g = g0 + t;
@@ -1198,17 +1353,20 @@ __global__ void __launch_bounds__(kThreads, 1) attn_pv8_kernel(const __grid_cons
     for (int t = 0; t < 5; ++t) {
       if (warp == t && t < tiles) {
         *reinterpret_cast<uint4*>(s_ent + (t & 7) * kTile + lane * 4) =
-            *reinterpret_cast<const uint4*>(entries + t * kTile + lane * 4);
+            *reinterpret_cast<const uint4*>(ents + t * kTile + lane * 4);
       }
     }
     if (tid < kReal) s_nm[tid] = 1e30f;
-    if (tid == 0) *s_any = 0;
+    if (tid == 0) {
+      *s_any = 0;
+      *s_tiles = static_cast<uint32_t>(tiles);
+    }
     device::ptx::bar_sync(3, kWorkers);
     for (int t = 0; t < 2; ++t) {
       if (t < tiles) gather_k(t);
     }
     if (tiles > 0) gather_v(0);
-    if (kSorted && pass == 0) {
+    if ((kSorted || spare) && pass == 0) {
       sc = split_q<kRows, kHeads>(p, row0, kvh, smem + Lay::q, s_red);
       device::ptx::fence_proxy_async_shared();
     }
@@ -1222,7 +1380,7 @@ __global__ void __launch_bounds__(kThreads, 1) attn_pv8_kernel(const __grid_cons
     for (int t = 0; t < tiles; ++t) {
       const int g = g0 + t;
       uint4 ent_next = make_uint4(0, 0, 0, 0);
-      if (warp == 0 && t + 5 < tiles) ent_next = *reinterpret_cast<const uint4*>(entries + (t + 5) * kTile + lane * 4);
+      if (warp == 0 && t + 5 < tiles) ent_next = *reinterpret_cast<const uint4*>(ents + (t + 5) * kTile + lane * 4);
       device::ptx::mbar_wait_parity(qk_bar + (g & 1), (g >> 1) & 1);
       tcgen05::fence_after_thread_sync();
       if (t + 2 < tiles) gather_k(t + 2);
@@ -1314,12 +1472,19 @@ __global__ void __launch_bounds__(kThreads, 1) attn_pv8_kernel(const __grid_cons
       if (lane == 0 && i < heads) s_red[(first + i) * 4 + (warp & 3)] = sum;
     }
     device::ptx::bar_sync(4 + wg, 128);
-    if (tl < heads) {
+    const int seg_e = s_split[0];
+    const int sidx_e = s_split[1];
+    const bool part = seg_e >= 0;
+    const float* const other = p.part + static_cast<int64_t>((sidx_e * p.HKV + kvh) * 2 + ((seg_e & 1) ^ 1)) * Lay::kRec;
+    if (part) {
+      split_partial<kRows, kHeads>(p, smem, kvh, tiles);
+    } else if (tl < heads) {
       const float4 r4 = *reinterpret_cast<const float4*>(s_red + (first + tl) * 4);
       const float sum = (r4.x + r4.y) + (r4.z + r4.w);
       s_fac[first + tl] = sum > 0.f ? 1.f / sum : 0.f;
     }
     device::ptx::bar_sync(4 + wg, 128);
+    const bool merge = part && *s_last != 0;
     uint16_t* const s_out = reinterpret_cast<uint16_t*>(s_k);
     bool poisoned = false;
 #pragma unroll
@@ -1334,7 +1499,7 @@ __global__ void __launch_bounds__(kThreads, 1) attn_pv8_kernel(const __grid_cons
           o[e] = 0.f;
           o2[e] = 0.f;
         }
-        if (tiles > 0) {
+        if (tiles > 0 && (!part || merge)) {
           tcgen05::ld_32x32b<kBlk>(t_o0 + h * kNP + wg * kSeg + b, o);
           tcgen05::ld_32x32b<kBlk>(t_o0 + h * kNP + 4 * kSeg + wg * kSeg + b, o2);
           tcgen05::wait_ld();
@@ -1343,8 +1508,12 @@ __global__ void __launch_bounds__(kThreads, 1) attn_pv8_kernel(const __grid_cons
         for (int e = 0; e < kBlk; ++e) {
           const int n = first + b + e;
           if (b + e < heads) {
-            s_out[n * kD + d] = __bfloat16_as_ushort(__float2bfloat16_rn((o[e] + o2[e]) * s_fac[n]));
-          } else if (kRows > 1 && wg == 3 && b + e == kSeg - 1 && pass == 0) {
+            const float own = o[e] + o2[e];
+            const float oth = merge ? other[n * kD + d] : 0.f;
+            const float y = merge ? (seg_e == 0 ? fmaf(own, s_fac[n], oth * s_fo[n]) : fmaf(oth, s_fac[n], own * s_fo[n]))
+                                  : own * s_fac[n];
+            s_out[n * kD + d] = __bfloat16_as_ushort(__float2bfloat16_rn(y));
+          } else if (kRows > 1 && wg == 3 && b + e == kSeg - 1 && pass == 0 && !part) {
             poisoned |= o[e] != o[e];
           }
         }
@@ -1353,17 +1522,23 @@ __global__ void __launch_bounds__(kThreads, 1) attn_pv8_kernel(const __grid_cons
     if (poisoned) *s_any = 1;
     tcgen05::fence_before_thread_sync();
     device::ptx::bar_sync(3, kWorkers);
-    if (kRows > 1 && pass == 0) repeat = *s_any != 0;
+    const bool write = !part || *s_last != 0;
+    if (kRows > 1 && pass == 0 && write) repeat = *s_any != 0;
     for (int i = tid; i < kReal * 32; i += kWorkers) {
       const int n = i >> 5;
       const int j = n / kHeads;
-      if (((rowmask >> j) & 1u) != 0) {
+      if (write && ((rowmask >> j) & 1u) != 0) {
         uint16_t* dst = p.out + (row0 + j) * p.stride_or + (kvh * kHeads + n % kHeads) * p.stride_oh + (i & 31) * 8;
         *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(s_out + n * kD + (i & 31) * 8);
       }
     }
     if (tid == 0) *s_more = pass + 1 < (repeat ? 1 + kRows : 1) ? 1 : 0;
     g0 += tiles;
+    if (part && repeat && tid == 0) {
+      s_split[0] = -1;
+      s_split[4] = s_split[3];
+      s_split[5] = 0;
+    }
     device::ptx::bar_sync(3, kWorkers);
     device::ptx::bar_arrive(1, kThreads);
   }
@@ -1386,6 +1561,8 @@ struct QsaSparseDecodeSm100 {
       const tvm::ffi::TensorView entries,
       const tvm::ffi::TensorView counts,
       const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView part,
+      const tvm::ffi::TensorView split_cnt,
       double qk_scale) {
     using namespace host;
     using namespace qsa_sparse_decode_sm100;
@@ -1468,6 +1645,9 @@ struct QsaSparseDecodeSm100 {
         .cap = static_cast<int32_t>(cap),
         .HKV = static_cast<int32_t>(hkv),
         .groups = static_cast<int32_t>(groups),
+        .part = static_cast<float*>(part.data_ptr()),
+        .split_cnt = static_cast<int32_t*>(split_cnt.data_ptr()),
+        .splits = 0,
     };
     const std::size_t union_smem =
         static_cast<std::size_t>(
@@ -1479,10 +1659,19 @@ struct QsaSparseDecodeSm100 {
       launch_union<false>(groups, union_threads, union_smem, union_params, dev);
     }
     // the rows of a request make lists of different lengths; single rows all have their top-k
-    if (kRows > 1 && groups * hkv > runtime::get_sm_count(dev.device_id) && groups < kTile * 32) {
+    const int64_t sms = runtime::get_sm_count(dev.device_id);
+    if (kRows > 1 && groups * hkv > sms && groups < kTile * 32) {
       launch_attn<true>(groups * hkv, params, dev);
     } else {
-      launch_attn<false>(groups * hkv, params, dev);
+      auto split = params;
+      if constexpr (kPv8 && kRows > 1) {
+        split.splits = static_cast<int32_t>(std::max<int64_t>(0, std::min<int64_t>((sms - groups * hkv) / hkv, groups)));
+        const int64_t rec = LayoutPv8<kRows, kHeads>::kRec;
+        RuntimeCheck(
+            part.numel() >= split.splits * hkv * 2 * rec && split_cnt.numel() >= split.splits * hkv,
+            "split scratch too small");
+      }
+      launch_attn<false>(groups * hkv + split.splits * hkv, split, dev);
     }
   }
 

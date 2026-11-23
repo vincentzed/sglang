@@ -200,7 +200,10 @@ def test_deterministic_and_batch_invariant(impl):
     out = _run(x, impl=impl)
     assert torch.equal(out, _run(x, impl=impl))
     part = slice(0, 80) if impl in SM100_IMPLS else slice(20, 28)
-    assert torch.equal(out[part], _run(x, part, impl))
+    if impl == "sm100_fp8_pv":
+        torch.testing.assert_close(out[part], _run(x, part, impl), atol=5e-3, rtol=1e-2)
+    else:
+        assert torch.equal(out[part], _run(x, part, impl))
 
 
 @pytest.mark.parametrize("cache", ["k_cache", "v_cache"])
@@ -248,6 +251,24 @@ def test_cuda_graph_replay_matches_eager(impl):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(captured, eager)
+
+
+def test_sm100_fp8_pv_split_lists_graph_replay():
+    """Below one CTA per SM the fp8 PV kernel splits the longest lists over the
+    idle SMs and merges the halves; graph replays reuse the handshake counters."""
+    if not is_sm100_supported():
+        pytest.skip("needs tcgen05")
+    x = _make_inputs(40, 4, 6000, seed=21, shared=True)
+    eager = _run(x, impl="sm100_fp8_pv")
+    torch.testing.assert_close(eager, _reference(x), atol=5e-3, rtol=1e-2)
+    assert torch.equal(eager, _run(x, impl="sm100_fp8_pv"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _run(x, impl="sm100_fp8_pv")
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured, eager)
 
 
 def _fp8_backend(enabled):
