@@ -220,8 +220,9 @@ def test_gate_parameter_dtypes(gate_dtypes):
     _close(cuda["g_cache"], triton["g_cache"], 1e-6)
 
 
-def test_many_rows_match_triton():
-    rows, slots, spec_len = 96, 128, 4
+@pytest.mark.parametrize("rows", [96, 200])
+def test_many_rows_match_triton(rows):
+    slots, spec_len = rows + 32, 4
     gen = torch.Generator(device=DEVICE).manual_seed(5)
     cpu = torch.Generator().manual_seed(5)
 

@@ -1,7 +1,6 @@
 // GDN ReplaySSM speculative verify over a bf16 checkpoint and the circular compact (d, k, g) ring on SM100: the
 // outputs of up to 4 draft tokens per request and this window's ring records, without committing. One CTA per
-// (request, value head); TMA streams the checkpoint into the tcgen05 operand, and the same operand columns give
-// the key-history scores and the window Gram matrix, so threads only normalize q / k and finish each row.
+// (request, key head) takes its value heads in turn: TMA streams each checkpoint into the tcgen05 operand.
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -104,8 +103,8 @@ SGL_DEVICE uint32_t to_bf(const float x) {
   return __bfloat16_as_ushort(__float2bfloat16_rn(x));
 }
 
-SGL_DEVICE float load_gate(const void* p, const int i, const bool is16) {
-  return is16 ? bf_lo(static_cast<const uint16_t*>(p)[i]) : static_cast<const float*>(p)[i];
+SGL_DEVICE float gate_value(const uint32_t raw, const bool is16) {
+  return is16 ? bf_lo(raw) : __uint_as_float(raw);
 }
 
 SGL_DEVICE uint4 load_u4(const uint16_t* p) {
@@ -145,6 +144,65 @@ SGL_DEVICE void issue_product(
   }
 }
 
+// the two K halves of value head hv of checkpoint `slot` into the operand tile at s_a, completing on bar
+SGL_DEVICE void load_checkpoint(const Params& p, uint64_t* bar, const uint32_t s_a, const int hv, const int64_t slot) {
+  device::ptx::mbar_arrive_expect_tx(bar, 2 * kPlane);
+  device::ptx::cp_async_bulk_tensor_3d(s_a, &p.h0_map, 0, hv * kD, static_cast<int32_t>(slot), bar);
+  device::ptx::cp_async_bulk_tensor_3d(s_a + kPlane, &p.h0_map, kD / 2, hv * kD, static_cast<int32_t>(slot), bar);
+}
+
+// this thread's v of the window and its first kEarly ring d records of value head hv, as loaded
+SGL_DEVICE void load_head(
+    const Params& p,
+    const int64_t ring,
+    const int64_t bos,
+    const int S,
+    const int r,
+    const int base,
+    const int hv,
+    const bool on,
+    uint16_t (&v)[kS],
+    uint16_t (&d_hi)[kEarly],
+    uint16_t (&d_lo)[kEarly]) {
+  const int tid = threadIdx.x;
+  const int64_t hv_off = static_cast<int64_t>(hv) * kL * kD + tid;
+  const uint16_t* hi = p.d_hi + ring * p.s_dhi + hv_off;
+  const uint16_t* lo = p.d_lo + ring * p.s_dlo + hv_off;
+#pragma unroll
+  for (int s = 0; s < kS; ++s) {
+    if (on) v[s] = p.v[(bos + (s < S ? s : 0)) * p.s_v + hv * kD + tid];
+  }
+#pragma unroll
+  for (int i = 0; i < kEarly; ++i) {
+    const int phys = (base + i) & (kL - 1);
+    if (on && i < r) {
+      d_hi[i] = hi[phys * kD];
+      d_lo[i] = lo[phys * kD];
+    }
+  }
+}
+
+// lane's gate inputs of value head hv as loaded: a and b of token lane & 3, the head's rates, ring gate `lane`
+struct GateInputs {
+  uint16_t a, b;
+  uint32_t rate, bias;
+  float g;
+};
+
+SGL_DEVICE GateInputs load_gates(
+    const Params& p, const int64_t ring, const int64_t token, const int r, const int base, const int hv, const bool on) {
+  const int lane = threadIdx.x & 31;
+  GateInputs in{};
+  if (on) {
+    in.a = p.a[token * p.s_a + hv];
+    in.b = p.b[token * p.s_b + hv];
+    in.rate = p.alog16 ? static_cast<const uint16_t*>(p.A_log)[hv] : static_cast<const uint32_t*>(p.A_log)[hv];
+    in.bias = p.dtb16 ? static_cast<const uint16_t*>(p.dt_bias)[hv] : static_cast<const uint32_t*>(p.dt_bias)[hv];
+    if (lane < r) in.g = p.g[ring * p.s_g + hv * kL + ((base + lane) & (kL - 1))];
+  }
+  return in;
+}
+
 SGL_DEVICE float sum8(float x) {
   x += __shfl_xor_sync(kFull, x, 4);
   x += __shfl_xor_sync(kFull, x, 2);
@@ -160,9 +218,10 @@ __global__ void __launch_bounds__(kThreads, Layout::per_sm) verify_kernel(const 
   const int lane = tid & 31;
   const int warp = tid >> 5;
   const bool issuer = warp == kWorkers / 32;
-  const int hv = blockIdx.x;
+  const int h = blockIdx.x;
   const int n = blockIdx.y;
-  const int h = hv / p.hv_per_h;
+  const int heads = p.hv_per_h;
+  const int hv0 = h * heads;
   float* const s_sc = reinterpret_cast<float*>(smem + Lay::sc);
   float* const s_coef = reinterpret_cast<float*>(smem + Lay::coef);
   float* const s_ex = reinterpret_cast<float*>(smem + Lay::ex);
@@ -184,22 +243,22 @@ __global__ void __launch_bounds__(kThreads, Layout::per_sm) verify_kernel(const 
     if (issuer) {
       tcgen05::dealloc(*s_tmem, kTmemCols);
     } else {
+      for (int j = 0; j < heads; ++j) {
 #pragma unroll
-      for (int s = 0; s < kS; ++s) {
-        if (s < S) p.o[(bos + s) * p.s_o + hv * kD + tid] = 0;
+        for (int s = 0; s < kS; ++s) {
+          if (s < S) p.o[(bos + s) * p.s_o + (hv0 + j) * kD + tid] = 0;
+        }
       }
     }
     return;
   }
+  const uint32_t s_a = device::ptx::to_shared(smem + Lay::a);
   if (issuer && lane == 0) {
     device::ptx::mbar_init(s_bar, 1);
     device::ptx::mbar_init(s_bar + 1, 1);
     device::ptx::mbar_init(s_bar + 2, 1);
     device::ptx::fence_barrier_init();
-    const uint32_t dst = device::ptx::to_shared(smem + Lay::a);
-    device::ptx::mbar_arrive_expect_tx(s_bar, 2 * kPlane);
-    device::ptx::cp_async_bulk_tensor_3d(dst, &p.h0_map, 0, hv * kD, static_cast<int32_t>(slot), s_bar);
-    device::ptx::cp_async_bulk_tensor_3d(dst + kPlane, &p.h0_map, kD / 2, hv * kD, static_cast<int32_t>(slot), s_bar);
+    load_checkpoint(p, s_bar, s_a, hv0, slot);
   }
   const int8_t flush = p.is_flush[ring * p.s_fl];
   const int r = min(max(p.write_pos[ring * p.s_wp], 0), kL);
@@ -216,105 +275,119 @@ __global__ void __launch_bounds__(kThreads, Layout::per_sm) verify_kernel(const 
     const int s = lane & 3;
     const bool live = s < S;
     const int64_t token = bos + (live ? s : 0);
-    const float x = bf_lo(p.a[token * p.s_a + hv]) + load_gate(p.dt_bias, hv, p.dtb16);
-    const float bv = bf_lo(p.b[token * p.s_b + hv]);
-    const float rate = load_gate(p.A_log, hv, p.alog16);
-    float gh[kL];
-#pragma unroll
-    for (int i = 0; i < kL; ++i)
-      gh[i] = i < r ? p.g[ring * p.s_g + hv * kL + ((base + i) & (kL - 1))] : 0.f;
-    tcgen05::fence_before_thread_sync();
-    device::ptx::bar_sync(1, kThreads);
-    tcgen05::fence_after_thread_sync();
-    const uint32_t t_d = *s_tmem;
     const auto adesc = tcgen05::make_desc_kmajor_sw128(smem + Lay::a);
     const auto bdesc = tcgen05::make_desc_kmajor_sw128(smem + Lay::b);
-    bool issued = false;
-    if (lane == 0) {
-      issued = mbar_test_parity(s_bar, 0);
-      if (issued) {
+    float kx[2 * kS], sc[2 * kS];
+    GateInputs next = load_gates(p, ring, token, r, base, hv0, true);
+#pragma unroll 1
+    for (int j = 0; j < heads; ++j) {
+      const int hv = hv0 + j;
+      const GateInputs in = next;
+      next = load_gates(p, ring, token, r, base, hv + 1, j + 1 < heads);
+      tcgen05::fence_before_thread_sync();
+      if (j == 0) {
+        device::ptx::bar_sync(1, kThreads);
+      } else {
+        device::ptx::bar_sync(3, kThreads);
+      }
+      tcgen05::fence_after_thread_sync();
+      const uint32_t t_d = *s_tmem;
+      bool issued = false;
+      if (lane == 0) {
+        issued = mbar_test_parity(s_bar, j & 1);
+        if (issued) {
+          issue_product(t_d, adesc, kPlane, kD, bdesc);
+          tcgen05::commit(s_bar + 1);
+        }
+      }
+      const float x = bf_lo(in.a) + gate_value(in.bias, p.dtb16);
+      const float sp = x <= 20.f ? logf(1.f + expf(x)) : x;
+      const float gate = live ? -expf(gate_value(in.rate, p.alog16)) * sp : 0.f;
+      const float beta = live ? 1.f / (1.f + expf(-bf_lo(in.b))) : 0.f;
+      const float G0 = __shfl_sync(kFull, gate, 0);
+      const float G1 = G0 + __shfl_sync(kFull, gate, 1);
+      const float G2 = G1 + __shfl_sync(kFull, gate, 2);
+      const float G3 = G2 + __shfl_sync(kFull, gate, 3);
+      float before = in.g;
+#pragma unroll
+      for (int step = 1; step < kL; step *= 2) {
+        const float up = __shfl_up_sync(kFull, before, step);
+        if (lane >= step) before += up;
+      }
+      const float total = __shfl_sync(kFull, before, kL - 1);
+      float arg = total;
+      if (lane < kL) {
+        arg = total - before;
+      } else if (lane < kL + 4) {
+        arg = pick(G0, G1, G2, G3, lane - kL);
+      } else if (lane < kL + 10) {
+        const int pi = (kPairRows >> (2 * (lane - kL - 4))) & 3;
+        const int pj = (kPairCols >> (2 * (lane - kL - 4))) & 3;
+        arg = pick(G0, G1, G2, G3, pi) - pick(G0, G1, G2, G3, pj);
+      }
+      const float e = expf(arg);
+      const float eG = __shfl_sync(kFull, e, kL + s);
+      const float decay = __shfl_sync(kFull, e, kL + 10);
+      float pe[kS];
+#pragma unroll
+      for (int m = 0; m < kS; ++m) {
+        const int hi = max(s, m);
+        const int lo = min(s, m);
+        pe[m] = __shfl_sync(kFull, e, kL + 4 + hi * (hi - 1) / 2 + lo);
+      }
+      if (j == 0) {
+        device::ptx::mbar_wait_parity(s_bar + 2, 0);
+        tcgen05::fence_after_thread_sync();
+#pragma unroll
+        for (int block = 3; block > 0; --block) {
+          float t[kCols];
+          if (block == 3 || r > 0) tcgen05::ld_32x32b<kCols>(t_d + block * kCols, t);
+          tcgen05::wait_ld();
+#pragma unroll
+          for (int m = 0; m < 2 * kS; ++m) {
+            const float sum = t[m] + t[2 * kS + m];
+            if (block == 3) {
+              kx[m] = sum + __shfl_xor_sync(kFull, sum, 8);
+            } else if (block == 2) {
+              sc[m] = sum;
+            } else {
+              sc[m] = r > 0 ? sc[m] + sum : 0.f;
+            }
+          }
+        }
+      }
+      if (r > 0 && lane < kL) {
+        *reinterpret_cast<float4*>(s_sc + lane * 8) = make_float4(sc[0] * e, sc[1] * e, sc[2] * e, sc[3] * e);
+        *reinterpret_cast<float4*>(s_sc + lane * 8 + 4) = make_float4(sc[4] * e, sc[5] * e, sc[6] * e, sc[7] * e);
+      }
+      if (lane >= kS && lane < 2 * kS) {
+        float af[2 * kS];
+#pragma unroll
+        for (int m = 0; m < kS; ++m) {
+          af[m] = m < s ? beta * pe[m] * kx[kS + m] : 0.f;
+          af[kS + m] = m < s ? 0.f : m == s ? kx[m] : pe[m] * kx[m];
+        }
+        *reinterpret_cast<float4*>(s_coef + s * 8) = make_float4(af[0], af[1], af[2], af[3]);
+        *reinterpret_cast<float4*>(s_coef + s * 8 + 4) = make_float4(af[4], af[5], af[6], af[7]);
+      }
+      if (lane < kS) {
+        s_ex[lane] = eG;
+        s_ex[kS + lane] = beta;
+        s_ex[2 * kS + lane] = decay;
+        s_ex[3 * kS + lane] = gate;
+      }
+      if (lane == 0 && !issued) {
+        device::ptx::mbar_wait_parity(s_bar, j & 1);
         issue_product(t_d, adesc, kPlane, kD, bdesc);
         tcgen05::commit(s_bar + 1);
       }
-    }
-
-    const float sp = x <= 20.f ? logf(1.f + expf(x)) : x;
-    const float gate = live ? -expf(rate) * sp : 0.f;
-    const float beta = live ? 1.f / (1.f + expf(-bv)) : 0.f;
-    const float G0 = __shfl_sync(kFull, gate, 0);
-    const float G1 = G0 + __shfl_sync(kFull, gate, 1);
-    const float G2 = G1 + __shfl_sync(kFull, gate, 2);
-    const float G3 = G2 + __shfl_sync(kFull, gate, 3);
-    float arg = 0.f;
-    if (lane < kL || lane == kL + 10) {
-#pragma unroll
-      for (int i = 0; i < kL; ++i) {
-        if (lane == kL + 10 || i > lane) arg += gh[i];
+      tcgen05::fence_before_thread_sync();
+      device::ptx::bar_sync(2, kThreads);
+      if (lane == 0 && j + 1 < heads) {
+        device::ptx::mbar_wait_parity(s_bar + 1, j & 1);
+        load_checkpoint(p, s_bar, s_a, hv + 1, slot);
       }
-    } else if (lane < kL + 4) {
-      arg = pick(G0, G1, G2, G3, lane - kL);
-    } else if (lane < kL + 10) {
-      const int pi = (kPairRows >> (2 * (lane - kL - 4))) & 3;
-      const int pj = (kPairCols >> (2 * (lane - kL - 4))) & 3;
-      arg = pick(G0, G1, G2, G3, pi) - pick(G0, G1, G2, G3, pj);
     }
-    const float e = expf(arg);
-    const float eG = __shfl_sync(kFull, e, kL + s);
-    const float decay = __shfl_sync(kFull, e, kL + 10);
-    float pe[kS];
-#pragma unroll
-    for (int j = 0; j < kS; ++j) {
-      const int hi = max(s, j);
-      const int lo = min(s, j);
-      pe[j] = __shfl_sync(kFull, e, kL + 4 + hi * (hi - 1) / 2 + lo);
-    }
-
-    device::ptx::mbar_wait_parity(s_bar + 2, 0);
-    tcgen05::fence_after_thread_sync();
-    float gr[kCols], sh[kCols], sl[kCols];
-    tcgen05::ld_32x32b<kCols>(t_d + 3 * kCols, gr);
-    if (r > 0) {
-      tcgen05::ld_32x32b<kCols>(t_d + kCols, sh);
-      tcgen05::ld_32x32b<kCols>(t_d + 2 * kCols, sl);
-    }
-    tcgen05::wait_ld();
-    if (r > 0 && lane < kL) {
-      float sc[2 * kS];
-#pragma unroll
-      for (int m = 0; m < 2 * kS; ++m)
-        sc[m] = ((sh[m] + sh[2 * kS + m]) + (sl[m] + sl[2 * kS + m])) * e;
-      *reinterpret_cast<float4*>(s_sc + lane * 8) = make_float4(sc[0], sc[1], sc[2], sc[3]);
-      *reinterpret_cast<float4*>(s_sc + lane * 8 + 4) = make_float4(sc[4], sc[5], sc[6], sc[7]);
-    }
-    float kx[2 * kS];
-#pragma unroll
-    for (int m = 0; m < 2 * kS; ++m) {
-      kx[m] = gr[m] + gr[2 * kS + m];
-      kx[m] += __shfl_xor_sync(kFull, kx[m], 8);
-    }
-    if (lane >= kS && lane < 2 * kS) {
-      float af[2 * kS];
-#pragma unroll
-      for (int j = 0; j < kS; ++j) {
-        af[j] = j < s ? beta * pe[j] * kx[kS + j] : 0.f;
-        af[kS + j] = j < s ? 0.f : j == s ? kx[j] : pe[j] * kx[j];
-      }
-      *reinterpret_cast<float4*>(s_coef + s * 8) = make_float4(af[0], af[1], af[2], af[3]);
-      *reinterpret_cast<float4*>(s_coef + s * 8 + 4) = make_float4(af[4], af[5], af[6], af[7]);
-    }
-    if (lane < kS) {
-      s_ex[lane] = eG;
-      s_ex[kS + lane] = beta;
-      s_ex[2 * kS + lane] = decay;
-      s_ex[3 * kS + lane] = gate;
-    }
-    if (lane == 0 && !issued) {
-      device::ptx::mbar_wait_parity(s_bar, 0);
-      issue_product(t_d, adesc, kPlane, kD, bdesc);
-      tcgen05::commit(s_bar + 1);
-    }
-    tcgen05::fence_before_thread_sync();
-    device::ptx::bar_sync(2, kThreads);
     device::ptx::bar_sync(3, kThreads);
     tcgen05::fence_after_thread_sync();
     tcgen05::dealloc(*s_tmem, kTmemCols);
@@ -330,19 +403,8 @@ __global__ void __launch_bounds__(kThreads, Layout::per_sm) verify_kernel(const 
   const bool is_k = c >= kS;
   const int64_t wtoken = bos + (wlive ? ws : 0);
   const uint4 raw = load_u4((is_k ? p.k + wtoken * p.s_k : p.q + wtoken * p.s_q) + h * kD + chunk * 8);
-  const int64_t hv_off = static_cast<int64_t>(hv) * kL * kD + tid;
-  uint16_t* const d_hi = p.d_hi + ring * p.s_dhi + hv_off;
-  uint16_t* const d_lo = p.d_lo + ring * p.s_dlo + hv_off;
-  uint16_t v_raw[kS];
-  uint32_t d_raw[kEarly];
-#pragma unroll
-  for (int s = 0; s < kS; ++s)
-    v_raw[s] = p.v[(bos + (s < S ? s : 0)) * p.s_v + hv * kD + tid];
-#pragma unroll
-  for (int i = 0; i < kEarly; ++i) {
-    const int phys = (base + i) & (kL - 1);
-    d_raw[i] = i < r ? d_hi[phys * kD] | (static_cast<uint32_t>(d_lo[phys * kD]) << 16) : 0u;
-  }
+  uint16_t v_raw[kS] = {}, dh_raw[kEarly] = {}, dl_raw[kEarly] = {};
+  load_head(p, ring, bos, S, r, base, hv0, true, v_raw, dh_raw, dl_raw);
   uint4 key_hi[2], key_lo[2];
   {
     const int64_t off = (static_cast<int64_t>(h) * kL + ((base + row) & (kL - 1))) * kD + part * 16;
@@ -381,7 +443,7 @@ __global__ void __launch_bounds__(kThreads, Layout::per_sm) verify_kernel(const 
     uint8_t* const col = smem + Lay::b + (chunk >> 3) * kColPlane;
     *reinterpret_cast<uint4*>(col + tcgen05::sw128_off(c, chunk & 7)) = hi4;
     *reinterpret_cast<uint4*>(col + tcgen05::sw128_off(2 * kS + c, chunk & 7)) = lo4;
-    if (is_k && wlive && hv % p.hv_per_h == 0 && r + ws < kL) {
+    if (is_k && wlive && r + ws < kL) {
       const int64_t off = (static_cast<int64_t>(h) * kL + ((base + r + ws) & (kL - 1))) * kD + chunk * 8;
       *reinterpret_cast<uint4*>(p.k_hi + ring * p.s_khi + off) = hi4;
       *reinterpret_cast<uint4*>(p.k_lo + ring * p.s_klo + off) = lo4;
@@ -410,106 +472,118 @@ __global__ void __launch_bounds__(kThreads, Layout::per_sm) verify_kernel(const 
     }
     tcgen05::commit(s_bar + 2);
   }
-  device::ptx::bar_sync(2, kThreads);
-  tcgen05::fence_after_thread_sync();
 
-  const float4 c0 = *reinterpret_cast<const float4*>(s_coef + 4);
-  const float4 a1 = *reinterpret_cast<const float4*>(s_coef + 8);
-  const float4 c1 = *reinterpret_cast<const float4*>(s_coef + 12);
-  const float4 a2 = *reinterpret_cast<const float4*>(s_coef + 16);
-  const float4 c2 = *reinterpret_cast<const float4*>(s_coef + 20);
-  const float4 a3 = *reinterpret_cast<const float4*>(s_coef + 24);
-  const float4 c3 = *reinterpret_cast<const float4*>(s_coef + 28);
-  const float4 eG4 = *reinterpret_cast<const float4*>(s_ex);
-  const float4 beta4 = *reinterpret_cast<const float4*>(s_ex + kS);
-  const float eG[kS] = {eG4.x, eG4.y, eG4.z, eG4.w};
-  const float beta[kS] = {beta4.x, beta4.y, beta4.z, beta4.w};
-  const float a10 = a1.x, a20 = a2.x, a21 = a2.y, a30 = a3.x, a31 = a3.y, a32 = a3.z;
-  const float f00 = c0.x, f01 = c0.y, f02 = c0.z, f03 = c0.w, f11 = c1.y;
-  const float f12 = c1.z, f13 = c1.w, f22 = c2.z, f23 = c2.w, f33 = c3.w;
-  const float t10 = -a10;
-  const float t21 = -a21;
-  const float t32 = -a32;
-  const float t20 = -a20 - a21 * t10;
-  const float t31 = -a31 - a32 * t21;
-  const float t30 = -a30 - a31 * t10 - a32 * t20;
+#pragma unroll 1
+  for (int j = 0; j < heads; ++j) {
+    const int hv = hv0 + j;
+    device::ptx::bar_sync(2, kThreads);
+    tcgen05::fence_after_thread_sync();
+    const float4 c0 = *reinterpret_cast<const float4*>(s_coef + 4);
+    const float4 a1 = *reinterpret_cast<const float4*>(s_coef + 8);
+    const float4 c1 = *reinterpret_cast<const float4*>(s_coef + 12);
+    const float4 a2 = *reinterpret_cast<const float4*>(s_coef + 16);
+    const float4 c2 = *reinterpret_cast<const float4*>(s_coef + 20);
+    const float4 a3 = *reinterpret_cast<const float4*>(s_coef + 24);
+    const float4 c3 = *reinterpret_cast<const float4*>(s_coef + 28);
+    const float4 eG4 = *reinterpret_cast<const float4*>(s_ex);
+    const float4 beta4 = *reinterpret_cast<const float4*>(s_ex + kS);
+    const float eG[kS] = {eG4.x, eG4.y, eG4.z, eG4.w};
+    const float beta[kS] = {beta4.x, beta4.y, beta4.z, beta4.w};
+    const float a10 = a1.x, a20 = a2.x, a21 = a2.y, a30 = a3.x, a31 = a3.y, a32 = a3.z;
+    const float f00 = c0.x, f01 = c0.y, f02 = c0.z, f03 = c0.w, f11 = c1.y;
+    const float f12 = c1.z, f13 = c1.w, f22 = c2.z, f23 = c2.w, f33 = c3.w;
+    const float t10 = -a10;
+    const float t21 = -a21;
+    const float t32 = -a32;
+    const float t20 = -a20 - a21 * t10;
+    const float t31 = -a31 - a32 * t21;
+    const float t30 = -a30 - a31 * t10 - a32 * t20;
 
-  device::ptx::mbar_wait_parity(s_bar + 1, 0);
-  tcgen05::fence_after_thread_sync();
-  float hw[kCols];
-  tcgen05::ld_32x32b<kCols>(t_d, hw);
-  tcgen05::wait_ld();
-  float hq[kS], hk[kS];
-#pragma unroll
-  for (int s = 0; s < kS; ++s) {
-    hq[s] = hw[s] + hw[2 * kS + s];
-    hk[s] = hw[kS + s] + hw[3 * kS + s];
-  }
-  if (r > 0) {
-    const float decay = s_ex[2 * kS];
+    device::ptx::mbar_wait_parity(s_bar + 1, j & 1);
+    tcgen05::fence_after_thread_sync();
+    float hw[kCols];
+    tcgen05::ld_32x32b<kCols>(t_d, hw);
+    tcgen05::wait_ld();
+    float hq[kS], hk[kS];
 #pragma unroll
     for (int s = 0; s < kS; ++s) {
-      hq[s] *= decay;
-      hk[s] *= decay;
+      hq[s] = hw[s] + hw[2 * kS + s];
+      hk[s] = hw[kS + s] + hw[3 * kS + s];
     }
-    for (int i = 0; i < r; ++i) {
-      float d;
-      if (i < kEarly) {
-        uint32_t w = d_raw[0];
+    const int64_t hv_off = static_cast<int64_t>(hv) * kL * kD + tid;
+    uint16_t* const d_hi = p.d_hi + ring * p.s_dhi + hv_off;
+    uint16_t* const d_lo = p.d_lo + ring * p.s_dlo + hv_off;
+    if (r > 0) {
+      const float decay = s_ex[2 * kS];
 #pragma unroll
-        for (int e = 1; e < kEarly; ++e) {
-          if (i == e) w = d_raw[e];
+      for (int s = 0; s < kS; ++s) {
+        hq[s] *= decay;
+        hk[s] *= decay;
+      }
+      for (int i = 0; i < r; ++i) {
+        float d;
+        if (i < kEarly) {
+          uint32_t hi = dh_raw[0];
+          uint32_t lo = dl_raw[0];
+#pragma unroll
+          for (int e = 1; e < kEarly; ++e) {
+            if (i == e) {
+              hi = dh_raw[e];
+              lo = dl_raw[e];
+            }
+          }
+          d = bf_lo(hi) + bf_lo(lo);
+        } else {
+          const int phys = (base + i) & (kL - 1);
+          d = bf_lo(d_hi[phys * kD]) + bf_lo(d_lo[phys * kD]);
         }
-        d = bf_lo(w) + bf_hi(w);
-      } else {
-        const int phys = (base + i) & (kL - 1);
-        d = bf_lo(d_hi[phys * kD]) + bf_lo(d_lo[phys * kD]);
+        const float4 sq = *reinterpret_cast<const float4*>(s_sc + i * 8);
+        const float4 sk = *reinterpret_cast<const float4*>(s_sc + i * 8 + 4);
+        hq[0] = fmaf(d, sq.x, hq[0]);
+        hq[1] = fmaf(d, sq.y, hq[1]);
+        hq[2] = fmaf(d, sq.z, hq[2]);
+        hq[3] = fmaf(d, sq.w, hq[3]);
+        hk[0] = fmaf(d, sk.x, hk[0]);
+        hk[1] = fmaf(d, sk.y, hk[1]);
+        hk[2] = fmaf(d, sk.z, hk[2]);
+        hk[3] = fmaf(d, sk.w, hk[3]);
       }
-      const float4 sq = *reinterpret_cast<const float4*>(s_sc + i * 8);
-      const float4 sk = *reinterpret_cast<const float4*>(s_sc + i * 8 + 4);
-      hq[0] = fmaf(d, sq.x, hq[0]);
-      hq[1] = fmaf(d, sq.y, hq[1]);
-      hq[2] = fmaf(d, sq.z, hq[2]);
-      hq[3] = fmaf(d, sq.w, hq[3]);
-      hk[0] = fmaf(d, sk.x, hk[0]);
-      hk[1] = fmaf(d, sk.y, hk[1]);
-      hk[2] = fmaf(d, sk.z, hk[2]);
-      hk[3] = fmaf(d, sk.w, hk[3]);
     }
-  }
 
-  float R[kS];
+    float R[kS];
 #pragma unroll
-  for (int s = 0; s < kS; ++s)
-    R[s] = beta[s] * (bf_lo(v_raw[s]) - eG[s] * hk[s]);
-  const float D[kS] = {
-      R[0],
-      R[0] * t10 + R[1],
-      R[0] * t20 + R[1] * t21 + R[2],
-      R[0] * t30 + R[1] * t31 + R[2] * t32 + R[3],
-  };
-  const float O[kS] = {
-      eG[0] * hq[0] + D[0] * f00,
-      eG[1] * hq[1] + D[0] * f01 + D[1] * f11,
-      eG[2] * hq[2] + D[0] * f02 + D[1] * f12 + D[2] * f22,
-      eG[3] * hq[3] + D[0] * f03 + D[1] * f13 + D[2] * f23 + D[3] * f33,
-  };
-  uint16_t* const out = p.o + bos * p.s_o + hv * kD + tid;
+    for (int s = 0; s < kS; ++s)
+      R[s] = beta[s] * (bf_lo(v_raw[s]) - eG[s] * hk[s]);
+    load_head(p, ring, bos, S, r, base, hv + 1, j + 1 < heads, v_raw, dh_raw, dl_raw);
+    const float D[kS] = {
+        R[0],
+        R[0] * t10 + R[1],
+        R[0] * t20 + R[1] * t21 + R[2],
+        R[0] * t30 + R[1] * t31 + R[2] * t32 + R[3],
+    };
+    const float O[kS] = {
+        eG[0] * hq[0] + D[0] * f00,
+        eG[1] * hq[1] + D[0] * f01 + D[1] * f11,
+        eG[2] * hq[2] + D[0] * f02 + D[1] * f12 + D[2] * f22,
+        eG[3] * hq[3] + D[0] * f03 + D[1] * f13 + D[2] * f23 + D[3] * f33,
+    };
+    uint16_t* const out = p.o + bos * p.s_o + hv * kD + tid;
 #pragma unroll
-  for (int s = 0; s < kS; ++s) {
-    if (s < S) {
-      out[s * p.s_o] = static_cast<uint16_t>(to_bf(O[s]));
-      if (r + s < kL) {
-        const int phys = (base + r + s) & (kL - 1);
-        const uint32_t dh = to_bf(D[s]);
-        d_hi[phys * kD] = static_cast<uint16_t>(dh);
-        d_lo[phys * kD] = static_cast<uint16_t>(to_bf(D[s] - bf_lo(dh)));
-        if (tid == 0) p.g[ring * p.s_g + hv * kL + phys] = s_ex[3 * kS + s];
+    for (int s = 0; s < kS; ++s) {
+      if (s < S) {
+        out[s * p.s_o] = static_cast<uint16_t>(to_bf(O[s]));
+        if (r + s < kL) {
+          const int phys = (base + r + s) & (kL - 1);
+          const uint32_t dh = to_bf(D[s]);
+          d_hi[phys * kD] = static_cast<uint16_t>(dh);
+          d_lo[phys * kD] = static_cast<uint16_t>(to_bf(D[s] - bf_lo(dh)));
+          if (tid == 0) p.g[ring * p.s_g + hv * kL + phys] = s_ex[3 * kS + s];
+        }
       }
     }
+    tcgen05::fence_before_thread_sync();
+    device::ptx::bar_sync(3, kThreads);
   }
-  tcgen05::fence_before_thread_sync();
-  device::ptx::bar_arrive(3, kThreads);
 }
 
 }  // namespace gdn_replayssm_verify
@@ -651,7 +725,7 @@ struct GdnReplaySSMVerify {
     const DLDevice dev = device.unwrap();
     constexpr int smem = Layout::bytes;
     runtime::set_max_dynamic_smem_per_device<verify_kernel<kUsePDL>>(dev, smem);
-    const dim3 grid(static_cast<uint32_t>(num_hv), static_cast<uint32_t>(rows));
+    const dim3 grid(static_cast<uint32_t>(num_h), static_cast<uint32_t>(rows));
     LaunchKernel(grid, kThreads, dev, smem).enable_pdl(kUsePDL)(verify_kernel<kUsePDL>, params);
   }
 };
