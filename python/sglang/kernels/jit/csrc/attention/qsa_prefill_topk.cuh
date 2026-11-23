@@ -4,7 +4,12 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
+
+#include <sgl_kernel/ptx/async.cuh>
+#include <sgl_kernel/ptx/barrier.cuh>
+#include <sgl_kernel/ptx/tcgen05.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -16,32 +21,35 @@ namespace sglang {
 
 namespace qsa_prefill_topk {
 
+using tcgen05 = device::ptx::TCGen05<1>;
+
 constexpr int kD = 128;
 constexpr int kHeads = 4;
 constexpr int kTopK = 512;
-constexpr int kWarps = 8;
-constexpr int kThreads = kWarps * 32;
-constexpr int kRowGroups = 2;
-constexpr int kWarpRows = 4 * kRowGroups;
-constexpr int kRows = kWarps * kWarpRows;
-constexpr int kTileKeys = 64;
-constexpr int kSubTiles = kTileKeys / 16;
-constexpr int kKeyStride = 2 * kD + 16;
-constexpr int kTileBytes = kTileKeys * kKeyStride;
-constexpr int kStages = 2;
-constexpr int kTilesBytes = kStages * kTileBytes;
+constexpr int kRows = 64;
+constexpr int kN = kRows * kHeads;
+constexpr int kTileKeys = 128;
+constexpr int kEpiWarps = 16;
+constexpr int kEpiThreads = kEpiWarps * 32;
+constexpr int kThreads = kEpiThreads + 32;
+constexpr int kWarpRows = kRows * 4 / kEpiWarps;
+constexpr int kQBytes = kN * kD;
+constexpr int kTileBytes = kTileKeys * kD;
+constexpr int kStages = 3;
+constexpr int kOpBytes = kQBytes + kStages * kTileBytes;
+constexpr int kTmemCols = 512;
 constexpr int kBins = 256;
 constexpr int kHistStride = kBins + 1;
 constexpr int kHistBytes = kRows * kHistStride * 4;
-constexpr int kStageEntries = 48;
-constexpr int kStagingBytes = kRows * kStageEntries * 8;
 constexpr int kSampleEvery = 8;
 constexpr int kSampleRank = 112;
 constexpr int kCapacity = 1664;
-constexpr int kTieLimit = kCapacity - kTopK - 32;
+constexpr int kTieLimit = kCapacity - kTopK - kTileKeys;
 constexpr int kPickWarps = 4;
+constexpr int kExactPickWarps = 8;
 constexpr int kPickBytes = kCapacity * 8 + kBins * 4;
-constexpr int kWorkStride = kBins + 2;
+constexpr int kMaxSplits = 64;
+constexpr int kWorkStride = kBins + 2 + kMaxSplits;
 constexpr uint32_t kCoarseLo = 0x3e800000u;
 constexpr uint32_t kFineLo = 0x40800000u;
 constexpr uint32_t kFineHi = 0x43800000u;
@@ -51,12 +59,13 @@ constexpr int kCoarseBins = 32;
 constexpr int kFineBins = 192;
 constexpr uint32_t kKeyMax = 0x7fffffffu;
 constexpr unsigned kFull = 0xffffffffu;
-constexpr int kSampleSmem = kTilesBytes + kHistBytes;
-constexpr int kCollectSmem = kTilesBytes + kStagingBytes;
-constexpr int kExactScratch = kHistBytes > kWarps * kPickBytes ? kHistBytes : kWarps * kPickBytes;
-constexpr int kExactSmem = kTilesBytes + kStagingBytes + kExactScratch;
+constexpr int kExactScratch = kHistBytes > kExactPickWarps * kPickBytes ? kHistBytes : kExactPickWarps * kPickBytes;
+constexpr int kSampleSmem = kOpBytes + kHistBytes + 1024;
+constexpr int kCollectSmem = kOpBytes + 1024;
+constexpr int kExactSmem = kOpBytes + kExactScratch + 1024;
+static_assert(kWarpRows == 16 && kRows % kExactPickWarps == 0);
 
-enum Mode { kSample, kCollect, kHist, kCollectLimited };
+enum Mode { kSample, kCollect, kCollectScores, kHist, kCollectLimited };
 
 struct Params {
   const uint8_t* q;     // fp8 e4m3 [rows, q_heads, 128]
@@ -66,8 +75,9 @@ struct Params {
   int32_t* out;         // [rows, 512]
   uint64_t* cand;       // [rows, capacity]: score bits << 32 | key
   uint32_t* work;       // [rows, 258]: sample histogram, candidate count, fallback flag (zeroed)
-  int64_t stride_q;
-  int32_t rows, keys, splits;
+  float* scores;        // optional [rows, score_stride]: raw sums of the collect pass
+  int64_t stride_q, score_stride, cand_stride;
+  int32_t rows, keys, splits, split_cap;
 };
 
 struct RowInfo {
@@ -76,8 +86,17 @@ struct RowInfo {
   int32_t shift, limit, mode;
 };
 
-SGL_DEVICE uint32_t load_u32(const uint8_t* p) {
-  return *reinterpret_cast<const uint32_t*>(p);
+struct Shared {
+  uint64_t bars[2];
+  uint32_t tmem;
+  uint32_t mma_count;
+  RowInfo info[kRows];
+  uint32_t counts[kRows];
+  int32_t owned[kRows];
+};
+
+SGL_DEVICE uint8_t* align_smem(uint8_t* raw) {
+  return raw + ((1024 - (device::ptx::to_shared(raw) & 1023)) & 1023);
 }
 
 SGL_DEVICE uint32_t* count_of(const Params& p, const int row) {
@@ -99,249 +118,6 @@ SGL_DEVICE uint32_t window_edge(const int bin) {
 
 SGL_DEVICE uint32_t hist_bin(const uint32_t key, const uint32_t lo, const int shift) {
   return shift < 0 ? window_bin(key) : (key - lo) >> shift;
-}
-
-SGL_DEVICE void mma_f16(float (&d)[4], const uint32_t* a, const uint32_t b0, const uint32_t b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
-      "{%0, %1, %2, %3};"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-SGL_DEVICE uint32_t e4m3x2_to_f16x2(const uint32_t x) {
-  uint32_t r;
-  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<uint16_t>(x)));
-  return r;
-}
-
-SGL_DEVICE void mma_e4m3_k32(
-    float (&acc)[4], const uint32_t (&a_lo)[4], const uint32_t (&a_hi)[4], const uint32_t (&b)[4], const bool first) {
-  float part[4] = {};
-  mma_f16(part, a_lo, b[0], b[1]);
-  mma_f16(part, a_hi, b[2], b[3]);
-#pragma unroll
-  for (int i = 0; i < 4; ++i) acc[i] = first ? part[i] : acc[i] + part[i];
-}
-
-SGL_DEVICE void ldmatrix_x4(uint32_t (&a)[4], const uint32_t addr) {
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
-               : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
-               : "r"(addr));
-}
-
-SGL_DEVICE uint32_t score_key(const float a0, const float a1, const float b0, const float b1) {
-  const float s = (fmaxf(a0, 0.f) + fmaxf(a1, 0.f)) + (fmaxf(b0, 0.f) + fmaxf(b1, 0.f));
-  return __float_as_uint(s) & kKeyMax;
-}
-
-SGL_DEVICE void load_q(const Params& p, const int row0, uint32_t (&qf)[kRowGroups][2][4][4]) {
-  const int lane = threadIdx.x & 31;
-  const int g = lane >> 2;
-  const int t = lane & 3;
-#pragma unroll
-  for (int rg = 0; rg < kRowGroups; ++rg) {
-    const int r = row0 + (threadIdx.x >> 5) * kWarpRows + rg * 4 + (g >> 1);
-    const bool ok = r < p.rows;
-#pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      const uint8_t* src = p.q + static_cast<int64_t>(ok ? r : 0) * p.stride_q + (2 * j + (g & 1)) * kD + 4 * t;
-#pragma unroll
-      for (int c = 0; c < 4; ++c) {
-        const uint32_t b0 = ok ? load_u32(src + 32 * c) : 0u;
-        const uint32_t b1 = ok ? load_u32(src + 32 * c + 16) : 0u;
-        qf[rg][j][c][0] = e4m3x2_to_f16x2(b0);
-        qf[rg][j][c][1] = e4m3x2_to_f16x2(b1);
-        qf[rg][j][c][2] = e4m3x2_to_f16x2(b0 >> 16);
-        qf[rg][j][c][3] = e4m3x2_to_f16x2(b1 >> 16);
-      }
-    }
-  }
-}
-
-constexpr int kLoads = kTileKeys * 8 / kThreads;
-
-SGL_DEVICE void fetch_tile(const Params& p, uint4 (&regs)[kLoads], const int key0, const int key_step) {
-#pragma unroll
-  for (int w = 0; w < kLoads; ++w) {
-    const int chunk = threadIdx.x + w * kThreads;
-    const int key = key0 + (chunk >> 3) * key_step;
-    regs[w] = key < p.keys ? *reinterpret_cast<const uint4*>(p.k + static_cast<int64_t>(key) * kD + (chunk & 7) * 16)
-                           : make_uint4(0, 0, 0, 0);
-  }
-}
-
-SGL_DEVICE void store_tile(uint8_t* stage, const uint4 (&regs)[kLoads]) {
-#pragma unroll
-  for (int w = 0; w < kLoads; ++w) {
-    const int chunk = threadIdx.x + w * kThreads;
-    const int part = chunk & 7;
-    uint8_t* row = stage + (chunk >> 3) * kKeyStride + (part >> 1) * 64 + (part & 1) * 16;
-    const uint32_t v[4] = {regs[w].x, regs[w].y, regs[w].z, regs[w].w};
-    uint4 lo, hi;
-    lo.x = e4m3x2_to_f16x2(v[0]);
-    lo.y = e4m3x2_to_f16x2(v[1]);
-    lo.z = e4m3x2_to_f16x2(v[2]);
-    lo.w = e4m3x2_to_f16x2(v[3]);
-    hi.x = e4m3x2_to_f16x2(v[0] >> 16);
-    hi.y = e4m3x2_to_f16x2(v[1] >> 16);
-    hi.z = e4m3x2_to_f16x2(v[2] >> 16);
-    hi.w = e4m3x2_to_f16x2(v[3] >> 16);
-    *reinterpret_cast<uint4*>(row) = lo;
-    *reinterpret_cast<uint4*>(row + 32) = hi;
-  }
-}
-
-SGL_DEVICE void flush_row(
-    const Params& p, uint64_t* stage, const int grow, const int n, const int keep, const int reserved_base) {
-  const int lane = threadIdx.x & 31;
-  int base = reserved_base;
-  if (base < 0) {
-    if (lane == 0) base = static_cast<int>(atomicAdd(count_of(p, grow), static_cast<uint32_t>(n)));
-    base = __shfl_sync(kFull, base, 0);
-  }
-  if (lane < n && base + lane < kCapacity) p.cand[static_cast<int64_t>(grow) * kCapacity + base + lane] = stage[lane];
-  const uint64_t rest = lane < keep ? stage[n + lane] : 0;
-  __syncwarp();
-  if (lane < keep) stage[lane] = rest;
-  __syncwarp();
-}
-
-template <Mode kMode>
-SGL_DEVICE void scan(
-    const Params& p,
-    const RowInfo* info,
-    uint8_t* tiles,
-    uint32_t* hist,
-    uint64_t* staging,
-    const uint32_t (&qf)[kRowGroups][2][4][4],
-    const int row0,
-    const int seg_start,
-    const int seg_len,
-    const int first,
-    const int step) {
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  const int g = lane >> 2;
-  const int t = lane & 3;
-  const unsigned row_lanes = 0x11111111u << t;
-  const unsigned below = (1u << lane) - 1;
-  int act[kRowGroups];
-  uint32_t lo[kRowGroups], hi[kRowGroups];
-  int shift[kRowGroups], limit[kRowGroups], staged[kRowGroups], sent[kRowGroups];
-#pragma unroll
-  for (int rg = 0; rg < kRowGroups; ++rg) {
-    const RowInfo& r = info[warp * kWarpRows + rg * 4 + t];
-    act[rg] = r.act;
-    lo[rg] = r.lo;
-    hi[rg] = r.hi;
-    shift[rg] = r.shift;
-    limit[rg] = r.limit;
-    staged[rg] = 0;
-    sent[rg] = 0;
-  }
-  constexpr int kKeyStep = kMode == kSample ? kSampleEvery : 1;
-  constexpr int kTileSpan = kTileKeys * kKeyStep;
-  const int num_tiles = (seg_len + kTileSpan - 1) / kTileSpan;
-  const int mine = first < num_tiles ? (num_tiles - first + step - 1) / step : 0;
-  const uint32_t tiles_addr = static_cast<uint32_t>(__cvta_generic_to_shared(tiles));
-  const uint32_t lm_off = ((lane & 7) + ((lane >> 3) & 1) * 8) * kKeyStride + (lane >> 4) * 16;
-
-  uint4 regs[kLoads];
-  if (mine > 0) {
-    fetch_tile(p, regs, seg_start + first * kTileSpan, kKeyStep);
-    store_tile(tiles, regs);
-  }
-  if (mine > 1) fetch_tile(p, regs, seg_start + (first + step) * kTileSpan, kKeyStep);
-  for (int n = 0; n < mine; ++n) {
-    __syncthreads();
-    if (n + 1 < mine) {
-      store_tile(tiles + ((n + 1) & 1) * kTileBytes, regs);
-      if (n + 2 < mine) fetch_tile(p, regs, seg_start + (first + (n + 2) * step) * kTileSpan, kKeyStep);
-    }
-    const uint32_t stage_addr = tiles_addr + (n & 1) * kTileBytes + lm_off;
-    const int tile_pos = (first + n * step) * kTileSpan;
-#pragma unroll 1
-    for (int u = 0; u < kSubTiles; ++u) {
-      float acc[kRowGroups][2][4] = {};
-#pragma unroll
-      for (int c = 0; c < 4; ++c) {
-        uint32_t a_lo[4], a_hi[4];
-        ldmatrix_x4(a_lo, stage_addr + u * 16 * kKeyStride + 64 * c);
-        ldmatrix_x4(a_hi, stage_addr + u * 16 * kKeyStride + 64 * c + 32);
-#pragma unroll
-        for (int rg = 0; rg < kRowGroups; ++rg) {
-          mma_e4m3_k32(acc[rg][0], a_lo, a_hi, qf[rg][0][c], c == 0);
-          mma_e4m3_k32(acc[rg][1], a_lo, a_hi, qf[rg][1][c], c == 0);
-        }
-      }
-      const int pos0 = tile_pos + (u * 16 + g) * kKeyStep;
-      const int pos1 = pos0 + 8 * kKeyStep;
-#pragma unroll
-      for (int rg = 0; rg < kRowGroups; ++rg) {
-        const int lrow = warp * kWarpRows + rg * 4 + t;
-        const uint32_t key0 = score_key(acc[rg][0][0], acc[rg][0][1], acc[rg][1][0], acc[rg][1][1]);
-        const uint32_t key1 = score_key(acc[rg][0][2], acc[rg][0][3], acc[rg][1][2], acc[rg][1][3]);
-        if constexpr (kMode == kSample) {
-          if (pos0 < act[rg]) atomicAdd(hist + lrow * kHistStride + window_bin(key0), 1u);
-          if (pos1 < act[rg]) atomicAdd(hist + lrow * kHistStride + window_bin(key1), 1u);
-        } else if constexpr (kMode == kHist) {
-          if (pos0 < act[rg] && key0 >= lo[rg]) {
-            atomicAdd(hist + lrow * kHistStride + (key0 > hi[rg] ? kBins : hist_bin(key0, lo[rg], shift[rg])), 1u);
-          }
-          if (pos1 < act[rg] && key1 >= lo[rg]) {
-            atomicAdd(hist + lrow * kHistStride + (key1 > hi[rg] ? kBins : hist_bin(key1, lo[rg], shift[rg])), 1u);
-          }
-        } else {
-          bool p0 = pos0 < act[rg] && key0 >= lo[rg];
-          bool p1 = pos1 < act[rg] && key1 >= lo[rg];
-          if constexpr (kMode == kCollectLimited) {
-            const bool open = sent[rg] + staged[rg] < limit[rg];
-            p0 = p0 && (key0 > hi[rg] || open);
-            p1 = p1 && (key1 > hi[rg] || open);
-          }
-          const unsigned m0 = __ballot_sync(kFull, p0);
-          const unsigned m1 = __ballot_sync(kFull, p1);
-          const int c0 = __popc(m0 & row_lanes);
-          uint64_t* row_stage = staging + lrow * kStageEntries + staged[rg];
-          if (p0) row_stage[__popc(m0 & row_lanes & below)] = (static_cast<uint64_t>(key0) << 32) | pos0;
-          if (p1) row_stage[c0 + __popc(m1 & row_lanes & below)] = (static_cast<uint64_t>(key1) << 32) | pos1;
-          staged[rg] += c0 + __popc(m1 & row_lanes);
-        }
-      }
-      if constexpr (kMode == kCollect || kMode == kCollectLimited) {
-#pragma unroll
-        for (int rg = 0; rg < kRowGroups; ++rg) {
-          const unsigned full = __ballot_sync(kFull, staged[rg] >= 32) & 0xfu;
-          if (full == 0) continue;
-          __syncwarp();
-          for (int r = 0; r < 4; ++r) {
-            if (!(full >> r & 1)) continue;
-            const int lrow = warp * kWarpRows + rg * 4 + r;
-            const int n_staged = __shfl_sync(kFull, staged[rg], r);
-            flush_row(p, staging + lrow * kStageEntries, row0 + lrow, 32, n_staged - 32, -1);
-          }
-          if (full >> t & 1) {
-            staged[rg] -= 32;
-            sent[rg] += 32;
-          }
-        }
-      }
-    }
-  }
-  if constexpr (kMode == kCollect || kMode == kCollectLimited) {
-    __syncwarp();
-#pragma unroll
-    for (int rg = 0; rg < kRowGroups; ++rg) {
-      for (int r = 0; r < 4; ++r) {
-        const int n_staged = __shfl_sync(kFull, staged[rg], r);
-        if (n_staged == 0) continue;
-        const int lrow = warp * kWarpRows + rg * 4 + r;
-        flush_row(p, staging + lrow * kStageEntries, row0 + lrow, n_staged, 0, -1);
-      }
-    }
-  }
-  __syncthreads();
 }
 
 SGL_DEVICE void load_rows(const Params& p, RowInfo* info, const int row0, const bool fallback) {
@@ -370,10 +146,10 @@ SGL_DEVICE int first_segment(const RowInfo* info) {
   return -1;
 }
 
-SGL_DEVICE bool next_segment(const RowInfo* info, const int first, int& seg_start, int& seg_len) {
+SGL_DEVICE bool next_segment(const RowInfo* info, int& seg_start, int& seg_len, const int first) {
   seg_start = -1;
   for (int i = 0; i < kRows; ++i) {
-    if (info[i].mode && (blockIdx.z == 0) == (info[i].start == first)) {
+    if (info[i].mode && (first < 0 || (blockIdx.z == 0) == (info[i].start == first))) {
       seg_start = info[i].start;
       break;
     }
@@ -386,21 +162,284 @@ SGL_DEVICE bool next_segment(const RowInfo* info, const int first, int& seg_star
   return true;
 }
 
+
+SGL_DEVICE float relu_bits(const uint32_t x) {
+  return __int_as_float(max(static_cast<int>(x), 0));
+}
+
+SGL_DEVICE uint32_t score_key(const uint32_t a0, const uint32_t a1, const uint32_t b0, const uint32_t b1) {
+  return __float_as_uint((relu_bits(a0) + relu_bits(a1)) + (relu_bits(b0) + relu_bits(b1)));
+}
+
+SGL_DEVICE void cp_async_zfill(const uint32_t dst, const void* src, const bool valid) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(valid ? 16 : 0));
+}
+
+SGL_DEVICE void cp_async_commit() {
+  asm volatile("cp.async.commit_group;");
+}
+
+template <int kPending>
+SGL_DEVICE void cp_async_wait() {
+  asm volatile("cp.async.wait_group %0;" ::"n"(kPending));
+}
+
+SGL_DEVICE void load_q(const Params& p, uint8_t* s_q, const int row0) {
+  for (int c = threadIdx.x; c < kN * 8; c += kEpiThreads) {
+    const int n = c >> 3;
+    const int r = row0 + (n >> 2);
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (r < p.rows) {
+      v = *reinterpret_cast<const uint4*>(p.q + static_cast<int64_t>(r) * p.stride_q + (n & 3) * kD + (c & 7) * 16);
+    }
+    *reinterpret_cast<uint4*>(s_q + tcgen05::sw128_off(n, c & 7)) = v;
+  }
+  device::ptx::fence_proxy_async_shared();
+}
+
+SGL_DEVICE void load_keys(const Params& p, uint8_t* stage, const int key0, const int key_step) {
+#pragma unroll
+  for (int w = 0; w < kTileKeys * 8 / kEpiThreads; ++w) {
+    const int c = threadIdx.x + w * kEpiThreads;
+    const int key = key0 + (c >> 3) * key_step;
+    const bool valid = key < p.keys;
+    cp_async_zfill(
+        device::ptx::to_shared(stage + tcgen05::sw128_off(c >> 3, c & 7)),
+        p.k + static_cast<int64_t>(valid ? key : 0) * kD + (c & 7) * 16,
+        valid);
+  }
+}
+
+template <Mode kMode>
+SGL_DEVICE void epilogue(
+    const Params& p,
+    Shared& sh,
+    uint32_t* hist,
+    const uint32_t g,
+    const int row0,
+    const int pos,
+    const int act,
+    const uint32_t lo,
+    const uint32_t hi,
+    const int shift,
+    const bool open,
+    const int pos_max,
+    const uint32_t (&los)[kWarpRows]) {
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int rbase = (warp >> 2) * kWarpRows;
+  const unsigned below = (1u << lane) - 1;
+  device::ptx::mbar_wait_parity(sh.bars + (g & 1), (g >> 1) & 1);
+  tcgen05::fence_after_thread_sync();
+  const uint32_t taddr = sh.tmem + (static_cast<uint32_t>((warp & 3) * 32) << 16) + (g & 1) * kN + rbase * kHeads;
+  uint32_t s[kWarpRows];
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    uint32_t v[32];
+    tcgen05::ld_32x32b<32>(taddr + half * 32, v);
+    tcgen05::wait_ld();
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      s[half * 8 + i] = score_key(v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]);
+    }
+  }
+  tcgen05::fence_before_thread_sync();
+  if constexpr (kMode == kSample) {
+#pragma unroll
+    for (int r = 0; r < kWarpRows; ++r) {
+      const int act_r = __shfl_sync(kFull, act, r);
+      if (pos < act_r) atomicAdd(hist + (rbase + r) * kHistStride + window_bin(s[r]), 1u);
+    }
+  } else if constexpr (kMode == kHist) {
+#pragma unroll
+    for (int r = 0; r < kWarpRows; ++r) {
+      const uint32_t lo_r = __shfl_sync(kFull, lo, r);
+      const uint32_t hi_r = __shfl_sync(kFull, hi, r);
+      const int shift_r = __shfl_sync(kFull, shift, r);
+      const int act_r = __shfl_sync(kFull, act, r);
+      if (pos < act_r && s[r] >= lo_r) {
+        atomicAdd(hist + (rbase + r) * kHistStride + (s[r] > hi_r ? kBins : hist_bin(s[r], lo_r, shift_r)), 1u);
+      }
+    }
+  } else {
+    unsigned m[kWarpRows];
+    int count = 0;
+    const bool interior = __all_sync(kFull, lane >= kWarpRows || act == 0 || pos_max < act);
+#pragma unroll
+    for (int r = 0; r < kWarpRows; ++r) {
+      bool take = s[r] >= los[r];
+      if (!interior || kMode != kCollect) {
+        const bool valid = pos < __shfl_sync(kFull, act, r);
+        take = take && valid;
+        if constexpr (kMode == kCollectScores) {
+          if (valid) p.scores[static_cast<int64_t>(row0 + rbase + r) * p.score_stride + pos] = __uint_as_float(s[r]);
+        }
+      }
+      if constexpr (kMode == kCollectLimited) {
+        const uint32_t hi_r = __shfl_sync(kFull, hi, r);
+        const bool open_r = __shfl_sync(kFull, open, r);
+        take = take && (s[r] > hi_r || open_r);
+      }
+      m[r] = __ballot_sync(kFull, take);
+      if (lane == r) count = __popc(m[r]);
+    }
+    constexpr bool kSplitRegion = kMode != kCollectLimited;
+    const int cap = kSplitRegion ? p.split_cap : kCapacity;
+    int base = 0;
+    if (count > 0) {
+      base = static_cast<int>(
+          kSplitRegion ? atomicAdd(&sh.counts[rbase + lane], static_cast<uint32_t>(count))
+                       : atomicAdd(count_of(p, row0 + rbase + lane), static_cast<uint32_t>(count)));
+    }
+    uint64_t* const rows_out =
+        p.cand + static_cast<int64_t>(row0 + rbase) * p.cand_stride + (kSplitRegion ? blockIdx.y * p.split_cap : 0);
+    const uint64_t pos_bits = static_cast<uint32_t>(pos);
+#pragma unroll
+    for (int r = 0; r < kWarpRows; ++r) {
+      const int slot = __shfl_sync(kFull, base, r) + __popc(m[r] & below);
+      if ((m[r] >> lane & 1) && slot < cap) {
+        rows_out[r * p.cand_stride + slot] = (static_cast<uint64_t>(s[r]) << 32) | pos_bits;
+      }
+    }
+  }
+}
+
+template <Mode kMode>
+SGL_DEVICE void scan(
+    const Params& p,
+    Shared& sh,
+    uint8_t* smem,
+    uint32_t* hist,
+    const int row0,
+    const int seg_start,
+    const int seg_len,
+    const int first,
+    const int step) {
+  constexpr int kKeyStep = kMode == kSample ? kSampleEvery : 1;
+  constexpr int kTileSpan = kTileKeys * kKeyStep;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const bool issuer = warp == kEpiWarps;
+  const int num_tiles = (seg_len + kTileSpan - 1) / kTileSpan;
+  const int mine = first < num_tiles ? (num_tiles - first + step - 1) / step : 0;
+  const uint32_t g0 = sh.mma_count;
+  uint8_t* s_k = smem + kQBytes;
+  int act = 0, shift = 0, limit = INT_MAX;
+  uint32_t lo = 0, hi = 0xffffffffu;
+  int grow = 0;
+  if (!issuer && lane < kWarpRows) {
+    const int lrow = (warp >> 2) * kWarpRows + lane;
+    const RowInfo& r = sh.info[lrow];
+    act = r.act;
+    lo = r.act > 0 ? r.lo : 0xffffffffu;
+    hi = r.hi;
+    shift = r.shift;
+    limit = r.limit;
+    grow = row0 + lrow;
+  }
+  const int key_in_tile = (warp & 3) * 32 + lane;
+  uint32_t los[kWarpRows];
+#pragma unroll
+  for (int r = 0; r < kWarpRows; ++r) los[r] = __shfl_sync(kFull, lo, r);
+  if (!issuer) {
+    if (mine > 0) load_keys(p, s_k, seg_start + first * kTileSpan, kKeyStep);
+    cp_async_commit();
+    if (mine > 1) load_keys(p, s_k + kTileBytes, seg_start + (first + step) * kTileSpan, kKeyStep);
+    cp_async_commit();
+  }
+  const auto qdesc = tcgen05::make_desc_kmajor_sw128(smem);
+  const auto kdesc = tcgen05::make_desc_kmajor_sw128(s_k);
+  const uint32_t idesc = tcgen05::make_instr_desc_f8<kTileKeys, kN>().bits;
+  for (int n = 0; n <= mine; ++n) {
+    const uint32_t g = g0 + n;
+    if (!issuer && n < mine) {
+      cp_async_wait<1>();
+      device::ptx::fence_proxy_async_shared();
+    }
+    device::ptx::bar_sync(1, kThreads);
+    if (issuer) {
+      if (n < mine && lane == 0) {
+        tcgen05::fence_after_thread_sync();
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          tcgen05::mma_f8_ss(
+              sh.tmem + (g & 1) * kN,
+              kdesc.advance_bytes((n % kStages) * kTileBytes + i * 32).bits,
+              qdesc.advance_bytes(i * 32).bits,
+              idesc,
+              i > 0);
+        }
+        tcgen05::commit(sh.bars + (g & 1));
+      }
+      __syncwarp();
+      continue;
+    }
+    if (n >= 1) {
+      bool open = true;
+      if constexpr (kMode == kCollectLimited) {
+        open = lane < kWarpRows && act > 0 && *reinterpret_cast<volatile uint32_t*>(count_of(p, grow)) < limit;
+        device::ptx::bar_sync(2, kEpiThreads);
+      }
+      const int tile_pos = (first + (n - 1) * step) * kTileKeys;
+      const int pos = (tile_pos + key_in_tile) * kKeyStep;
+      epilogue<kMode>(
+          p, sh, hist, g - 1, row0, pos, act, lo, hi, shift, open, (tile_pos + kTileKeys - 1) * kKeyStep, los);
+    }
+    if (n + 2 < mine) {
+      load_keys(p, s_k + ((n + 2) % kStages) * kTileBytes, seg_start + (first + (n + 2) * step) * kTileSpan, kKeyStep);
+    }
+    cp_async_commit();
+  }
+  if (!issuer) cp_async_wait<0>();
+  __syncthreads();
+  if (threadIdx.x == 0) sh.mma_count = g0 + mine;
+  __syncthreads();
+}
+
+SGL_DEVICE void cta_setup(const Params& p, Shared& sh, uint8_t* smem, const int row0, const bool init) {
+  const int warp = threadIdx.x >> 5;
+  if (init && threadIdx.x == 0) {
+    device::ptx::mbar_init(sh.bars, 1);
+    device::ptx::mbar_init(sh.bars + 1, 1);
+    device::ptx::fence_barrier_init();
+    sh.mma_count = 0;
+  }
+  if (warp == kEpiWarps) {
+    if (init) {
+      tcgen05::alloc(&sh.tmem, kTmemCols);
+      tcgen05::relinquish_alloc_permit();
+      tcgen05::fence_before_thread_sync();
+    }
+  } else {
+    load_q(p, smem, row0);
+  }
+  __syncthreads();
+  tcgen05::fence_after_thread_sync();
+}
+
+SGL_DEVICE void cta_teardown(Shared& sh) {
+  __syncthreads();
+  if ((threadIdx.x >> 5) == kEpiWarps) {
+    tcgen05::fence_after_thread_sync();
+    tcgen05::dealloc(sh.tmem, kTmemCols);
+  }
+}
+
 template <bool kUsePDL>
-__global__ void __launch_bounds__(kThreads, 2) sample_kernel(const __grid_constant__ Params p) {
-  extern __shared__ __align__(16) uint8_t smem[];
-  __shared__ RowInfo info[kRows];
+__global__ void __launch_bounds__(kThreads, 1) sample_kernel(const __grid_constant__ Params p) {
+  extern __shared__ __align__(1024) uint8_t smem_raw[];
+  __shared__ Shared sh;
+  uint8_t* smem = align_smem(smem_raw);
   device::PDLWaitPrimary<kUsePDL>();
-  uint8_t* tiles = smem;
-  uint32_t* hist = reinterpret_cast<uint32_t*>(smem + kTilesBytes);
+  RowInfo* info = sh.info;
+  uint32_t* hist = reinterpret_cast<uint32_t*>(smem + kOpBytes);
   const int row0 = blockIdx.x * kRows;
   load_rows(p, info, row0, false);
   const int first = first_segment(info);
   int seg_start, seg_len;
-  if (first >= 0 && next_segment(info, first, seg_start, seg_len)) {
+  if (next_segment(info, seg_start, seg_len, first)) {
     for (int i = threadIdx.x; i < kRows * kHistStride; i += kThreads) hist[i] = 0;
-    uint32_t qf[kRowGroups][2][4][4];
-    load_q(p, row0, qf);
+    cta_setup(p, sh, smem, row0, true);
     do {
       __syncthreads();
       if (threadIdx.x < kRows) {
@@ -408,16 +447,16 @@ __global__ void __launch_bounds__(kThreads, 2) sample_kernel(const __grid_consta
         r.act = r.mode && r.start == seg_start ? r.len : 0;
       }
       __syncthreads();
-      scan<kSample>(
-          p, info, tiles, hist, nullptr, qf, row0, seg_start, seg_len, blockIdx.y, p.splits);
+      scan<kSample>(p, sh, smem, hist, row0, seg_start, seg_len, blockIdx.y, p.splits);
       if (threadIdx.x < kRows && info[threadIdx.x].act) info[threadIdx.x].mode = 0;
       __syncthreads();
-    } while (next_segment(info, first, seg_start, seg_len));
+    } while (next_segment(info, seg_start, seg_len, first));
     for (int i = threadIdx.x; i < kRows * kBins; i += kThreads) {
       const int r = i / kBins;
       const uint32_t v = hist[r * kHistStride + i % kBins];
       if (v) atomicAdd(p.work + static_cast<int64_t>(row0 + r) * kWorkStride + i % kBins, v);
     }
+    cta_teardown(sh);
   }
   device::PDLTriggerSecondary<kUsePDL>();
 }
@@ -450,54 +489,90 @@ SGL_DEVICE uint32_t sample_bound(const uint32_t* row_hist) {
   return window_edge(__shfl_sync(kFull, bin, src));
 }
 
+
 template <bool kUsePDL>
-__global__ void __launch_bounds__(kThreads, 2) collect_kernel(const __grid_constant__ Params p) {
-  extern __shared__ __align__(16) uint8_t smem[];
-  __shared__ RowInfo info[kRows];
+__global__ void __launch_bounds__(kThreads, 1) collect_kernel(const __grid_constant__ Params p) {
+  extern __shared__ __align__(1024) uint8_t smem_raw[];
+  __shared__ Shared sh;
+  uint8_t* smem = align_smem(smem_raw);
   device::PDLWaitPrimary<kUsePDL>();
-  uint8_t* tiles = smem;
-  uint64_t* staging = reinterpret_cast<uint64_t*>(smem + kTilesBytes);
+  RowInfo* info = sh.info;
   const int row0 = blockIdx.x * kRows;
   const int warp = threadIdx.x >> 5;
   load_rows(p, info, row0, false);
   const int first = first_segment(info);
   int seg_start, seg_len;
-  if (first >= 0 && next_segment(info, first, seg_start, seg_len)) {
-    for (int i = 0; i < kWarpRows; ++i) {
-      const int lrow = warp * kWarpRows + i;
-      if (!info[lrow].mode) continue;
-      const uint32_t lo = sample_bound(p.work + static_cast<int64_t>(row0 + lrow) * kWorkStride);
-      if ((threadIdx.x & 31) == 0) info[lrow].lo = lo;
+  if (next_segment(info, seg_start, seg_len, first)) {
+    for (int i = warp; i < kRows; i += kThreads / 32) {
+      if (!info[i].mode) continue;
+      const uint32_t lo = sample_bound(p.work + static_cast<int64_t>(row0 + i) * kWorkStride);
+      if ((threadIdx.x & 31) == 0) info[i].lo = lo;
     }
-    uint32_t qf[kRowGroups][2][4][4];
-    load_q(p, row0, qf);
+    if (threadIdx.x < kRows) {
+      sh.counts[threadIdx.x] = 0;
+      sh.owned[threadIdx.x] = 0;
+    }
+    cta_setup(p, sh, smem, row0, true);
     do {
       __syncthreads();
       if (threadIdx.x < kRows) {
         RowInfo& r = info[threadIdx.x];
         r.act = r.mode && r.start == seg_start ? r.len : 0;
+        sh.owned[threadIdx.x] |= r.act > 0;
       }
       __syncthreads();
-      scan<kCollect>(p, info, tiles, nullptr, staging, qf, row0, seg_start, seg_len, blockIdx.y, p.splits);
+      if (p.scores != nullptr) {
+        scan<kCollectScores>(p, sh, smem, nullptr, row0, seg_start, seg_len, blockIdx.y, p.splits);
+      } else {
+        scan<kCollect>(p, sh, smem, nullptr, row0, seg_start, seg_len, blockIdx.y, p.splits);
+      }
       if (threadIdx.x < kRows && info[threadIdx.x].act) info[threadIdx.x].mode = 0;
       __syncthreads();
-    } while (next_segment(info, first, seg_start, seg_len));
+    } while (next_segment(info, seg_start, seg_len, first));
+    if (threadIdx.x < kRows && sh.owned[threadIdx.x]) {
+      p.work[static_cast<int64_t>(row0 + threadIdx.x) * kWorkStride + kBins + 2 + blockIdx.y] = sh.counts[threadIdx.x];
+    }
+    cta_teardown(sh);
   }
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
-SGL_DEVICE void pick_row(const Params& p, const int row, uint32_t* keys, uint32_t* idx, uint32_t* bins) {
+SGL_DEVICE void pick_row(
+    const Params& p,
+    const int row,
+    uint32_t* keys,
+    uint32_t* idx,
+    uint32_t* bins,
+    const int segments,
+    const int seg_cap,
+    const uint32_t* seg_counts) {
   const int lane = threadIdx.x & 31;
   const unsigned below = (1u << lane) - 1;
-  const int count = min(static_cast<int>(*count_of(p, row)), kCapacity);
-  const uint64_t* cand = p.cand + static_cast<int64_t>(row) * kCapacity;
   uint32_t k_or = 0, k_and = 0xffffffffu;
-  for (int i = lane; i < count; i += 32) {
-    const uint64_t v = cand[i];
-    keys[i] = static_cast<uint32_t>(v >> 32);
-    idx[i] = static_cast<uint32_t>(v);
-    k_or |= keys[i];
-    k_and &= keys[i];
+  int count = 0;
+  for (int seg = 0; seg < segments; ++seg) {
+    const int n = static_cast<int>(seg_counts[seg]);
+    const uint64_t* cand = p.cand + static_cast<int64_t>(row) * p.cand_stride + seg * seg_cap;
+    for (int i0 = 0; i0 < n; i0 += 8 * 32) {
+      uint64_t v[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int i = i0 + j * 32 + lane;
+        v[j] = i < n ? cand[i] : 0;
+      }
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int i = i0 + j * 32 + lane;
+        if (i < n) {
+          const uint32_t key = static_cast<uint32_t>(v[j] >> 32);
+          keys[count + i] = key;
+          idx[count + i] = static_cast<uint32_t>(v[j]);
+          k_or |= key;
+          k_and &= key;
+        }
+      }
+    }
+    count += n;
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) {
@@ -577,7 +652,9 @@ SGL_DEVICE void pick_row(const Params& p, const int row, uint32_t* keys, uint32_
   int written = 0;
   for (int i0 = 0; i0 < count; i0 += 32) {
     const int i = i0 + lane;
-    const bool take = i < count && (keys[i] > prefix || (keys[i] == prefix && idx[i] <= cut));
+    const uint32_t key = i < count ? keys[i] : 0u;
+    const bool tie = i < count && key == prefix;
+    const bool take = i < count && (key > prefix || (tie && idx[i] <= cut));
     const unsigned m = __ballot_sync(kFull, take);
     if (take) out[written + __popc(m & below)] = static_cast<int32_t>(idx[i]);
     written += __popc(m);
@@ -587,7 +664,7 @@ SGL_DEVICE void pick_row(const Params& p, const int row, uint32_t* keys, uint32_
 
 template <bool kUsePDL>
 __global__ void __launch_bounds__(kPickWarps * 32) pick_kernel(const __grid_constant__ Params p) {
-  extern __shared__ __align__(16) uint8_t smem[];
+  extern __shared__ __align__(1024) uint8_t smem[];
   device::PDLWaitPrimary<kUsePDL>();
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -599,13 +676,18 @@ __global__ void __launch_bounds__(kPickWarps * 32) pick_kernel(const __grid_cons
     if (len <= kTopK) {
       for (int c = lane; c < kTopK; c += 32) out[c] = c < len ? c : -1;
     } else {
-      const uint32_t count = *count_of(p, row);
-      if (count < kTopK || count > kCapacity) {
-        if (lane == 0) count_of(p, row)[1] = count < kTopK ? 1 : 2;
+      const uint32_t* seg_counts = p.work + static_cast<int64_t>(row) * kWorkStride + kBins + 2;
+      uint32_t total = 0, worst = 0;
+      for (int seg = 0; seg < p.splits; ++seg) {
+        total += seg_counts[seg];
+        worst = max(worst, seg_counts[seg]);
+      }
+      if (total < kTopK || total > kCapacity || worst > static_cast<uint32_t>(p.split_cap)) {
+        if (lane == 0) count_of(p, row)[1] = total < kTopK ? 1 : 2;
       } else {
         uint8_t* base = smem + warp * kPickBytes;
         uint32_t* keys = reinterpret_cast<uint32_t*>(base);
-        pick_row(p, row, keys, keys + kCapacity, keys + 2 * kCapacity);
+        pick_row(p, row, keys, keys + kCapacity, keys + 2 * kCapacity, p.splits, p.split_cap, seg_counts);
       }
     }
   }
@@ -665,30 +747,29 @@ SGL_DEVICE void narrow(RowInfo& r, const uint32_t* row_hist) {
   __syncwarp();
 }
 
-SGL_DEVICE bool any_mode(const RowInfo* info, const int mode) {
-  bool any = false;
-  for (int i = 0; i < kRows; ++i) any |= info[i].mode == mode;
-  return any;
-}
 
 template <bool kUsePDL>
 __global__ void __launch_bounds__(kThreads, 1) exact_kernel(const __grid_constant__ Params p) {
-  extern __shared__ __align__(16) uint8_t smem[];
-  __shared__ RowInfo info[kRows];
+  extern __shared__ __align__(1024) uint8_t smem_raw[];
+  __shared__ Shared sh;
+  uint8_t* smem = align_smem(smem_raw);
   __shared__ int segment_of[kRows];
   device::PDLWaitPrimary<kUsePDL>();
-  uint8_t* tiles = smem;
-  uint64_t* staging = reinterpret_cast<uint64_t*>(smem + kTilesBytes);
-  uint32_t* hist = reinterpret_cast<uint32_t*>(smem + kTilesBytes + kStagingBytes);
-  const int row0 = blockIdx.x * kRows;
+  RowInfo* info = sh.info;
+  uint32_t* hist = reinterpret_cast<uint32_t*>(smem + kOpBytes);
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
-  load_rows(p, info, row0, true);
-  const int first = first_segment(info);
-  int seg_start, seg_len;
-  if (first >= 0 && next_segment(info, first, seg_start, seg_len)) {
-    uint32_t qf[kRowGroups][2][4][4];
-    load_q(p, row0, qf);
+  constexpr int kPickRows = kRows / kExactPickWarps;
+  const int tiles = (p.rows + kRows - 1) / kRows;
+  bool ready = false;
+  for (int tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
+    const int row0 = tile * kRows;
+    __syncthreads();
+    load_rows(p, info, row0, true);
+    int seg_start, seg_len;
+    if (!next_segment(info, seg_start, seg_len, -1)) continue;
+    cta_setup(p, sh, smem, row0, !ready);
+    ready = true;
     do {
       __syncthreads();
       if (threadIdx.x < kRows) {
@@ -716,36 +797,40 @@ __global__ void __launch_bounds__(kThreads, 1) exact_kernel(const __grid_constan
             info[threadIdx.x].act = segment_of[threadIdx.x] && info[threadIdx.x].mode == 1 ? info[threadIdx.x].len : 0;
           }
           __syncthreads();
-          scan<kHist>(p, info, tiles, hist, nullptr, qf, row0, seg_start, seg_len, 0, 1);
-          for (int i = 0; i < kWarpRows; ++i) {
-            const int lrow = warp * kWarpRows + i;
-            if (info[lrow].act) narrow(info[lrow], hist + lrow * kHistStride);
+          scan<kHist>(p, sh, smem, hist, row0, seg_start, seg_len, 0, 1);
+          for (int i = warp; i < kRows; i += kThreads / 32) {
+            if (info[i].act) narrow(info[i], hist + i * kHistStride);
           }
           __syncthreads();
         }
-        if (any_mode(info, 2)) {
+        bool any_two = false;
+        for (int i = 0; i < kRows; ++i) any_two |= segment_of[i] && info[i].mode == 2;
+        if (any_two) {
           if (threadIdx.x < kRows) {
             const bool on = segment_of[threadIdx.x] && info[threadIdx.x].mode == 2;
             info[threadIdx.x].act = on ? info[threadIdx.x].len : 0;
             if (on) *count_of(p, row0 + threadIdx.x) = 0;
           }
           __syncthreads();
-          scan<kCollectLimited>(p, info, tiles, nullptr, staging, qf, row0, seg_start, seg_len, 0, 1);
-          uint32_t* keys = hist + warp * (kPickBytes / 4);
-          for (int i = 0; i < kWarpRows; ++i) {
-            const int lrow = warp * kWarpRows + i;
-            if (!info[lrow].act) continue;
-            pick_row(p, row0 + lrow, keys, keys + kCapacity, keys + 2 * kCapacity);
-            if (lane == 0) info[lrow].mode = 3;
-            __syncwarp();
+          scan<kCollectLimited>(p, sh, smem, nullptr, row0, seg_start, seg_len, 0, 1);
+          if (warp < kExactPickWarps) {
+            uint32_t* keys = hist + warp * (kPickBytes / 4);
+            for (int i = 0; i < kPickRows; ++i) {
+              const int lrow = warp * kPickRows + i;
+              if (!info[lrow].act) continue;
+              pick_row(p, row0 + lrow, keys, keys + kCapacity, keys + 2 * kCapacity, 1, 0, count_of(p, row0 + lrow));
+              if (lane == 0) info[lrow].mode = 3;
+              __syncwarp();
+            }
           }
           __syncthreads();
         }
       }
       if (threadIdx.x < kRows && segment_of[threadIdx.x]) info[threadIdx.x].mode = 0;
       __syncthreads();
-    } while (next_segment(info, first, seg_start, seg_len));
+    } while (next_segment(info, seg_start, seg_len, -1));
   }
+  if (ready) cta_teardown(sh);
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
@@ -761,12 +846,14 @@ struct QsaPrefillTopk {
       const tvm::ffi::TensorView out,
       const tvm::ffi::TensorView cand,
       const tvm::ffi::TensorView work,
+      const tvm::ffi::TensorView scores,
       const int64_t splits) {
     using namespace host;
     using namespace qsa_prefill_topk;
     auto R_ = SymbolicSize{"rows"};
     auto HQ_ = SymbolicSize{"q_heads"};
     auto N_ = SymbolicSize{"keys"};
+    auto W_ = SymbolicSize{"score_width"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
     TensorMatcher({R_, HQ_, kD}).with_dtype<uint8_t>().with_device(device).with_strides({-1, kD, 1}).verify(q);
@@ -774,11 +861,15 @@ struct QsaPrefillTopk {
     TensorMatcher({R_}).with_dtype<int32_t>().with_device(device).with_strides({1}).verify(starts);
     TensorMatcher({R_}).with_dtype<int32_t>().with_device(device).with_strides({1}).verify(ends);
     TensorMatcher({R_, kTopK}).with_dtype<int32_t>().with_device(device).with_strides({kTopK, 1}).verify(out);
-    TensorMatcher({R_, kCapacity}).with_dtype<int64_t>().with_device(device).with_strides({kCapacity, 1}).verify(cand);
+    auto CS_ = SymbolicSize{"cand_stride"};
+    TensorMatcher({R_, CS_}).with_dtype<int64_t>().with_device(device).with_strides({CS_, 1}).verify(cand);
     TensorMatcher({R_, kWorkStride}).with_dtype<int32_t>().with_device(device).with_strides({kWorkStride, 1}).verify(work);
+    TensorMatcher({R_, W_}).with_dtype<float>().with_device(device).with_strides({-1, 1}).verify(scores);
     const int64_t rows = R_.unwrap();
     RuntimeCheck(HQ_.unwrap() >= kHeads, "q needs at least 4 heads");
-    RuntimeCheck(splits >= 1 && splits <= 1024, "splits must be in [1, 1024]");
+    RuntimeCheck(splits >= 1 && splits <= kMaxSplits, "splits must be in [1, 64]");
+    const int64_t split_cap = splits == 1 ? kCapacity : CS_.unwrap() / splits;
+    RuntimeCheck(CS_.unwrap() >= kCapacity && split_cap >= 32, "candidate rows must hold the top-k capacity");
     RuntimeCheck(
         reinterpret_cast<uintptr_t>(q.data_ptr()) % 4 == 0 && q.stride(0) % 4 == 0, "q rows must be 4-byte aligned");
     RuntimeCheck(reinterpret_cast<uintptr_t>(k.data_ptr()) % 16 == 0, "keys must be 16-byte aligned");
@@ -791,10 +882,14 @@ struct QsaPrefillTopk {
         .out = static_cast<int32_t*>(out.data_ptr()),
         .cand = static_cast<uint64_t*>(cand.data_ptr()),
         .work = static_cast<uint32_t*>(work.data_ptr()),
+        .scores = W_.unwrap() > 0 ? static_cast<float*>(scores.data_ptr()) : nullptr,
         .stride_q = q.stride(0),
+        .score_stride = W_.unwrap() > 0 ? scores.stride(0) : 0,
+        .cand_stride = CS_.unwrap(),
         .rows = static_cast<int32_t>(rows),
         .keys = static_cast<int32_t>(N_.unwrap()),
         .splits = static_cast<int32_t>(splits),
+        .split_cap = static_cast<int32_t>(split_cap),
     };
     const uint32_t tiles = static_cast<uint32_t>((rows + kRows - 1) / kRows);
     const dim3 split_grid(tiles, static_cast<uint32_t>(splits), 2);
@@ -815,7 +910,7 @@ struct QsaPrefillTopk {
         device.unwrap(),
         kPickWarps * kPickBytes)
         .enable_pdl(kUsePDL)(pick, params);
-    LaunchKernel(dim3(tiles, 1, 2), kThreads, device.unwrap(), kExactSmem).enable_pdl(kUsePDL)(exact, params);
+    LaunchKernel(min(tiles, static_cast<uint32_t>(runtime::get_sm_count(device.unwrap().device_id))), kThreads, device.unwrap(), kExactSmem).enable_pdl(kUsePDL)(exact, params);
   }
 };
 

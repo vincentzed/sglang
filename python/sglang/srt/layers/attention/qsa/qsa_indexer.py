@@ -58,7 +58,7 @@ def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
 _QSA_PREFILL_SELECT_MIN_ROWS = 8192
 
 
-_QSA_PREFILL_TOPK_MIN_ROWS_OR_KEYS = 8192
+_QSA_PREFILL_TOPK_MIN_SCORES = 1 << 23
 
 
 def _use_cuda_prefill_topk(
@@ -70,7 +70,7 @@ def _use_cuda_prefill_topk(
     row_keys = compressed_keys.shape[0] if max_row_keys is None else max_row_keys
     return (
         envs.SGLANG_ENABLE_QSA_PREFILL_TOPK_CUDA.get()
-        and max(q.shape[0], row_keys) > _QSA_PREFILL_TOPK_MIN_ROWS_OR_KEYS
+        and q.shape[0] * row_keys >= _QSA_PREFILL_TOPK_MIN_SCORES
         and q.is_cuda
         and is_sm100_supported()
         and q.dtype == torch.float8_e4m3fn

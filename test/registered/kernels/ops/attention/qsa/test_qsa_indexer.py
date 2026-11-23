@@ -3,7 +3,6 @@ up to rare last-ulp RMSNorm flips (see assert_bit_comparable). With an fp8
 indexer cache the same rows are cast to e4m3 at the store, so a bf16 last-ulp
 flip may move the e4m3 code by one step (see assert_fp8_within_one_ulp)."""
 
-import math
 from types import SimpleNamespace
 
 import pytest
@@ -498,21 +497,18 @@ def test_cuda_prefill_select_picks_topk_of_tilelang_scores(monkeypatch):
     assert longer_than_topk > 0, "no row exercises the top-k cut"
 
 
-def test_cuda_prefill_topk_is_exact_topk_of_raw_scores(monkeypatch):
-    """The fused CUDA prefill top-k returns, per row, exactly the 512 best raw head
-    sums (ties at the cut to the lower key index) of the decode kernel's mma chain,
-    whose scaled scores equal TileLang's; rows that fit the top-k get 0..len-1, -1."""
+def test_cuda_prefill_topk_is_exact_topk_of_its_scores(monkeypatch):
+    """The fused CUDA prefill top-k returns, per row, exactly the 512 best of the
+    raw head sums it scores (ties at the cut to the lower key index); those sums
+    match SGLang's decode scoring chain to fp32 rounding, and rows that fit the
+    top-k get 0..len-1, then -1."""
     from sglang.kernels.ops.attention import qsa_prefill_topk as topk_module
     from sglang.kernels.ops.attention.qsa_index_score import qsa_index_score_decode
     from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
-    from sglang.srt.layers.attention.qsa.mqa import (
-        HAS_TILELANG,
-        tilelang_qsa_mqa_prefill,
-    )
     from sglang.srt.utils.device import is_sm100_supported
 
-    if not HAS_TILELANG or not is_sm100_supported():
-        pytest.skip("needs TileLang and an SM100 GPU")
+    if not is_sm100_supported():
+        pytest.skip("needs an SM100 GPU")
     device = torch.device("cuda")
     q, k, starts, ends, width = _packed_prefill_case(
         [704, 3008, 1504, 9008], 37, device, torch.float8_e4m3fn, seed=7, empty_rows=True
@@ -526,6 +522,7 @@ def test_cuda_prefill_topk_is_exact_topk_of_raw_scores(monkeypatch):
     reference = QSAIndexer.select_prefill_tokens(*args, max_row_keys=width)
 
     monkeypatch.setenv("SGLANG_ENABLE_QSA_PREFILL_TOPK_CUDA", "1")
+    monkeypatch.setattr(qsa_indexer_module, "_QSA_PREFILL_TOPK_MIN_SCORES", 1)
     calls = []
     cuda_topk = topk_module.qsa_prefill_topk
     monkeypatch.setattr(
@@ -533,7 +530,8 @@ def test_cuda_prefill_topk_is_exact_topk_of_raw_scores(monkeypatch):
     )
     full = QSAIndexer.select_prefill_tokens(*args, max_row_keys=width)
     assert len(calls) == 1
-    blocks = cuda_topk(q, k, starts, ends)
+    own = torch.zeros(q.shape[0], width, dtype=torch.float32, device=device)
+    blocks = cuda_topk(q, k, starts, ends, 0, own)
     for splits in (1, 7):
         again = cuda_topk(q, k, starts, ends, splits)
         assert torch.equal(blocks.sort(1).values, again.sort(1).values)
@@ -542,33 +540,29 @@ def test_cuda_prefill_topk_is_exact_topk_of_raw_scores(monkeypatch):
     page_table = (
         starts[:, None] // 16 + torch.arange(pages, device=device, dtype=torch.int32)
     ).contiguous()
-    raw = torch.zeros(q.shape[0], pages * 16, dtype=torch.float32, device=device)
+    chain = torch.zeros(q.shape[0], pages * 16, dtype=torch.float32, device=device)
     qsa_index_score_decode(
-        q, k.view(-1, 16 * HEAD_DIM), page_table, lengths.int(), raw, 1.0
+        q, k.view(-1, 16 * HEAD_DIM), page_table, lengths.int(), chain, 1.0
     )
-    scaled = tilelang_qsa_mqa_prefill(q, k, starts, ends)
     over_topk = 0
     for row in range(q.shape[0]):
-        start, length = int(starts[row]), int(lengths[row])
+        length = int(lengths[row])
         if length <= indexer.block_topk:
             expect = torch.arange(512, device=device, dtype=torch.int32)
             assert torch.equal(blocks[row], torch.where(expect < length, expect, -1))
             assert torch.equal(full[row], reference[row]), row
             continue
-        row_raw = raw[row, :length]
-        assert torch.equal(
-            row_raw / math.sqrt(HEAD_DIM), scaled[row, start : start + length]
-        ), row
-        cut = torch.topk(row_raw, indexer.block_topk).values[-1]
-        above = torch.nonzero(row_raw > cut).flatten()
-        ties = torch.nonzero(row_raw == cut).flatten()
+        row_scores = own[row, :length]
+        torch.testing.assert_close(row_scores, chain[row, :length], rtol=1e-5, atol=1e-4)
+        cut = torch.topk(row_scores, indexer.block_topk).values[-1]
+        above = torch.nonzero(row_scores > cut).flatten()
+        ties = torch.nonzero(row_scores == cut).flatten()
         expect = torch.cat([above, ties[: indexer.block_topk - above.numel()]])
         assert torch.equal(blocks[row].long().sort().values, expect.sort().values), row
         picked = torch.unique(full[row][full[row] >= 0].long() // RATIO)
         assert torch.equal(picked[picked < length], expect.sort().values), row
         over_topk += 1
     assert over_topk > 0, "no row exercises the top-k cut"
-
 
 def test_prefill_max_row_keys_reads_host_lengths_only():
     """The relative logits width comes from host lengths: the prefill tuple when
