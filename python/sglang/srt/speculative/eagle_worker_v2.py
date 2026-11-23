@@ -911,6 +911,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Forward multiple steps
         scores = None
+        keep_bf16_logits = (
+            envs.SGLANG_OPT_SPEC_VERIFY_FUSION.get()
+            and draft_tokens_topk1 is not None
+            and fold is None
+            and (_is_cuda or _is_hip)
+        )
+        if keep_bf16_logits:
+            self.draft_runner.model.logits_processor.keep_decode_logits_dtype = True
         with IndexTopKShareState.mtp_iteration(
             forward_batch,
             enabled=self.index_share_for_mtp_iteration,
@@ -1011,6 +1019,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
         forward_batch.draft_step_fold = captured_fold
+        if keep_bf16_logits:
+            self.draft_runner.model.logits_processor.keep_decode_logits_dtype = False
 
         # Organize the results
         if topk1_chain_fits:

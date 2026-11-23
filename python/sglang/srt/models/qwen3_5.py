@@ -185,6 +185,7 @@ _qknorm_use_alt_stream = _is_cuda or (
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
+_gdn_verify_proj_views = _is_cuda and envs.SGLANG_OPT_SPEC_VERIFY_FUSION.get()
 _gdn_online_mxfp4 = (
     ("in_proj_qkvz", "out_proj")
     if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
@@ -1022,11 +1023,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
-            # The strided views feed only prefill GDN; DP-relabeled decode rows
-            # run the decode kernels, so pick the layout from the logical mode.
-            use_strided_prefill_z = (
-                _is_cuda or _is_hip
-            ) and forward_batch.logical_forward_mode.is_extend_without_speculative()
+            # Strided views feed prefill GDN and, opted in, target verify; pick the
+            # layout from the logical mode (DP-relabeled decode runs decode kernels).
+            use_strided_prefill_z = (_is_cuda or _is_hip) and (
+                forward_batch.logical_forward_mode.is_extend_without_speculative()
+                or (
+                    _gdn_verify_proj_views
+                    and forward_batch.forward_mode.is_target_verify()
+                )
+            )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
                 if use_strided_prefill_z

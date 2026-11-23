@@ -571,6 +571,7 @@ class LogitsProcessor(nn.Module):
         # full-vocabulary gather even when the runtime master switch is on.
         self.sharded_verify = False
         self._sharded_verify_temperature_keys = False
+        self.keep_decode_logits_dtype = False
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -1662,7 +1663,9 @@ class LogitsProcessor(nn.Module):
                 return cast_to_float32_logits(logits, logits_buffer)
             logits_buffer.copy_(logits)
             logits = logits_buffer
-        else:
+        elif not (
+            self.keep_decode_logits_dtype and logits_metadata.forward_mode.is_decode()
+        ):
             logits = logits.float()
         return logits
 

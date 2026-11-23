@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.numerics import round_bf16_to_fp32
+from sglang.srt.environ import envs
 
 _QWEN4_MAX_SHORT_CONV_STATE_LEN = 16
 
@@ -497,6 +498,139 @@ def _qwen4_verify_conv_finish_kernel(
     tl.store(output_ptr + offsets, tl.where(valid, activated + residual, 0), mask)
 
 
+@triton.jit
+def _qwen4_verify_conv_one_pass_kernel(
+    x_ptr,
+    residual_ptr,
+    weight_ptr,
+    state_ptr,
+    indices_ptr,
+    valid_ptr,
+    output_ptr,
+    intermediate_ptr,
+    state_stride0,
+    state_stride1,
+    state_stride2,
+    index_stride,
+    cache_stride0,
+    cache_stride1,
+    cache_stride2,
+    cache_stride3,
+    CHANNELS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    STATE_LEN: tl.constexpr,
+    KERNEL: tl.constexpr,
+    DILATION: tl.constexpr,
+    HAS_INTERMEDIATE: tl.constexpr,
+    CONV_PROGRAMS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    CACHE_BLOCK: tl.constexpr,
+):
+    req = tl.program_id(0)
+    pid = tl.program_id(1)
+    slot = tl.load(indices_ptr + req * index_stride)
+    if pid < CONV_PROGRAMS:
+        _qwen4_verify_conv_one_pass_rows(
+            x_ptr,
+            residual_ptr,
+            weight_ptr,
+            state_ptr + slot * state_stride0,
+            valid_ptr,
+            output_ptr,
+            state_stride1,
+            state_stride2,
+            req,
+            pid * BLOCK + tl.arange(0, BLOCK),
+            CHANNELS,
+            WIDTH,
+            STATE_LEN,
+            KERNEL,
+            DILATION,
+            BLOCK,
+        )
+    elif HAS_INTERMEDIATE and STATE_LEN > 0:
+        flat = (pid - CONV_PROGRAMS) * CACHE_BLOCK + tl.arange(0, CACHE_BLOCK)
+        mask = flat < CHANNELS * STATE_LEN
+        channel = flat // STATE_LEN
+        state_col = flat % STATE_LEN
+        for step in tl.static_range(WIDTH):
+            col = step + 1 + state_col
+            valid = tl.load(valid_ptr + req * WIDTH + step)
+            state = tl.load(
+                state_ptr
+                + slot * state_stride0
+                + channel * state_stride1
+                + col * state_stride2,
+                mask & (col < STATE_LEN),
+                other=0,
+            ).to(x_ptr.dtype.element_ty)
+            x = tl.load(
+                x_ptr + (req * WIDTH + col - STATE_LEN) * CHANNELS + channel,
+                mask & (col >= STATE_LEN),
+                other=0,
+            )
+            tl.store(
+                intermediate_ptr
+                + req * cache_stride0
+                + step * cache_stride1
+                + channel * cache_stride2
+                + state_col * cache_stride3,
+                tl.where(valid, tl.where(col < STATE_LEN, state, x), 0),
+                mask,
+            )
+
+
+@triton.jit
+def _qwen4_verify_conv_one_pass_rows(
+    x_ptr,
+    residual_ptr,
+    weight_ptr,
+    state_row_ptr,
+    valid_ptr,
+    output_ptr,
+    state_stride1,
+    state_stride2,
+    req,
+    channel,
+    CHANNELS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    STATE_LEN: tl.constexpr,
+    KERNEL: tl.constexpr,
+    DILATION: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    mask = channel < CHANNELS
+    state_base = state_row_ptr + channel * state_stride1
+    for step in tl.static_range(WIDTH):
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)
+        for tap in tl.static_range(KERNEL):
+            col = step + tap * DILATION
+            if col < STATE_LEN:
+                value = tl.load(state_base + col * state_stride2, mask, other=0).to(
+                    x_ptr.dtype.element_ty
+                )
+            else:
+                value = tl.load(
+                    x_ptr + (req * WIDTH + col - STATE_LEN) * CHANNELS + channel,
+                    mask,
+                    other=0,
+                )
+            weight = tl.load(weight_ptr + channel * KERNEL + tap, mask, other=0)
+            acc = tl.fma(weight.to(tl.float32), value.to(tl.float32), acc)
+        conv = acc.to(x_ptr.dtype.element_ty).to(tl.float32)
+        activated = round_bf16_to_fp32(conv * tl.sigmoid(conv))
+        token = req * WIDTH + step
+        residual = tl.load(residual_ptr + token * CHANNELS + channel, mask, other=0).to(
+            tl.float32
+        )
+        valid = tl.load(valid_ptr + token)
+        tl.store(
+            output_ptr + token * CHANNELS + channel,
+            tl.where(valid, activated + residual, 0),
+            mask,
+        )
+
+
 def can_fuse_qwen4_verify_conv(
     x, residual, weight, state, state_indices, valid, width, dilation, intermediate
 ):
@@ -555,6 +689,38 @@ def fused_qwen4_verify_conv(
         return output
     requests = state_indices.numel()
     channels, state_len = state.shape[1:]
+    if envs.SGLANG_OPT_SPEC_VERIFY_FUSION.get():
+        block, cache_block = 256, 1024
+        conv_programs = triton.cdiv(channels, block)
+        cache_programs = (
+            triton.cdiv(channels * state_len, cache_block)
+            if intermediate is not None
+            else 0
+        )
+        _qwen4_verify_conv_one_pass_kernel[(requests, conv_programs + cache_programs)](
+            x,
+            residual,
+            weight,
+            state,
+            state_indices,
+            valid,
+            output,
+            intermediate if intermediate is not None else x,
+            *state.stride(),
+            state_indices.stride(0),
+            *(intermediate.stride() if intermediate is not None else (0, 0, 0, 0)),
+            CHANNELS=channels,
+            WIDTH=width,
+            STATE_LEN=state_len,
+            KERNEL=weight.shape[2],
+            DILATION=dilation,
+            HAS_INTERMEDIATE=intermediate is not None,
+            CONV_PROGRAMS=conv_programs,
+            BLOCK=block,
+            CACHE_BLOCK=cache_block,
+            enable_fp_fusion=False,
+        )
+        return output
     conv_input = torch.empty(
         (requests, channels, state_len + width), dtype=x.dtype, device=x.device
     )

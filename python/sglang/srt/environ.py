@@ -1909,6 +1909,9 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # MTP verify cycle of hybrid GDN models: GDN verify reads projection views, one-pass
+    # Qwen4 PLE verify conv, wider conv-window scatter, greedy draft top-1 on BF16 logits.
+    SGLANG_OPT_SPEC_VERIFY_FUSION = EnvBool(False)
     # Which speculative decisions rank 0 broadcasts to its TP group. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
     # and numbers, each negatable with a leading "-": "all,-dspark-plan,-dspark-draft".

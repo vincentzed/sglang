@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
+from sglang.srt.environ import envs
 from sglang.srt.utils.device import get_device_core_count
 
 
@@ -542,7 +543,10 @@ def fused_conv_window_scatter_with_mask(
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
     src_indices_raw = _prepare_src_rows(src_indices_raw, step_indices_raw)
 
-    BLOCK_SIZE = 1024
+    if envs.SGLANG_OPT_SPEC_VERIFY_FUSION.get():
+        BLOCK_SIZE, num_warps = 8192, 8
+    else:
+        BLOCK_SIZE, num_warps = 1024, 4
     grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
 
     _fused_conv_window_scatter_with_mask_kernel[grid](
@@ -564,6 +568,7 @@ def fused_conv_window_scatter_with_mask(
         src_step_size,
         dst_req_size,
         BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
     )
 
 
