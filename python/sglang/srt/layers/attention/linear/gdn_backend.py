@@ -694,6 +694,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
         self._use_strided_target_verify_qkv = False
+        if envs.SGLANG_ENABLE_GDN_REPLAYSSM_VERIFY_CUDA.get() and is_cuda():
+            from sglang.kernels.ops.attention.linear.gdn_replayssm_verify_cuda import (
+                prewarm_gdn_replayssm_verify_cuda,
+            )
+
+            prewarm_gdn_replayssm_verify_cuda()
         # A prefill batch never holds more requests than the pool.
         self.prefill_graph_max_seqs = min(
             self.req_to_token_pool.size, envs.SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS.get()
@@ -1959,6 +1965,45 @@ class GDNAttnBackend(MambaAttnBackendBase):
         d_cache = layer_cache.replayssm_d  # [slots, HV, L, V]
         max_cache_len = d_cache.shape[-2]  # ring length L
         out = q.new_empty(seq_len, HV, V)
+        if envs.SGLANG_ENABLE_GDN_REPLAYSSM_VERIFY_CUDA.get():
+            from sglang.kernels.ops.attention.linear.gdn_replayssm_verify_cuda import (
+                gdn_replayssm_verify_cuda,
+                gdn_replayssm_verify_cuda_supported,
+            )
+
+            verify_args = dict(
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                A_log=layer.A_log.detach(),
+                dt_bias=layer.dt_bias.detach(),
+                checkpoint_state=layer_cache.temporal,
+                d_cache=d_cache,
+                k_cache=layer_cache.replayssm_k,
+                g_cache=layer_cache.replayssm_g,
+                d_residual_cache=layer_cache.replayssm_rawv,
+                k_residual_cache=layer_cache.replayssm_rawk,
+                query_start_loc=query_start_loc,
+                ssm_state_indices=cache_indices,
+                replay_indices=replay_indices,
+                write_pos=mamba_pool.replayssm_spec_write_pos,
+                cache_base=mamba_pool.replayssm_cache_base,
+            )
+            if gdn_replayssm_verify_cuda_supported(
+                **verify_args,
+                beta_cache=layer_cache.replayssm_beta,
+                max_spec_len=draft_token_num,
+            ):
+                gdn_replayssm_verify_cuda(
+                    **verify_args,
+                    out=out,
+                    is_flush=mamba_pool.replayssm_is_flush,
+                    scale=K**-0.5,
+                    null_block_id=-1,
+                )
+                return out.reshape(value.shape)
         gdn_replayssm_spec_decode(
             q=q,
             k=k,
