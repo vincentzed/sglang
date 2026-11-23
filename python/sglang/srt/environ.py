@@ -2031,6 +2031,9 @@ class Envs:
     # Sequences a captured GDN extend bucket accepts (at most the request pool); a
     # larger prefill batch runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # GDN ReplaySSM target verify on SM100 with a bf16 checkpoint and the compact
+    # bf16 ring: a tcgen05 CUDA kernel instead of the Triton kernel.
+    SGLANG_ENABLE_GDN_REPLAYSSM_VERIFY_CUDA = EnvBool(False)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls
