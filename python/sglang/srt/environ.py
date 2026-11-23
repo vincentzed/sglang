@@ -936,9 +936,6 @@ class Envs:
     # Opt-in: the per-path Mamba state cap also counts HiCache host copies, and a
     # capped state loses its host copy too. Off (default) caps device states only.
     SGLANG_MAMBA_PATH_CAP_COUNTS_HOST = EnvBool(False)
-    # Write-back eviction demotes without a host wait for its copies: the streams that
-    # next touch the freed pages or their host copies wait on them instead.
-    SGLANG_OPT_HICACHE_WRITE_BACK_ORDERED_DEMOTE = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
