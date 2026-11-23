@@ -2105,6 +2105,10 @@ macro_rules! tree_core_methods {
                 py.detach(|| self.core().set_mamba_path_cap_counts_host(enabled));
             }
 
+            fn set_mamba_path_cap_grid(&self, py: Python<'_>, grid: usize) {
+                py.detach(|| self.core().set_mamba_path_cap_grid(grid));
+            }
+
             /// The current write-back (vs write-through) policy.
             fn is_write_back(&self, py: Python<'_>) -> bool {
                 self.core_attached(py).is_write_back()
@@ -3480,6 +3484,14 @@ macro_rules! tree_core_binding {
             fn set_mamba_path_cap_counts_host(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
                 catch_native_panic(|| {
                     self.inner.set_mamba_path_cap_counts_host(py, enabled);
+                    Ok(())
+                })
+            }
+
+            /// Keep the deepest Mamba state of each `grid`-token span past the path cap.
+            fn set_mamba_path_cap_grid(&self, py: Python<'_>, grid: usize) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_mamba_path_cap_grid(py, grid);
                     Ok(())
                 })
             }

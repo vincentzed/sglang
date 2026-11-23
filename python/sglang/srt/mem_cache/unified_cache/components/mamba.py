@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -82,6 +83,8 @@ class MambaComponent(TreeComponent):
     # Class-level defaults (nothing parked) for instances built without __init__.
     _parked: Sequence = ()
     _step = 0
+    path_cap_grid = 0
+    _path_cap_grid_applied = 0
 
     def __init__(
         self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
@@ -119,6 +122,8 @@ class MambaComponent(TreeComponent):
         )
 
         self.host_only_checkpoint = host_only_mamba_checkpoint()
+        self.path_cap_grid = envs.SGLANG_MAMBA_PATH_CAP_GRID.get()
+        self._path_cap_grid_applied = 0
         # (scheduler step, tracking slot, copy done event) of finished requests'
         # checkpoints still being copied to host; see reap_parked_slots.
         self._parked: list = []
@@ -514,7 +519,9 @@ class MambaComponent(TreeComponent):
         and device leaves are preserved, so the cap is a best-effort soft
         limit. Freed slots are collected into the caller's dicts. With
         ``mamba_path_cap_counts_host``, host copies count toward the cap too and
-        a capped state loses its host copy unless it is locked or in flight.
+        a capped state loses its host copy unless it is locked or in flight. With
+        ``mamba_path_cap_grid``, the deepest state of each grid span below the
+        tail is kept on top of the cap.
         """
         cap = self.mamba_max_states_per_path
         if cap < 0:
@@ -522,16 +529,29 @@ class MambaComponent(TreeComponent):
 
         ct = self.component_type
         count_host = self.tree_core.mamba_path_cap_counts_host
+        grid = self.tree_core.mamba_path_cap_grid
         host_holders = self._mamba_host_only_checkpoint() or count_host
+        path = []
         holders = []
         node = tail
         while node is not None and node is not self.tree_core.root_node:
+            path.append(node)
             cd = node.component_data[ct]
             if cd.value is not None or (host_holders and cd.host_value is not None):
                 holders.append(node)
             node = node.parent
 
-        excess = len(holders) - cap
+        grid_kept = set()
+        if grid > 0:
+            depth = sum(len(node.key) for node in path)
+            last_span = None
+            for node in path:
+                if node is not tail and node in holders and depth // grid != last_span:
+                    last_span = depth // grid
+                    grid_kept.add(node)
+                depth -= len(node.key)
+
+        excess = len(holders) - cap - len(grid_kept)
         if excess <= 0:
             return
 
@@ -539,6 +559,8 @@ class MambaComponent(TreeComponent):
         for node in reversed(holders):
             if excess <= 0 or node is tail:
                 break
+            if node in grid_kept:
+                continue
             cd = node.component_data[ct]
             has_device = cd.value is not None
             if cd.lock_ref > 0 or len(node.children) != 1:
@@ -1574,6 +1596,18 @@ class MambaComponent(TreeComponent):
         if enabled:
             host_lru.cursor_end()
 
+    def _update_path_cap_grid(self) -> None:
+        host_pool = self._mamba_pool_host
+        roomy = (
+            host_pool is not None
+            and host_pool.available_size()
+            >= envs.SGLANG_MAMBA_PATH_CAP_GRID_MIN_FREE.get() * host_pool.size
+        )
+        grid = self.path_cap_grid if roomy else 0
+        if grid != self._path_cap_grid_applied:
+            self.tree_core.set_mamba_path_cap_grid(grid)
+            self._path_cap_grid_applied = grid
+
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
         if self._mamba_pool_host is None:
             return
@@ -1582,6 +1616,8 @@ class MambaComponent(TreeComponent):
 
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, MambaEvictExcessPathStates):
+            if self.path_cap_grid > 0:
+                self._update_path_cap_grid()
             result = BaseEvictionResult()
             # Drain even if the walk raises so tombstoned slots are not leaked;
             # the walk runs behind the tree-core interface (Rust runs it natively).

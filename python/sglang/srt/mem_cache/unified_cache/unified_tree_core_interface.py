@@ -647,6 +647,12 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def set_mamba_path_cap_grid(self, grid: int) -> None:
+        """Keep the deepest Mamba state of each ``grid``-token span past the path
+        cap; 0 keeps none."""
+        ...
+
+    @abstractmethod
     def insert_host(
         self,
         node_id: NodeId,

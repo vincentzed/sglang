@@ -2567,6 +2567,26 @@ fn evict_excess_path_states_removes_the_shallowest_states_beyond_the_cap() {
 }
 
 #[test]
+fn evict_excess_path_states_keeps_the_deepest_state_of_each_grid_span() {
+    // States at depths 1..6. The two deepest end inside the last grid span; a
+    // request that rewrites that span needs a state at depth <= 4.
+    for (grid, kept) in [(0, vec![4, 5]), (4, vec![2, 3, 4, 5])] {
+        let mut tc = mamba_core_with_cap(2);
+        tc.set_mamba_path_cap_grid(grid);
+        let nodes = chain::<6>(&mut tc);
+        for (slot, &node) in nodes.iter().enumerate() {
+            set_mamba_device(&mut tc, node, slot as i64);
+        }
+        tc.evict_excess_path_states(tc.arena.node(nodes[5]).id)
+            .expect("live test node");
+        let survivors: Vec<usize> = (0..6)
+            .filter(|&i| tc.arena.node(nodes[i]).try_device_value(MAMBA).is_some())
+            .collect();
+        assert_eq!(survivors, kept, "grid {grid}");
+    }
+}
+
+#[test]
 fn evict_excess_path_states_preserves_forks_locked_nodes_and_the_tail() {
     let mut tc = mamba_core_with_cap(1);
     let [a, b, c] = chain::<3>(&mut tc);

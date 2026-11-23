@@ -936,6 +936,11 @@ class Envs:
     # Opt-in: the per-path Mamba state cap also counts HiCache host copies, and a
     # capped state loses its host copy too. Off (default) caps device states only.
     SGLANG_MAMBA_PATH_CAP_COUNTS_HOST = EnvBool(False)
+    # Opt-in: the per-path Mamba state cap also keeps the deepest state of every span
+    # of this many tokens on the path, while at least the given fraction of the
+    # host Mamba pool is free. 0 (default) keeps only the cap.
+    SGLANG_MAMBA_PATH_CAP_GRID = EnvInt(0)
+    SGLANG_MAMBA_PATH_CAP_GRID_MIN_FREE = EnvFloat(0.15)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)

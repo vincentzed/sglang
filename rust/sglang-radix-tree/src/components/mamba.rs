@@ -491,30 +491,54 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             return;
         };
         let count_host = tree_core.mamba_path_cap_counts_host;
-        // Mamba-value holders on the root path, tail-first.
-        let mut holders: Vec<NodeIdx_> = Vec::new();
+        let grid = tree_core.mamba_path_cap_grid;
+        let mut path: Vec<NodeIdx_> = Vec::new();
         let mut cursor = Some(tail_node_id);
         while let Some(node_id) = cursor {
             let node = tree_core.arena.node(node_id);
             if node.is_root() {
                 break;
             }
+            path.push(node_id);
+            cursor = node.parent;
+        }
+        // Mamba-value holders on the root path with their depths, tail-first.
+        let mut depth: usize = path
+            .iter()
+            .map(|&node_id| tree_core.arena.node(node_id).key.atom_len())
+            .sum();
+        let mut holders: Vec<(NodeIdx_, usize)> = Vec::new();
+        for &node_id in &path {
+            let node = tree_core.arena.node(node_id);
             let host_holder =
                 (self.mamba_host_only_checkpoint || count_host) && node.has_host_value(MAMBA);
             if node.has_device_value(MAMBA) || host_holder {
-                holders.push(node_id);
+                holders.push((node_id, depth));
             }
-            cursor = node.parent;
+            depth -= node.key.atom_len();
         }
-        let mut excess = holders.len().saturating_sub(cap);
+        let mut grid_kept: Vec<NodeIdx_> = Vec::new();
+        if grid > 0 {
+            let mut last_span = None;
+            for &(node_id, depth) in holders.iter().skip(1) {
+                if last_span != Some(depth / grid) {
+                    last_span = Some(depth / grid);
+                    grid_kept.push(node_id);
+                }
+            }
+        }
+        let mut excess = holders.len().saturating_sub(cap + grid_kept.len());
         if excess == 0 {
             return;
         }
         // Cache-level apply: the counts are not reported, only the frees.
         let mut tracker: HashMap<ComponentType, usize> = HashMap::new();
-        for &node_id in holders.iter().rev() {
+        for &(node_id, _) in holders.iter().rev() {
             if excess == 0 || node_id == tail_node_id {
                 break;
+            }
+            if grid_kept.contains(&node_id) {
+                continue;
             }
             let node = tree_core.arena.node(node_id);
             let has_device = node.has_device_value(MAMBA);
