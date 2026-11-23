@@ -673,6 +673,7 @@ def tilelang_qsa_mqa_prefill_relative(
 # CTAs per decode row: few enough levels to bound the TileLang specializations, and
 # a grid of about four waves (at least one CTA per row).
 _DECODE_CTAS_PER_ROW_LEVELS = (1, 16, 256)
+_QSA_INDEX_SCORE_SM100_MIN_REQUESTS = 64
 
 
 @functools.lru_cache(maxsize=None)
@@ -818,21 +819,31 @@ def cuda_qsa_mqa_decode(
     ``tilelang_qsa_mqa_decode``. The ``rows_per_request`` consecutive rows of a
     request are scored against the pages of its last (longest) row."""
 
-    from sglang.kernels.ops.attention.qsa_index_score import qsa_index_score_decode
+    from sglang.kernels.ops.attention.qsa_index_score import (
+        qsa_index_score_decode,
+        qsa_index_score_decode_sm100,
+    )
 
     _validate_decode_inputs(q, k_cache, page_table, context_lens)
     logits = _decode_logits(q, max_model_len, min_scored_len)
     if not q.shape[0] or not max_model_len:
         return logits
     grouped = 1 <= rows_per_request <= 4 and q.shape[0] % rows_per_request == 0
-    qsa_index_score_decode(
+    group_rows = rows_per_request if grouped else 1
+    score = (
+        qsa_index_score_decode_sm100
+        if envs.SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_SM100.get()
+        and -(-q.shape[0] // group_rows) >= _QSA_INDEX_SCORE_SM100_MIN_REQUESTS
+        else qsa_index_score_decode
+    )
+    score(
         q.contiguous(),
         k_cache.contiguous(),
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),
         context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
         logits,
         float(score_scale or math.sqrt(q.shape[-1])),
-        group_rows=rows_per_request if grouped else 1,
+        group_rows=group_rows,
         min_scored_len=min_scored_len,
     )
     return logits

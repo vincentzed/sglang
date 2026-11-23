@@ -724,6 +724,114 @@ def test_cuda_decode_scoring_equals_tilelang(rows_per_request, monkeypatch):
     assert len(cuda_calls) == 2
 
 
+def _e4m3_codes(shape, device, generator):
+    """Every finite e4m3 code (the NaN codes 0x7f / 0xff excluded), uniformly."""
+    codes = torch.randint(0, 254, shape, device=device, generator=generator)
+    return (codes + (codes >= 127).int()).to(torch.uint8).view(torch.float8_e4m3fn)
+
+
+@pytest.mark.parametrize("rows_per_request", [1, 3, 4])
+def test_sm100_decode_scoring_is_bit_identical_to_cuda(rows_per_request, monkeypatch):
+    """With SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_SM100 the tcgen05 scorer writes the
+    CUDA kernel's fp32 values bit for bit, and only where the CUDA kernel writes:
+    every e4m3 code, products of +-448 that cancel, denormals next to large values,
+    zero queries; rows that fit k, lengths that end mid-page or mid-tile, a full
+    page table, and a request count that leaves a partial last group."""
+    from sglang.kernels.ops.attention import qsa_index_score
+    from sglang.kernels.ops.attention.qsa_index_score import (
+        qsa_index_score_decode,
+        qsa_index_score_decode_sm100,
+    )
+    from sglang.srt.layers.attention.qsa import mqa
+    from sglang.srt.utils.device import is_sm100_supported
+
+    if not is_sm100_supported():
+        pytest.skip("needs an SM100 GPU")
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device).manual_seed(29)
+    torch.manual_seed(29)
+    requests, max_pages, page_size, pool = 21, 640, 16, 3000
+    max_model_len = max_pages * page_size
+    base = torch.randint(4 * 600, 4 * max_model_len - 8, (requests,))
+    base[:6] = torch.tensor(
+        [300, 2048, 2051, 4 * 2048 + 5, 4 * 2176 - 9, 4 * max_model_len - 4]
+    )
+    seq_lens = (base[:, None] + torch.arange(1, rows_per_request + 1)).reshape(-1)
+    lens = (seq_lens // RATIO).to(device=device, dtype=torch.int32)
+    rows = lens.numel() - (rows_per_request - 1)
+    lens = lens[:rows].contiguous()
+    page_table = (
+        torch.randint(0, pool, (requests, max_pages), device=device, dtype=torch.int32)
+        .repeat_interleave(rows_per_request, dim=0)[:rows]
+        .contiguous()
+    )
+    keys = _e4m3_codes((pool, page_size, 1, HEAD_DIM), device, gen)
+    keys[: pool // 3] = (
+        (
+            torch.randn(pool // 3, page_size, 1, HEAD_DIM, device=device, generator=gen)
+            * 64
+        )
+        .clamp(-448, 448)
+        .to(torch.float8_e4m3fn)
+    )
+    tiny = (
+        torch.rand(keys[pool // 3 : 2 * pool // 3].shape, device=device, generator=gen)
+        < 0.9
+    )
+    keys[pool // 3 : 2 * pool // 3] = torch.where(
+        tiny,
+        torch.randn(tiny.shape, device=device, generator=gen) * 2.0**-8,
+        torch.randn(tiny.shape, device=device, generator=gen) * 200,
+    ).to(torch.float8_e4m3fn)
+    q = torch.zeros(rows, 8, HEAD_DIM, device=device, dtype=torch.float8_e4m3fn)
+    q[:, :NUM_Q_HEADS] = _e4m3_codes((rows, NUM_Q_HEADS, HEAD_DIM), device, gen)
+    q[: rows // 2, :NUM_Q_HEADS] = (
+        (
+            torch.randn(rows // 2, NUM_Q_HEADS, HEAD_DIM, device=device, generator=gen)
+            * 64
+        )
+        .clamp(-448, 448)
+        .to(torch.float8_e4m3fn)
+    )
+    q[::5] = 0
+    for min_scored_len in (0, 512):
+        want = torch.full(
+            (rows, max_model_len), 0x7FBADBAD, dtype=torch.int32, device=device
+        )
+        got = want.clone()
+        args = (q, keys, page_table, lens)
+        kwargs = dict(group_rows=rows_per_request, min_scored_len=min_scored_len)
+        qsa_index_score_decode(*args, want.view(torch.float32), HEAD_DIM**0.5, **kwargs)
+        qsa_index_score_decode_sm100(
+            *args, got.view(torch.float32), HEAD_DIM**0.5, **kwargs
+        )
+        assert torch.equal(got, want)
+    monkeypatch.setenv("SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_CUDA", "1")
+    monkeypatch.setenv("SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_SM100", "1")
+    monkeypatch.setattr(mqa, "_QSA_INDEX_SCORE_SM100_MIN_REQUESTS", 1)
+    sm100_calls = []
+    monkeypatch.setattr(
+        qsa_index_score,
+        "qsa_index_score_decode_sm100",
+        lambda *a, **k: sm100_calls.append(1) or qsa_index_score_decode_sm100(*a, **k),
+    )
+    out = mqa.qsa_mqa_decode(
+        q,
+        keys,
+        page_table,
+        lens,
+        max_model_len,
+        min_scored_len=512,
+        rows_per_request=rows_per_request,
+        num_query_heads=NUM_Q_HEADS,
+    )
+    scored = (torch.arange(max_model_len, device=device) < lens[:, None]) & (
+        lens[:, None] > 512
+    )
+    assert torch.equal(out.view(torch.int32)[scored], got.view(torch.int32)[scored])
+    assert len(sm100_calls) == 1
+
+
 def _exact_decode_topk(logits, lens, topk=512):
     """Per row: every score above the topk-th largest, then the lowest indices among
     ties at it, ordered by the fp32 bit pattern as fast_topk orders it."""

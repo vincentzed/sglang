@@ -396,6 +396,20 @@ struct TCGen05 : TCGen05Common {
         : "memory");
   }
 
+  /// The same with A (128 lanes x K / 2 columns, two f16 per 32-bit column, the lower k in the low half) from TMEM.
+  SGL_DEVICE static void
+  mma_f16_ts(uint32_t taddr_d, uint32_t taddr_a, uint64_t bdesc, uint32_t idesc, uint32_t accumulate) {
+    asm volatile(
+        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::%5.kind::f16 [%0], [%1], %2, %3, p;\n\t}" ::"r"(taddr_d),
+        "r"(taddr_a),
+        "l"(bdesc),
+        "r"(idesc),
+        "r"(accumulate),
+        "n"(kCtaGroup)
+        : "memory");
+  }
+
   // ---- unscaled MMA (kind::f8f6f4) ----------------------------------------
 
   /// D [+]= A x B with A and B from smem; `idesc` is an InstrDesc.

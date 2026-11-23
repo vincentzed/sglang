@@ -30,6 +30,7 @@ def _jit_qsa_index_score_module() -> Module:
         cuda_files=["attention/qsa_index_score.cuh"],
         cuda_wrappers=[
             ("decode", f"QsaIndexScoreDecode<{args}>::run"),
+            ("decode_sm100", f"QsaIndexScoreDecodeSm100<{args}>::run"),
             ("decode_topk", f"QsaDecodeTopk<{args}>::run"),
         ],
     )
@@ -70,6 +71,31 @@ def qsa_index_score_decode(
         group_rows,
         min_scored_len,
         _decode_splits(groups, q.device),
+    )
+
+
+def qsa_index_score_decode_sm100(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    lens: torch.Tensor,
+    logits: torch.Tensor,
+    scale: float,
+    *,
+    group_rows: int = 1,
+    min_scored_len: int = 0,
+) -> None:
+    """``qsa_index_score_decode`` on SM100 / SM103 with tcgen05: the same values
+    bit for bit."""
+    _jit_qsa_index_score_module().decode_sm100(
+        q.view(torch.uint8),
+        k_cache.view(torch.uint8).view(k_cache.shape[0], -1),
+        page_table,
+        lens,
+        logits,
+        float(scale),
+        group_rows,
+        min_scored_len,
     )
 
 
