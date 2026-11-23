@@ -252,6 +252,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     # extend() gathers each request's state by pool index and scatters the
     # final state back the same way, so any slot pitch works.
     extend_honors_slot_pitch = True
+    accepts_normalized_qk = True
     _joint_qk_l2norm: bool = False
 
     def __init__(self):
@@ -578,9 +579,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
 
-        q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(
-            q[0], k[0], v[0], joint_qk=self._joint_qk_l2norm
-        )
+        if kwargs.get("qk_normalized"):
+            q_fi, k_fi, v_fi = q[0], k[0], v[0]
+        else:
+            q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(
+                q[0], k[0], v[0], joint_qk=self._joint_qk_l2norm
+            )
 
         output = kwargs.get("output")
         output_fi = None

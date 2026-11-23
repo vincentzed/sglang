@@ -21,6 +21,9 @@ class LinearAttnKernelBase(ABC):
     # g/beta as None and skip the separate gating launch.
     defers_prefill_gates: bool = False
 
+    # True when extend() takes qk_normalized=True: q and k arrive l2-normalized.
+    accepts_normalized_qk: bool = False
+
     # True when extend() honors the fp32 track snapshot (track_state /
     # track_chunk_idx), natively or by routing tracked batches to a kernel
     # that does. KDAAttnBackend asserts this before allocating the snapshot
