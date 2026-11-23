@@ -211,6 +211,10 @@ class FlashInferGatedResidual(nn.Module):
         self._up_loaded = False
         self._initial_load_done = False
         self._runtime = None
+        self._ws_mix = (
+            envs.SGLANG_ENABLE_HC_SUM_WS_MIX.get() and not self._deterministic
+        )
+        self._ws_gamma = None
         self._bind_views()
         self.register_load_state_dict_pre_hook(_before_state_dict_load)
 
@@ -260,6 +264,7 @@ class FlashInferGatedResidual(nn.Module):
         if self._storage_key() != storage:
             # The plan holds the old storage; bind the moved weights anew.
             self._runtime = None
+            self._ws_gamma = None
         return module
 
     def _reject_after_initial_load(self) -> None:
@@ -361,6 +366,10 @@ class FlashInferGatedResidual(nn.Module):
             rms_eps=self.config.rms_norm_eps,
         )
         self._runtime = api.HCSumRuntime(plan, deterministic=self._deterministic)
+        if self._ws_mix:
+            from sglang.kernels.ops.gemm.hc_sum_ws import hc_gamma
+
+            self._ws_gamma = hc_gamma(self._packed_norm)
 
     def mix(self, residual: torch.Tensor, prepared=None):
         """The mixed input and the HCApplyContext of ``residual``. ``prepared``
@@ -374,7 +383,33 @@ class FlashInferGatedResidual(nn.Module):
                     "precompile_kernels_after_loading) before CUDA graph capture"
                 )
             self.bind()
+        if self._ws_mix:
+            from sglang.kernels.ops.gemm.hc_sum_ws import hc_sum_ws_supported
+
+            if hc_sum_ws_supported(residual):
+                return self._ws_mix_call(residual, prepared)
         return self._runtime.mix(residual, prepared)
+
+    def _ws_mix_call(self, residual: torch.Tensor, prepared):
+        from sglang.kernels.ops.gemm.hc_sum_ws import hc_sum_ws_mix
+
+        plan = self._runtime.plan
+        if prepared is not None and prepared.matches(residual):
+            sums = prepared.sum_sq
+        else:
+            sums = plan.bootstrap(residual)
+        mixed, alpha, next_sums = hc_sum_ws_mix(
+            residual,
+            sums,
+            plan.packed_down,
+            plan.up,
+            self._ws_gamma,
+            plan.rms_eps,
+        )
+        context = _flashinfer_hc().HCApplyContext(
+            residual, alpha, torch.empty_like(residual), next_sums, None, None, sums
+        )
+        return mixed, context
 
 
 def _before_state_dict_load(module, state_dict, prefix, *_):

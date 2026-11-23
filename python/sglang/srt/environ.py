@@ -312,6 +312,9 @@ class Envs:
     # model construction; requires an HC-enabled FlashInfer build and rejects
     # online weight updates.
     SGLANG_ENABLE_FLASHINFER_HC_SUM = EnvBool(False)
+    # With SGLANG_ENABLE_FLASHINFER_HC_SUM, run the Up product, gate and stream mean of
+    # the HC sum mix in one warp-specialized kernel (sglang.kernels.ops.gemm.hc_sum_ws).
+    SGLANG_ENABLE_HC_SUM_WS_MIX = EnvBool(False)
     # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
     # instead of gathering DP tokens for a global-TP lookup.
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
