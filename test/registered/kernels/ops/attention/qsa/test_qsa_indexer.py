@@ -437,6 +437,65 @@ def test_select_prefill_tokens_relative_matches_absolute(
     assert longer_than_topk > 0, "no row exercises the top-k cut"
 
 
+def test_cuda_prefill_select_picks_topk_of_tilelang_scores(monkeypatch):
+    """The matrix-free CUDA prefill selection returns, per row, a top-512 set of
+    the TileLang scores (any member of an exact tie at the cut), and the fast
+    top-k's output for rows that fit the top-k."""
+    from sglang.kernels.ops.attention import qsa_prefill_select as select_module
+    from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_prefill,
+    )
+    from sglang.srt.utils.device import is_sm100_supported
+
+    if not HAS_TILELANG or not is_sm100_supported():
+        pytest.skip("needs TileLang and an SM100 GPU")
+    q, k, starts, ends, width = _packed_prefill_case(
+        [700, 3000, 1500, 9000],
+        37,
+        torch.device("cuda"),
+        torch.float8_e4m3fn,
+        seed=7,
+        empty_rows=True,
+    )
+    q.view(torch.uint8)[::5] = 0
+    indexer = SimpleNamespace(token_topk=2048, compress_ratio=RATIO, block_topk=512)
+    lengths_t = (ends - starts).long()
+    seq_lens = torch.where(lengths_t > 0, lengths_t * RATIO, 2).to(torch.int32)
+    args = (indexer, q, k, starts, ends, (seq_lens - 1).long(), seq_lens)
+    reference = QSAIndexer.select_prefill_tokens(*args, max_row_keys=width)
+
+    monkeypatch.setenv("SGLANG_ENABLE_QSA_PREFILL_SELECT_CUDA", "1")
+    monkeypatch.setattr(qsa_indexer_module, "_QSA_PREFILL_SELECT_MIN_ROWS", 1)
+    cuda_calls = []
+    cuda_select = select_module.qsa_prefill_select
+    monkeypatch.setattr(
+        select_module,
+        "qsa_prefill_select",
+        lambda *a: cuda_calls.append(1) or cuda_select(*a),
+    )
+    out = QSAIndexer.select_prefill_tokens(*args, max_row_keys=width)
+    assert len(cuda_calls) == 1
+
+    scores = tilelang_qsa_mqa_prefill(q, k, starts, ends)
+    longer_than_topk = 0
+    for row in range(q.shape[0]):
+        start, length = int(starts[row]), int(lengths_t[row])
+        if length <= indexer.block_topk:
+            assert torch.equal(out[row], reference[row]), row
+            continue
+        blocks = torch.unique(out[row][out[row] >= 0].long() // RATIO)
+        assert blocks.numel() == indexer.block_topk and int(blocks[-1]) < length, row
+        row_scores = scores[row, start : start + length]
+        cut = torch.topk(row_scores, indexer.block_topk).values[-1]
+        picked = row_scores[blocks]
+        assert bool((picked >= cut).all()), row
+        assert int((picked > cut).sum()) == int((row_scores > cut).sum()), row
+        longer_than_topk += 1
+    assert longer_than_topk > 0, "no row exercises the top-k cut"
+
+
 def test_prefill_max_row_keys_reads_host_lengths_only():
     """The relative logits width comes from host lengths: the prefill tuple when
     set, else the scheduler's seq_lens_cpu; with neither it is None (the

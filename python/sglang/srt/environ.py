@@ -1482,6 +1482,9 @@ class Envs:
     # QSA (Qwen4-Exp) decode / target verify index scoring with an fp8_e4m3
     # indexer cache on SM100 in a CUDA kernel instead of the TileLang kernels.
     SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_CUDA = EnvBool(False)
+    # QSA (Qwen4-Exp) prefill block selection with an fp8_e4m3 indexer cache on
+    # SM100 in one CUDA kernel that never stores the [rows, keys] score matrix.
+    SGLANG_ENABLE_QSA_PREFILL_SELECT_CUDA = EnvBool(False)
     # The same on SM100 / SM103 with tcgen05; the tokens of a verify chain share
     # the KV reads of their request.
     SGLANG_ENABLE_QSA_SPARSE_DECODE_SM100 = EnvBool(False)
