@@ -48,8 +48,10 @@ def _jit_qsa_sparse_decode_module(stages: int, q_in_smem: bool) -> Module:
 
 
 @cache_once
-def _jit_qsa_sparse_decode_sm100_module(rows_per_cta: int, heads: int) -> Module:
-    args = make_cpp_args(rows_per_cta, heads, is_arch_support_pdl())
+def _jit_qsa_sparse_decode_sm100_module(
+    rows_per_cta: int, heads: int, fp8_pv: bool
+) -> Module:
+    args = make_cpp_args(rows_per_cta, heads, is_arch_support_pdl(), fp8_pv)
     return load_jit(
         "qsa_sparse_decode_sm100",
         *args,
@@ -130,10 +132,13 @@ def qsa_sparse_decode_sm100(
     seq_lens: torch.Tensor,
     sm_scale: float,
     rows_per_request: int = 1,
+    fp8_pv: bool = False,
 ) -> torch.Tensor:
     """``qsa_sparse_decode`` on SM100 tensor cores. Consecutive rows of a request
     (a verify chain of ``rows_per_request``) share a CTA per KV head, and the KV
-    rows they have in common, in the smallest groups that fit one CTA per SM."""
+    rows they have in common, in the smallest groups that fit one CTA per SM.
+    With ``fp8_pv`` the PV product runs on the fp8 V rows as stored, with the
+    softmax weights as two e4m3 terms scaled per head and 32 KV rows."""
     rows, q_heads, head_dim = q.shape
     kv_heads = k_cache.shape[1]
     heads = q_heads // kv_heads
@@ -155,7 +160,7 @@ def qsa_sparse_decode_sm100(
     entries = torch.empty((groups, capacity), dtype=torch.int32, device=q.device)
     counts = torch.empty(groups, dtype=torch.int32, device=q.device)
     out = torch.empty_like(q)
-    _jit_qsa_sparse_decode_sm100_module(rows_per_cta, heads).run(
+    _jit_qsa_sparse_decode_sm100_module(rows_per_cta, heads, fp8_pv).run(
         q,
         k_cache.view(torch.uint8),
         v_cache.view(torch.uint8),

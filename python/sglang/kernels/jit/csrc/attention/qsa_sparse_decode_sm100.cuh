@@ -869,9 +869,500 @@ __global__ void __launch_bounds__(kThreads, 1) attn_kernel(const __grid_constant
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
+// Block-scaled FP8 PV: V is the MMA operand as gathered, P is two e4m3 terms with a UE8M0 scale per head and 32 slots.
+template <int kRows, int kHeads>
+struct LayoutPv8 {
+  static constexpr int kReal = kRows * kHeads;
+  static constexpr int kNQ = (2 * kReal + 7) & -8;
+  static constexpr int kPer = ((kReal + 3) / 4 + 1) & -2;
+  static constexpr int kWin = kPer <= 4 ? 4 : kPer <= 8 ? 8 : 16;
+  static constexpr int kSeg = kWin;
+  static constexpr int kNP = 8 * kSeg;
+  static constexpr int kBlk = kSeg < 8 ? kSeg : 8;
+  static constexpr int kQPlane = kNQ * 128;
+  static constexpr int kOCol = 2 * kNQ;
+  static constexpr int kSfaCol = (kOCol + 2 * kNP + 3) & -4;
+  static constexpr int kSfbCol = kSfaCol + 4;
+  static constexpr int kCols = kSfbCol + 8;
+  static constexpr int kTmemCols = kCols <= 128 ? 128 : kCols <= 256 ? 256 : 512;
+  static constexpr int k = 0;
+  static constexpr int v = k + 4 * kPlane;
+  static constexpr int q = v + 6 * kPlane;
+  static constexpr int pr = q + 2 * kQPlane;
+  static constexpr int sf = pr + 2 * kTile * 128;
+  static constexpr int ent = sf + 3 * 512;
+  static constexpr int red = ent + 8 * kTile * 4;
+  static constexpr int fac = red + kNP * 16;
+  static constexpr int flag = fac + kNP * 4;
+  static constexpr int bar = flag + 24;
+  static constexpr int tmem = bar + 9 * 8;
+  static constexpr int bytes = tmem + 8;
+};
+
+SGL_DEVICE bool bar_red_or(const uint32_t id, const uint32_t threads, const bool pred) {
+  uint32_t any;
+  asm volatile(
+      "{\n.reg .pred p, q;\nsetp.ne.u32 q, %1, 0;\nbar.red.or.pred p, %2, %3, q;\nselp.u32 %0, 1, 0, p;\n}"
+      : "=r"(any)
+      : "r"(static_cast<uint32_t>(pred)), "r"(id), "r"(threads)
+      : "memory");
+  return any != 0;
+}
+
+SGL_DEVICE void cp_async_arrive_noinc(uint64_t* bar) {
+  asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(device::ptx::to_shared(bar)) : "memory");
+}
+
+// The MMA warp. Barrier 1 brackets a pass, barrier 2 = P, scales and O of tile t are written and S of tile t is read.
+// Tile g of the CTA's sequence: V in slot g % 3, K and S and P in slot g % 2.
+template <int kRows, int kHeads>
+SGL_DEVICE void issue_mmas_pv8(const int tiles, const uint32_t t_base, uint8_t* const smem) {
+  using Lay = LayoutPv8<kRows, kHeads>;
+  uint64_t* const s_bar = reinterpret_cast<uint64_t*>(smem + Lay::bar);
+  uint64_t* const qk_bar = s_bar;
+  uint64_t* const pv_bar = s_bar + 2;
+  uint64_t* const k_full = s_bar + 4;
+  uint64_t* const v_full = s_bar + 6;
+  const uint32_t* const s_more = reinterpret_cast<const uint32_t*>(smem + Lay::flag + 20);
+  const bool issuer = (threadIdx.x & 31) == 0;
+  const auto kdesc = tcgen05::make_desc_kmajor_sw128(smem + Lay::k);
+  const auto qdesc = tcgen05::make_desc_kmajor_sw128(smem + Lay::q);
+  const auto vdesc = tcgen05::make_desc_kmajor_sw128(smem + Lay::v);
+  const auto pdesc = tcgen05::make_desc_kmajor_sw128(smem + Lay::pr);
+  const uint32_t idesc_qk = tcgen05::make_instr_desc_f8<kTile, Lay::kNQ>().bits;
+  auto idesc_pv = tcgen05::make_instr_desc_mxf8<kTile, Lay::kNP>();
+  idesc_pv.bits |= (1u << 15) | (1u << 16);
+  if (issuer) {
+    tcgen05::cp_32x128b_warpx4(t_base + Lay::kSfaCol, tcgen05::make_desc_sf_chunk(smem + Lay::sf).bits);
+  }
+  int g0 = 0;
+  const auto qk = [&](const int g) {
+    if (issuer) {
+      device::ptx::mbar_wait_parity(k_full + (g & 1), (g >> 1) & 1);
+      device::ptx::fence_proxy_async_shared();
+      tcgen05::fence_after_thread_sync();
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        tcgen05::mma_f8_ss(
+            t_base + (g & 1) * Lay::kNQ,
+            kdesc.advance_bytes(((g & 1) * 2 + (i >> 2)) * kPlane + (i & 3) * 32).bits,
+            qdesc.advance_bytes((i >> 2) * Lay::kQPlane + (i & 3) * 32).bits,
+            idesc_qk,
+            i > 0);
+      }
+      tcgen05::commit(qk_bar + (g & 1));
+    }
+  };
+  do {
+    device::ptx::bar_sync(1, kThreads);
+    if (tiles > 0) qk(g0);
+    if (tiles > 1) qk(g0 + 1);
+    for (int t = 0; t < tiles; ++t) {
+      const int g = g0 + t;
+      device::ptx::bar_sync(2, kThreads);
+      if (issuer) {
+        device::ptx::mbar_wait_parity(v_full + g % 3, (g / 3) & 1);
+        device::ptx::fence_proxy_async_shared();
+        tcgen05::fence_after_thread_sync();
+        tcgen05::cp_32x128b_warpx4(
+            t_base + Lay::kSfbCol + 4 * (g & 1), tcgen05::make_desc_sf_chunk(smem + Lay::sf + 512 * (1 + (g & 1))).bits);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          const int h = i >> 2;
+          const int kk = i & 3;
+          tcgen05::mma_mxf8_ss(
+              t_base + Lay::kOCol + h * Lay::kNP,
+              vdesc.advance_bytes(((g % 3) * 2 + h) * kPlane + kk * 4096).bits,
+              pdesc.advance_bytes((g & 1) * kTile * 128 + kk * 4096).bits,
+              idesc_pv.with_sf_id(kk).bits,
+              t_base + Lay::kSfaCol,
+              t_base + Lay::kSfbCol + 4 * (g & 1),
+              t > 0 || kk > 0);
+        }
+        tcgen05::commit(pv_bar + (g & 1));
+      }
+      if (t + 2 < tiles) qk(g + 2);
+    }
+    g0 += tiles;
+    device::ptx::bar_sync(1, kThreads);
+  } while (*s_more != 0);
+}
+
+template <int kRows, int kHeads, bool kUsePDL, bool kSorted>
+__global__ void __launch_bounds__(kThreads, 1) attn_pv8_kernel(const __grid_constant__ Params p) {
+  using Lay = LayoutPv8<kRows, kHeads>;
+  static_assert(Lay::bytes <= kMaxSmem && Lay::kPer <= 16 && Lay::kNP <= 256);
+  static_assert(kRows == 1 || Lay::kReal - 3 * Lay::kPer < Lay::kSeg);
+  constexpr int kReal = Lay::kReal;
+  constexpr int kNP = Lay::kNP;
+  constexpr int kSeg = Lay::kSeg;
+  constexpr int kBlk = Lay::kBlk;
+  constexpr int kPer = Lay::kPer;
+  constexpr int kWin = Lay::kWin;
+  extern __shared__ __align__(1024) uint8_t smem[];
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int wg = warp >> 2;
+  const int tl = tid & 127;
+  int group = blockIdx.x / p.HKV;
+  const int kvh = blockIdx.x % p.HKV;
+  int row0 = group * kRows;
+  uint8_t* const s_k = smem + Lay::k;
+  uint8_t* const s_v = smem + Lay::v;
+  uint8_t* const s_p = smem + Lay::pr;
+  uint8_t* const s_sf = smem + Lay::sf;
+  uint32_t* const s_ent = reinterpret_cast<uint32_t*>(smem + Lay::ent);
+  float* const s_red = reinterpret_cast<float*>(smem + Lay::red);
+  float* const s_fac = reinterpret_cast<float*>(smem + Lay::fac);
+  uint32_t* const s_any = reinterpret_cast<uint32_t*>(smem + Lay::flag + 16);
+  uint32_t* const s_more = s_any + 1;
+  uint64_t* const s_bar = reinterpret_cast<uint64_t*>(smem + Lay::bar);
+  uint64_t* const qk_bar = s_bar;
+  uint64_t* const pv_bar = s_bar + 2;
+  uint64_t* const k_full = s_bar + 4;
+  uint64_t* const v_full = s_bar + 6;
+  uint32_t* const s_tmem = reinterpret_cast<uint32_t*>(smem + Lay::tmem);
+  const float ninf = __int_as_float(0xFF800000);
+  const bool worker = warp < kWorkers / 32;
+
+  if (tid == 0) {
+    for (int i = 0; i < 4; ++i)
+      device::ptx::mbar_init(s_bar + i, 1);
+    for (int i = 4; i < 9; ++i)
+      device::ptx::mbar_init(s_bar + i, kWorkers);
+    device::ptx::fence_barrier_init();
+  }
+  float sc = 0.f;
+  if (worker) {
+    for (int i = tid; i < 2 * kTile * 32; i += kWorkers)
+      reinterpret_cast<uint32_t*>(s_p)[i] = 0;
+    for (int i = tid; i < 3 * 128; i += kWorkers)
+      reinterpret_cast<uint32_t*>(s_sf)[i] = 0x7F7F7F7Fu;
+    if constexpr (!kSorted) sc = split_q<kRows, kHeads>(p, row0, kvh, smem + Lay::q, s_red);
+    device::ptx::fence_proxy_async_shared();
+  } else {
+    tcgen05::alloc(s_tmem, Lay::kTmemCols);
+    tcgen05::relinquish_alloc_permit();
+    tcgen05::fence_before_thread_sync();
+  }
+  __syncthreads();
+  tcgen05::fence_after_thread_sync();
+
+  const uint32_t t_base = *s_tmem;
+  const uint32_t t_lane = t_base + (static_cast<uint32_t>((warp & 3) * 32) << 16);
+  device::PDLWaitPrimary<kUsePDL>();
+  if constexpr (kSorted) {
+    group = group_of_rank(p, group, reinterpret_cast<uint32_t*>(s_p));
+    row0 = group * kRows;
+    if (worker) {
+      for (int i = tid; i < 2 * kTile * 32; i += kWorkers)
+        reinterpret_cast<uint32_t*>(s_p)[i] = 0;
+      sc = split_q<kRows, kHeads>(p, row0, kvh, smem + Lay::q, s_red);
+      device::ptx::fence_proxy_async_shared();
+    }
+  }
+  const int32_t* entries = p.entries + static_cast<int64_t>(group) * p.cap;
+  const int tiles = (p.counts[group] + kTile - 1) / kTile;
+
+  if (!worker) {
+    issue_mmas_pv8<kRows, kHeads>(tiles, t_base, smem);
+    tcgen05::dealloc(t_base, Lay::kTmemCols);
+    return;
+  }
+
+  const int gk = tid >> 4;
+  const int gc = tid & 15;
+  const int vk = ((tid >> 6) << 3) | (((tid >> 3) & 3) ^ (((tid >> 2) & 1) * 5));
+  const int vc = (tid & 3) | (((tid >> 5) & 1) << 2);
+  const int first = wg * kPer;
+  const int heads = min(max(kReal - first, 0), kPer);
+  const int j0 = first / kHeads;
+  const int split = (j0 + 1) * kHeads - first;
+  const uint32_t t_od = t_lane + Lay::kOCol + (wg & 1) * kNP;
+  int g0 = 0;
+  bool repeat = false;
+#pragma unroll 1
+  for (int pass = 0; pass < (repeat ? 1 + kRows : 1); ++pass) {
+    const uint32_t rowmask = pass == 0 ? (1u << kRows) - 1 : 1u << (pass - 1);
+
+    const auto gather_k = [&](const int t) {
+      const int g = g0 + t;
+      const uint8_t* base = p.k + kvh * p.stride_kh + gc * 16;
+      const uint32_t dst = device::ptx::to_shared(s_k + ((g & 1) * 2 + (gc >> 3)) * kPlane);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const uint32_t entry = s_ent[(t & 7) * kTile + gk + 32 * i];
+        cp_async16(
+            dst + tcgen05::sw128_off(gk + 32 * i, gc & 7),
+            base + static_cast<int64_t>(entry & kSlotMask) * p.stride_kslot,
+            ((entry >> kSlotBits) & rowmask) != 0 ? 16 : 0);
+      }
+      cp_async_arrive_noinc(k_full + (g & 1));
+    };
+    const auto gather_v = [&](const int t) {
+      const int g = g0 + t;
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const uint8_t* base = p.v + kvh * p.stride_kh + h * 128 + vc * 16;
+        const uint32_t dst = device::ptx::to_shared(s_v + ((g % 3) * 2 + h) * kPlane);
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          const uint32_t entry = s_ent[(t & 7) * kTile + vk + 64 * i];
+          cp_async16(
+              dst + tcgen05::sw128_off(vk + 64 * i, vc),
+              base + static_cast<int64_t>(entry & kSlotMask) * p.stride_kslot,
+              ((entry >> kSlotBits) & rowmask) != 0 ? 16 : 0);
+        }
+      }
+      cp_async_arrive_noinc(v_full + g % 3);
+    };
+    const auto wait_pv = [&](const int g) { device::ptx::mbar_wait_parity(pv_bar + (g & 1), (g >> 1) & 1); };
+    // P columns wg kSeg + i, 4 kSeg + wg kSeg + i: hi and lo e4m3 terms of head first + i; column 4 kSeg - 1: sum(V)
+    const auto store_p = [&](const float (&pv)[kPer], const uint32_t mine, const int g) {
+      uint8_t* row = s_p + (g & 1) * kTile * 128 + tl * 128;
+      uint8_t* sfb = s_sf + 512 * (1 + (g & 1)) + (warp & 3);
+      uint32_t hi[kSeg / 4];
+      uint32_t lo[kSeg / 4];
+#pragma unroll
+      for (int j = 0; j < kSeg / 4; ++j) {
+        hi[j] = 0;
+        lo[j] = 0;
+      }
+      uint32_t code = 127;
+#pragma unroll
+      for (int i = 0; i < kPer; i += 2) {
+        float r[2];
+        uint32_t h[2];
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const uint32_t top = i + e < heads ? device::warp::reduce_max(__float_as_uint(pv[i + e])) : 0u;
+          const uint32_t c = static_cast<uint32_t>(max(static_cast<int>(top >> 23) - 7, 1));
+          if (lane == i + e) code = c;
+          const float x = pv[i + e] * __uint_as_float((254u - c) << 23);
+          const uint32_t rb = (__float_as_uint(x) + 0x80000u) & 0xFFF00000u;
+          const bool normal = rb >= (121u << 23);
+          r[e] = x - (normal ? __uint_as_float(rb) : 0.f);
+          h[e] = normal ? (rb >> 20) - (120u << 3) : 0u;
+        }
+        hi[i / 4] |= ((h[0] & 0xFFu) | ((h[1] & 0xFFu) << 8)) << (16 * ((i / 2) & 1));
+        lo[i / 4] |= f32x2_e4m3x2(r[0], r[1]) << (16 * ((i / 2) & 1));
+      }
+      if (kRows > 1 && wg == 3 && mine != 0) hi[kSeg / 4 - 1] |= 0x38u << 24;
+      if (lane < heads) {
+        const int c = wg * kSeg + lane;
+        sfb[(c & 31) * 16 + (c >> 5) * 4] = static_cast<uint8_t>(code);
+        sfb[((4 * kSeg + c) & 31) * 16 + ((4 * kSeg + c) >> 5) * 4] = static_cast<uint8_t>(code);
+      }
+      const auto at = [&](const int b) { return row + ((((b >> 4) ^ (tl & 7)) << 4) | (b & 15)); };
+      if constexpr (kSeg == 16) {
+        *reinterpret_cast<uint4*>(at(wg * kSeg)) = make_uint4(hi[0], hi[1], hi[2], hi[3]);
+        *reinterpret_cast<uint4*>(at(4 * kSeg + wg * kSeg)) = make_uint4(lo[0], lo[1], lo[2], lo[3]);
+      } else if constexpr (kSeg == 8) {
+        *reinterpret_cast<uint2*>(at(wg * kSeg)) = make_uint2(hi[0], hi[1]);
+        *reinterpret_cast<uint2*>(at(4 * kSeg + wg * kSeg)) = make_uint2(lo[0], lo[1]);
+      } else {
+        *reinterpret_cast<uint32_t*>(at(wg * kSeg)) = hi[0];
+        *reinterpret_cast<uint32_t*>(at(4 * kSeg + wg * kSeg)) = lo[0];
+      }
+    };
+    const auto load_scores = [&](float (&x)[kPer], const float (&bias)[kPer], const uint32_t mine, const int g) {
+      const bool on0 = ((mine >> j0) & 1u) != 0;
+      const bool on1 = ((mine >> (j0 + 1)) & 1u) != 0;
+      const uint32_t t_s = t_lane + (g & 1) * Lay::kNQ;
+      float term[kWin];
+      if (heads > 0) tcgen05::ld_32x32b<kWin>(t_s + kReal + first, term);
+      tcgen05::wait_ld();
+#pragma unroll
+      for (int i = 0; i < kPer; ++i)
+        x[i] = fmaf(term[i], sc, bias[i]);
+      if (heads > 0) tcgen05::ld_32x32b<kWin>(t_s + first, term);
+      tcgen05::wait_ld();
+      tcgen05::fence_before_thread_sync();
+#pragma unroll
+      for (int i = 0; i < kPer; ++i)
+        x[i] = (i < split ? on0 : on1) && i < heads ? fmaf(term[i], sc, x[i]) : ninf;
+    };
+
+    for (int t = 0; t < 5; ++t) {
+      if (warp == t && t < tiles) {
+        *reinterpret_cast<uint4*>(s_ent + (t & 7) * kTile + lane * 4) =
+            *reinterpret_cast<const uint4*>(entries + t * kTile + lane * 4);
+      }
+    }
+    device::ptx::bar_sync(3, kWorkers);
+    for (int t = 0; t < 2; ++t) {
+      if (t < tiles) gather_k(t);
+    }
+    if (tiles > 0) gather_v(0);
+    device::ptx::bar_arrive(1, kThreads);
+
+    float nm[kPer];
+    float ls[kPer];
+    float zero[kPer];
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+      nm[i] = 1e30f;
+      ls[i] = 0.f;
+      zero[i] = 0.f;
+    }
+
+#pragma unroll 1
+    for (int t = 0; t < tiles; ++t) {
+      const int g = g0 + t;
+      uint4 ent_next = make_uint4(0, 0, 0, 0);
+      if (warp == 0 && t + 5 < tiles) ent_next = *reinterpret_cast<const uint4*>(entries + (t + 5) * kTile + lane * 4);
+      device::ptx::mbar_wait_parity(qk_bar + (g & 1), (g >> 1) & 1);
+      tcgen05::fence_after_thread_sync();
+      if (t + 1 < tiles) gather_v(t + 1);
+      const uint32_t mine = (s_ent[(t & 7) * kTile + tl] >> kSlotBits) & rowmask;
+      float pv[kPer];
+      load_scores(pv, nm, mine, g);
+      float top = ninf;
+#pragma unroll
+      for (int i = 0; i < kPer; ++i) {
+        top = fmaxf(top, pv[i]);
+        pv[i] = ex2_approx(pv[i]);
+      }
+      const bool rescale = bar_red_or(3, kWorkers, top > kRescale);
+      if (t + 2 < tiles) gather_k(t + 2);
+      if (rescale) {
+        tcgen05::fence_after_thread_sync();
+        load_scores(pv, zero, mine, g);
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+          const float m = device::warp::reduce_max(pv[i]);
+          if (lane == 0 && i < heads) s_red[(first + i) * 4 + (warp & 3)] = m;
+        }
+        if (tid == 0) *s_any = 0;
+        device::ptx::bar_sync(3, kWorkers);
+        bool moved = false;
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+          if (i < heads) {
+            const float4 r4 = *reinterpret_cast<const float4*>(s_red + (first + i) * 4);
+            const float m = fmaxf(fmaxf(r4.x, r4.y), fmaxf(r4.z, r4.w));
+            const float ref = -nm[i];
+            const bool move = m > ref + kRescale;
+            const float f = move ? ex2_approx(ref - m) : 1.f;
+            nm[i] = move ? -m : nm[i];
+            ls[i] *= f;
+            pv[i] = ex2_approx(pv[i] + nm[i]);
+            moved |= move && ref > -1e29f;
+            if (lane == 0 && (warp & 3) == 0) s_fac[first + i] = f;
+          }
+        }
+        if (moved && lane == 0 && (warp & 3) == 0) *s_any = 1;
+        device::ptx::bar_sync(3, kWorkers);
+        if (*s_any != 0 && t > 0) {
+          wait_pv(g - 1);
+          tcgen05::fence_after_thread_sync();
+#pragma unroll
+          for (int s = 0; s < 2; ++s) {
+            const int seg = 2 * (wg >> 1) + s;
+#pragma unroll
+            for (int b = 0; b < kSeg; b += kBlk) {
+#pragma unroll
+              for (int part = 0; part < 2; ++part) {
+                float o[kBlk];
+                const uint32_t col = t_od + part * 4 * kSeg + seg * kSeg + b;
+                tcgen05::ld_32x32b<kBlk>(col, o);
+                tcgen05::wait_ld();
+#pragma unroll
+                for (int e = 0; e < kBlk; ++e) {
+                  const int n = seg * kPer + b + e;
+                  if (b + e < kPer && n < kReal) o[e] *= s_fac[n];
+                }
+                tcgen05::st_32x32b<kBlk>(col, o);
+              }
+            }
+          }
+          tcgen05::wait_st();
+          tcgen05::fence_before_thread_sync();
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < kPer; ++i)
+        ls[i] += pv[i];
+      store_p(pv, mine, g);
+      device::ptx::bar_arrive(2, kThreads);
+      if (warp == 0 && t + 5 < tiles) *reinterpret_cast<uint4*>(s_ent + ((t + 5) & 7) * kTile + lane * 4) = ent_next;
+    }
+
+    if (tiles > 0) wait_pv(g0 + tiles - 1);
+    tcgen05::fence_after_thread_sync();
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+      const float sum = device::warp::reduce_sum(ls[i]);
+      if (lane == 0 && i < heads) s_red[(first + i) * 4 + (warp & 3)] = sum;
+    }
+    if (tid == 0) *s_any = 0;
+    device::ptx::bar_sync(3, kWorkers);
+    if (lane == 0 && (warp & 3) == 0) {
+#pragma unroll
+      for (int i = 0; i < kPer; ++i) {
+        if (i < heads) {
+          const float4 r4 = *reinterpret_cast<const float4*>(s_red + (first + i) * 4);
+          const float sum = (r4.x + r4.y) + (r4.z + r4.w);
+          s_fac[first + i] = sum > 0.f ? 1.f / sum : 0.f;
+        }
+      }
+    }
+    device::ptx::bar_sync(3, kWorkers);
+    uint16_t* const s_out = reinterpret_cast<uint16_t*>(s_k);
+    const int d = (wg & 1) * 128 + tl;
+    bool poisoned = false;
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+      const int seg = 2 * (wg >> 1) + s;
+#pragma unroll
+      for (int b = 0; b < kSeg; b += kBlk) {
+        float o[kBlk];
+        float o2[kBlk];
+#pragma unroll
+        for (int e = 0; e < kBlk; ++e) {
+          o[e] = 0.f;
+          o2[e] = 0.f;
+        }
+        if (tiles > 0) {
+          tcgen05::ld_32x32b<kBlk>(t_od + seg * kSeg + b, o);
+          tcgen05::ld_32x32b<kBlk>(t_od + 4 * kSeg + seg * kSeg + b, o2);
+          tcgen05::wait_ld();
+        }
+#pragma unroll
+        for (int e = 0; e < kBlk; ++e) {
+          const int n = seg * kPer + b + e;
+          if (b + e < kPer && n < kReal) {
+            s_out[n * kD + d] = __bfloat16_as_ushort(__float2bfloat16_rn((o[e] + o2[e]) * s_fac[n]));
+          } else if (kRows > 1 && seg == 3 && b + e == kSeg - 1 && pass == 0) {
+            poisoned = o[e] != o[e];
+          }
+        }
+      }
+    }
+    if (poisoned) *s_any = 1;
+    tcgen05::fence_before_thread_sync();
+    device::ptx::bar_sync(3, kWorkers);
+    if (kRows > 1 && pass == 0) repeat = *s_any != 0;
+    for (int i = tid; i < kReal * 32; i += kWorkers) {
+      const int n = i >> 5;
+      const int j = n / kHeads;
+      if (((rowmask >> j) & 1u) != 0) {
+        uint16_t* dst = p.out + (row0 + j) * p.stride_or + (kvh * kHeads + n % kHeads) * p.stride_oh + (i & 31) * 8;
+        *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(s_out + n * kD + (i & 31) * 8);
+      }
+    }
+    if (tid == 0) *s_more = pass + 1 < (repeat ? 1 + kRows : 1) ? 1 : 0;
+    g0 += tiles;
+    device::ptx::bar_sync(3, kWorkers);
+    device::ptx::bar_arrive(1, kThreads);
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
 }  // namespace qsa_sparse_decode_sm100
 
-template <int kRows, int kHeads, bool kUsePDL>
+template <int kRows, int kHeads, bool kUsePDL, bool kPv8>
 struct QsaSparseDecodeSm100 {
   static void
   run(const tvm::ffi::TensorView q,
@@ -989,10 +1480,17 @@ struct QsaSparseDecodeSm100 {
   static void launch_attn(const int64_t blocks, const qsa_sparse_decode_sm100::Params& params, const DLDevice dev) {
     using namespace host;
     using namespace qsa_sparse_decode_sm100;
-    constexpr int smem = Layout<kRows, kHeads>::bytes;
-    runtime::set_max_dynamic_smem_per_device<attn_kernel<kRows, kHeads, kUsePDL, kSorted>>(dev, smem);
-    LaunchKernel(static_cast<uint32_t>(blocks), kThreads, dev, smem)
-        .enable_pdl(kUsePDL)(attn_kernel<kRows, kHeads, kUsePDL, kSorted>, params);
+    if constexpr (kPv8) {
+      constexpr int smem = LayoutPv8<kRows, kHeads>::bytes;
+      runtime::set_max_dynamic_smem_per_device<attn_pv8_kernel<kRows, kHeads, kUsePDL, kSorted>>(dev, smem);
+      LaunchKernel(static_cast<uint32_t>(blocks), kThreads, dev, smem)
+          .enable_pdl(kUsePDL)(attn_pv8_kernel<kRows, kHeads, kUsePDL, kSorted>, params);
+    } else {
+      constexpr int smem = Layout<kRows, kHeads>::bytes;
+      runtime::set_max_dynamic_smem_per_device<attn_kernel<kRows, kHeads, kUsePDL, kSorted>>(dev, smem);
+      LaunchKernel(static_cast<uint32_t>(blocks), kThreads, dev, smem)
+          .enable_pdl(kUsePDL)(attn_kernel<kRows, kHeads, kUsePDL, kSorted>, params);
+    }
   }
 
   template <bool kRowReq64>

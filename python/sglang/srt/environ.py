@@ -1510,6 +1510,8 @@ class Envs:
     # The same on SM100 / SM103 with tcgen05; the tokens of a verify chain share
     # the KV reads of their request.
     SGLANG_ENABLE_QSA_SPARSE_DECODE_SM100 = EnvBool(False)
+    # With it, the PV product of that kernel on fp8 V with block-scaled fp8 weights.
+    SGLANG_QSA_SPARSE_DECODE_SM100_FP8_PV = EnvBool(False)
     # QSA (Qwen4-Exp) chunked prefill of 8192+ rows with an fp8_e4m3 KV cache on
     # SM100 / SM103: tcgen05 over the union of what 4 consecutive rows selected.
     SGLANG_ENABLE_QSA_SPARSE_PREFILL_SM100 = EnvBool(False)
