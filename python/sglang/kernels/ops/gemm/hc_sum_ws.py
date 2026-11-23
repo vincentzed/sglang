@@ -2,10 +2,10 @@
 
 Down and its RMS/SiLU post-processing stay FlashInfer's (cuBLAS bmm into per-stream FP32 partials, then
 the BF16 low-rank input and alpha). One warp-specialized tcgen05 kernel replaces the Up GEMM and the mix
-kernel: a TMA warp streams the residual and Up tiles, an MMA warp accumulates four streams x 32 channels
-into double-buffered TMEM, and eight epilogue warps apply the gate, the RMS-normalized residual and the
-stream mean while the next tile's MMA runs. The low-rank input lives in TMEM, which leaves shared memory
-for a deeper load pipeline. The [T, 4*H] BF16 logits are never written.
+kernel: a TMA warp keeps the 128-row low-rank input resident and streams the residual and Up tiles, an
+MMA warp accumulates four streams x 32 channels into double-buffered TMEM, and eight epilogue warps apply
+the gate, the RMS-normalized residual and the stream mean while the next tile's MMA runs. The [T, 4*H]
+BF16 logits are never written.
 """
 
 import torch
@@ -30,10 +30,9 @@ _BM = 128
 _BK = 64
 _BC = 32
 _CH = 16
-_STAGES = 6
-_XS = 3
+_STAGES = 4
 _NW = 8
-_MIN_ROWS = 1024
+_MIN_ROWS = 128
 
 
 @constexpr_function
@@ -44,10 +43,10 @@ def _tmem_reg_layout(dtype, shape, layout, num_warps):
 
 
 @gluon.jit
-def _gate_pair(lg):
+def _term_pair(lg, x, inv, g):
     return gl.inline_asm_elementwise(
         asm="""{
-        .reg .b32 p, a, b;
+        .reg .b32 p, a, b, x0, x1, gb, nb;
         cvt.rn.bf16x2.f32 p, $2, $1;
         shl.b32 a, p, 16;
         and.b32 b, p, 0xffff0000;
@@ -59,10 +58,18 @@ def _gate_pair(lg):
         add.f32 b, b, 0f3F800000;
         rcp.approx.ftz.f32 a, a;
         rcp.approx.ftz.f32 b, b;
-        cvt.rn.bf16x2.f32 $0, b, a;
+        cvt.rn.bf16x2.f32 gb, b, a;
+        shl.b32 x0, $3, 16;
+        and.b32 x1, $3, 0xffff0000;
+        mul.f32 x0, x0, $4;
+        mul.f32 x1, x1, $5;
+        mul.f32 x0, x0, $6;
+        mul.f32 x1, x1, $7;
+        cvt.rn.bf16x2.f32 nb, x1, x0;
+        mul.rn.bf16x2 $0, gb, nb;
         }""",
-        constraints="=r,r,r",
-        args=[lg],
+        constraints="=r,r,r,r,r,r,r,r",
+        args=[lg, x, inv, g],
         dtype=gl.bfloat16,
         is_pure=True,
         pack=2,
@@ -71,9 +78,11 @@ def _gate_pair(lg):
 
 @gluon.aggregate
 class _UpMix:
+    t_desc: tma.tensor_descriptor
     up_desc: tma.tensor_descriptor
     x_desc: tma.tensor_descriptor
     out_desc: tma.tensor_descriptor
+    t_bufs: gl.shared_memory_descriptor
     w_bufs: gl.shared_memory_descriptor
     x_bufs: gl.shared_memory_descriptor
     ld_empty: gl.shared_memory_descriptor
@@ -81,10 +90,10 @@ class _UpMix:
     x_empty: gl.shared_memory_descriptor
     x_ready: gl.shared_memory_descriptor
     acc: tensor_memory_descriptor
-    t_tmem: tensor_memory_descriptor
     acc_empty: gl.shared_memory_descriptor
     acc_ready: gl.shared_memory_descriptor
     t_ready: gl.shared_memory_descriptor
+    t_free: gl.shared_memory_descriptor
 
 
 @gluon.jit
@@ -97,21 +106,30 @@ def _up_mix_load(
     BC: gl.constexpr,
     KS: gl.constexpr,
     STAGES: gl.constexpr,
-    XS: gl.constexpr,
 ):
     it = 0
     n = 0
+    r = 0
+    cur = -1
     for tile in range(start, end):
-        off_m = (tile // NCB) * 128
+        rt = tile // NCB
+        off_m = rt * 128
         c0 = (tile % NCB) * BC
-        xs = n % XS
-        mbarrier.wait(p.x_empty.index(xs), ((n // XS) & 1) ^ 1)
+        xs = n % 2
+        mbarrier.wait(p.x_empty.index(xs), ((n // 2) & 1) ^ 1)
         xbar = p.x_ready.index(xs)
         mbarrier.expect(xbar, 4 * p.x_desc.block_type.nbytes)
         for b in gl.static_range(4):
             tma.async_load(
                 p.x_desc, [off_m, b * H + c0], xbar, p.x_bufs.index(xs * 4 + b)
             )
+        if rt != cur:
+            mbarrier.wait(p.t_free, (r & 1) ^ 1)
+            mbarrier.expect(p.t_ready, KS * p.t_desc.block_type.nbytes)
+            for k in gl.static_range(KS):
+                tma.async_load(p.t_desc, [off_m, k * 64], p.t_ready, p.t_bufs.index(k))
+            cur = rt
+            r += 1
         for k in gl.static_range(KS):
             s = it % STAGES
             mbarrier.wait(p.ld_empty.index(s), ((it // STAGES) & 1) ^ 1)
@@ -149,7 +167,7 @@ def _up_mix_mma(
             s = it % STAGES
             mbarrier.wait(p.ld_ready.index(s), (it // STAGES) & 1)
             tcgen05_mma(
-                p.t_tmem.index(k),
+                p.t_bufs.index(k),
                 p.w_bufs.index(s).permute((1, 0)),
                 acc,
                 use_acc=k > 0,
@@ -157,31 +175,9 @@ def _up_mix_mma(
             )
             it += 1
         tcgen05_commit(p.acc_ready.index(a))
+        if (tile + 1 == end) or ((tile + 1) // NCB != rt):
+            tcgen05_commit(p.t_free)
         n += 1
-
-
-@gluon.jit
-def _up_mix_load_t(
-    p, t_ptr, off_m, M, L: gl.constexpr, KS: gl.constexpr, NW: gl.constexpr
-):
-    treg: gl.constexpr = _tmem_reg_layout(
-        gl.bfloat16, [128, 64], TensorMemoryLayout(block=(128, 64), col_stride=1), NW
-    )
-    rows = off_m + gl.arange(0, 128, gl.SliceLayout(1, treg))
-    cols = gl.arange(0, 64, gl.SliceLayout(0, treg))
-    vs = ()
-    for k in gl.static_range(KS):
-        vs = vs + (
-            gl.load(
-                t_ptr + rows[:, None] * L + (k * 64 + cols)[None, :],
-                mask=(rows < M)[:, None],
-                other=0.0,
-            ),
-        )
-    for k in gl.static_range(KS):
-        p.t_tmem.index(k).store(vs[k])
-    gl.barrier()
-    mbarrier.arrive(p.t_ready, count=1)
 
 
 @gluon.jit
@@ -189,7 +185,6 @@ def _up_mix_epilogue(
     p,
     start,
     end,
-    t_ptr,
     sums_ptr,
     gamma_ptr,
     next_sums_ptr,
@@ -197,12 +192,9 @@ def _up_mix_epilogue(
     eps,
     NCB: gl.constexpr,
     H: gl.constexpr,
-    L: gl.constexpr,
-    KS: gl.constexpr,
     BC: gl.constexpr,
     CH: gl.constexpr,
     NW: gl.constexpr,
-    XS: gl.constexpr,
 ):
     creg: gl.constexpr = _tmem_reg_layout(
         gl.float32, [128, CH], TensorMemoryLayout(block=(128, 4 * BC), col_stride=1), NW
@@ -212,17 +204,13 @@ def _up_mix_epilogue(
     zl: gl.constexpr = gl.BlockedLayout([4], [32], [NW], [0])
     dt: gl.constexpr = p.out_desc.dtype
     o_bufs = gl.allocate_shared_memory(dt, [2, 128, BC], p.out_desc.layout)
-    if start < end:
-        _up_mix_load_t(p, t_ptr, (start // NCB) * 128, M, L, KS, NW)
     n = 0
     for tile in range(start, end):
         cb = tile % NCB
-        rt = tile // NCB
-        off_m = rt * 128
+        off_m = (tile // NCB) * 128
         c0 = cb * BC
         a = n % 2
         ph = (n // 2) & 1
-        xs = n % XS
         rows = off_m + gl.arange(0, 128, rl)
         live = rows < M
         if cb == 0:
@@ -242,10 +230,8 @@ def _up_mix_epilogue(
         inv3 = gl.rsqrt(
             gl.load(sums_ptr + rows * 4 + 3, mask=live, other=1.0) * (1.0 / H) + eps
         )
+        mbarrier.wait(p.x_ready.index(a), ph)
         mbarrier.wait(p.acc_ready.index(a), ph)
-        if (tile + 1 < end) and ((tile + 1) // NCB != rt):
-            _up_mix_load_t(p, t_ptr, off_m + 128, M, L, KS, NW)
-        mbarrier.wait(p.x_ready.index(xs), (n // XS) & 1)
         acc = p.acc.index(a)
         o = o_bufs.index(a)
         tma.store_wait(1)
@@ -261,20 +247,19 @@ def _up_mix_epilogue(
                     inv = inv2
                 else:
                     inv = inv3
+                lg = acc.slice(b * BC + c * CH, CH).load(creg)
+                xb = p.x_bufs.index(a * 4 + b).slice(c * CH, CH, dim=1).load(creg)
                 g = gl.load(gamma_ptr + b * H + cols)
-                xv = (
-                    p.x_bufs.index(xs * 4 + b)
-                    .slice(c * CH, CH, dim=1)
-                    .load(creg)
-                    .to(gl.float32)
-                )
-                norm = ((xv * inv[:, None]) * g[None, :]).to(dt)
-                gate = _gate_pair(acc.slice(b * BC + c * CH, CH).load(creg))
-                total += (gate * norm).to(gl.float32)
+                total += _term_pair(
+                    lg,
+                    xb,
+                    gl.broadcast(inv[:, None], lg)[0],
+                    gl.broadcast(g[None, :], lg)[0],
+                ).to(gl.float32)
             o.slice(c * CH, CH, dim=1).store((total * 0.25).to(dt))
         gl.barrier()
         mbarrier.arrive(p.acc_empty.index(a), count=1)
-        mbarrier.arrive(p.x_empty.index(xs), count=1)
+        mbarrier.arrive(p.x_empty.index(a), count=1)
         fence_async_shared()
         tma.async_store(p.out_desc, [off_m, c0], o)
         n += 1
@@ -283,7 +268,7 @@ def _up_mix_epilogue(
 
 @gluon.jit
 def _hc_up_mix_ws_kernel(
-    t_ptr,
+    t_desc,
     up_desc,
     x_desc,
     out_desc,
@@ -298,7 +283,6 @@ def _hc_up_mix_ws_kernel(
     BC: gl.constexpr,
     CH: gl.constexpr,
     STAGES: gl.constexpr,
-    XS: gl.constexpr,
     NW: gl.constexpr,
 ):
     KS: gl.constexpr = L // 64
@@ -307,39 +291,40 @@ def _hc_up_mix_ws_kernel(
     grid = gl.num_programs(0)
     start = pid * n_tiles // grid
     end = (pid + 1) * n_tiles // grid
+    t_bufs = gl.allocate_shared_memory(gl.bfloat16, [KS, 128, 64], t_desc.layout)
     w_bufs = gl.allocate_shared_memory(
         gl.bfloat16, [STAGES, 4 * BC, 64], up_desc.layout
     )
-    x_bufs = gl.allocate_shared_memory(gl.bfloat16, [XS * 4, 128, BC], x_desc.layout)
+    x_bufs = gl.allocate_shared_memory(gl.bfloat16, [8, 128, BC], x_desc.layout)
     ld_empty = mbarrier.allocate_mbarrier(batch=STAGES)
     ld_ready = mbarrier.allocate_mbarrier(batch=STAGES)
-    x_empty = mbarrier.allocate_mbarrier(batch=XS)
-    x_ready = mbarrier.allocate_mbarrier(batch=XS)
+    x_empty = mbarrier.allocate_mbarrier(batch=2)
+    x_ready = mbarrier.allocate_mbarrier(batch=2)
     acc_empty = mbarrier.allocate_mbarrier(batch=2)
     acc_ready = mbarrier.allocate_mbarrier(batch=2)
     t_ready = mbarrier.allocate_mbarrier()
+    t_free = mbarrier.allocate_mbarrier()
     for i in gl.static_range(STAGES):
         mbarrier.init(ld_empty.index(i), count=1)
         mbarrier.init(ld_ready.index(i), count=1)
-    for i in gl.static_range(XS):
+    for i in gl.static_range(2):
         mbarrier.init(x_empty.index(i), count=1)
         mbarrier.init(x_ready.index(i), count=1)
-    for i in gl.static_range(2):
         mbarrier.init(acc_empty.index(i), count=1)
         mbarrier.init(acc_ready.index(i), count=1)
     mbarrier.init(t_ready, count=1)
+    mbarrier.init(t_free, count=1)
     acc = allocate_tensor_memory(
         gl.float32,
         [2, 128, 4 * BC],
         TensorMemoryLayout(block=(128, 4 * BC), col_stride=1),
     )
-    t_tmem = allocate_tensor_memory(
-        gl.bfloat16, [KS, 128, 64], TensorMemoryLayout(block=(128, 64), col_stride=1)
-    )
     p = _UpMix(
+        t_desc,
         up_desc,
         x_desc,
         out_desc,
+        t_bufs,
         w_bufs,
         x_bufs,
         ld_empty,
@@ -347,10 +332,10 @@ def _hc_up_mix_ws_kernel(
         x_empty,
         x_ready,
         acc,
-        t_tmem,
         acc_empty,
         acc_ready,
         t_ready,
+        t_free,
     )
     gl.warp_specialize(
         [
@@ -360,7 +345,6 @@ def _hc_up_mix_ws_kernel(
                     p,
                     start,
                     end,
-                    t_ptr,
                     sums_ptr,
                     gamma_ptr,
                     next_sums_ptr,
@@ -368,15 +352,12 @@ def _hc_up_mix_ws_kernel(
                     eps,
                     NCB,
                     H,
-                    L,
-                    KS,
                     BC,
                     CH,
                     NW,
-                    XS,
                 ),
             ),
-            (_up_mix_load, (p, start, end, NCB, H, BC, KS, STAGES, XS)),
+            (_up_mix_load, (p, start, end, NCB, H, BC, KS, STAGES)),
             (_up_mix_mma, (p, start, end, NCB, KS, STAGES)),
         ],
         [1, 1],
@@ -405,19 +386,24 @@ def hc_gamma(norm: torch.Tensor) -> torch.Tensor:
 
 
 def hc_sum_ws_supported(residual: torch.Tensor) -> bool:
-    return residual.shape[0] >= _MIN_ROWS and residual.is_contiguous()
+    return (
+        residual.shape[0] >= _MIN_ROWS
+        and residual.dtype == torch.bfloat16
+        and residual.is_contiguous()
+    )
 
 
 def hc_up_mix(t, up, residual, sums, gamma, mixed, next_sums, eps):
     rows = residual.shape[0]
     h = mixed.shape[1]
     lowrank = t.shape[1]
+    t_desc = TensorDescriptor.from_tensor(t, [_BM, _BK], _nvmma([_BM, _BK]))
     up_desc = TensorDescriptor.from_tensor(up, [_BC, _BK], _nvmma([_BC, _BK]))
     x_desc = TensorDescriptor.from_tensor(residual, [_BM, _BC], _nvmma([_BM, _BC]))
     out_desc = TensorDescriptor.from_tensor(mixed, [_BM, _BC], _nvmma([_BM, _BC]))
     n_tiles = triton.cdiv(rows, _BM) * (h // _BC)
     _hc_up_mix_ws_kernel[(min(n_tiles, _sm_count(residual.device)),)](
-        t,
+        t_desc,
         up_desc,
         x_desc,
         out_desc,
@@ -432,7 +418,6 @@ def hc_up_mix(t, up, residual, sums, gamma, mixed, next_sums, eps):
         BC=_BC,
         CH=_CH,
         STAGES=_STAGES,
-        XS=_XS,
         NW=_NW,
         num_warps=_NW,
         enable_fp_fusion=False,

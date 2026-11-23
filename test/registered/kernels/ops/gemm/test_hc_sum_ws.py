@@ -100,6 +100,14 @@ def test_cuda_graph_replay_with_new_inputs():
         assert torch.equal(alpha, base_alpha)
 
 
+def test_supported_rows_and_dtype():
+    from sglang.kernels.ops.gemm.hc_sum_ws import hc_sum_ws_supported
+
+    assert hc_sum_ws_supported(_residual(128, 0))
+    assert not hc_sum_ws_supported(_residual(127, 0))
+    assert not hc_sum_ws_supported(_residual(256, 0).half())
+
+
 def test_adapter_routes_rows_through_ws_mix(monkeypatch):
     import sglang.kernels.ops.gemm.hc_sum_ws as ws_mod
 
