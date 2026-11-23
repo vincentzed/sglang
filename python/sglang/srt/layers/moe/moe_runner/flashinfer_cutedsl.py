@@ -59,6 +59,8 @@ def use_cutedsl_moe_swap_ab(device: torch.device) -> bool:
 
 @lru_cache(maxsize=None)
 def _use_cutedsl_moe_swap_ab(device_index: int) -> bool:
+    if envs.SGLANG_OPT_CUTEDSL_MOE_NO_SWAP_AB.get():
+        return False
     return torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
 
 
