@@ -29,12 +29,13 @@ pytestmark = pytest.mark.skipif(
 
 Q_HEADS, KV_HEADS, HEAD_DIM, PAGE, RATIO = 24, 2, 256, 64, 4
 TOPK = 2048 + RATIO - 1
-IMPLS = [
-    "split_k",
+SM100_IMPLS = ["sm100", "sm100_fp8_pv"]
+IMPLS = ["split_k"] + [
     pytest.param(
-        "sm100",
+        impl,
         marks=pytest.mark.skipif(not is_sm100_supported(), reason="needs tcgen05"),
-    ),
+    )
+    for impl in SM100_IMPLS
 ]
 
 
@@ -112,8 +113,10 @@ def _run(x, rows=slice(None), impl="split_k"):
         seq_lens=x.seq_lens[rows],
         sm_scale=HEAD_DIM**-0.5,
     )
-    if impl == "sm100":
-        return qsa_sparse_decode_sm100(**pool_read, rows_per_request=x.width)
+    if impl in SM100_IMPLS:
+        return qsa_sparse_decode_sm100(
+            **pool_read, rows_per_request=x.width, fp8_pv=impl == "sm100_fp8_pv"
+        )
     return qsa_sparse_decode(**pool_read)
 
 
@@ -140,41 +143,38 @@ def test_matches_sparse_attention_reference(requests, width, context, impl):
     "requests,width,shared",
     [(40, 4, True), (40, 4, False), (24, 4, True), (32, 3, True), (48, 2, True)],
 )
-def test_sm100_rows_of_a_request_share_a_cta(requests, width, shared):
+@pytest.mark.parametrize("impl", SM100_IMPLS)
+def test_sm100_rows_of_a_request_share_a_cta(requests, width, shared, impl):
     """Above one CTA per SM, 2, 3 or 4 rows of a request are merged: slots
     several rows selected are read once (``shared``), and rows that list a
     position twice keep their columns apart (random blocks repeat)."""
     if not is_sm100_supported():
         pytest.skip("needs tcgen05")
     x = _make_inputs(requests, width, 6000, seed=width, shared=shared)
-    torch.testing.assert_close(
-        _run(x, impl="sm100"), _reference(x), atol=5e-3, rtol=1e-2
-    )
+    torch.testing.assert_close(_run(x, impl=impl), _reference(x), atol=5e-3, rtol=1e-2)
 
 
-def test_sm100_group_of_rows_from_different_requests():
+@pytest.mark.parametrize("impl", SM100_IMPLS)
+def test_sm100_group_of_rows_from_different_requests(impl):
     """``rows_per_request`` only sizes the groups: rows of two requests in one
     group are each read through their own request."""
     if not is_sm100_supported():
         pytest.skip("needs tcgen05")
     x = _make_inputs(80, 2, 6000, seed=17, shared=True)
     x.width = 4
-    torch.testing.assert_close(
-        _run(x, impl="sm100"), _reference(x), atol=5e-3, rtol=1e-2
-    )
+    torch.testing.assert_close(_run(x, impl=impl), _reference(x), atol=5e-3, rtol=1e-2)
 
 
 @pytest.mark.parametrize("requests", [4, 24, 40])
-def test_sm100_score_far_above_the_first_tile(requests):
+@pytest.mark.parametrize("impl", SM100_IMPLS)
+def test_sm100_score_far_above_the_first_tile(requests, impl):
     """Scores that keep rising by more than the rescale distance move the
     per-head softmax reference and rescale the accumulated output."""
     if not is_sm100_supported():
         pytest.skip("needs tcgen05")
     x = _make_inputs(requests, 4, 6000, seed=7, shared=True)
     x.q = x.q * 30
-    torch.testing.assert_close(
-        _run(x, impl="sm100"), _reference(x), atol=2e-2, rtol=2e-2
-    )
+    torch.testing.assert_close(_run(x, impl=impl), _reference(x), atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("impl", IMPLS)
@@ -199,8 +199,11 @@ def test_deterministic_and_batch_invariant(impl):
     x = _make_inputs(32, 4, 6000, seed=3)
     out = _run(x, impl=impl)
     assert torch.equal(out, _run(x, impl=impl))
-    part = slice(0, 80) if impl == "sm100" else slice(20, 28)
-    assert torch.equal(out[part], _run(x, part, impl))
+    part = slice(0, 80) if impl in SM100_IMPLS else slice(20, 28)
+    if impl == "sm100_fp8_pv":
+        torch.testing.assert_close(out[part], _run(x, part, impl), atol=5e-3, rtol=1e-2)
+    else:
+        assert torch.equal(out[part], _run(x, part, impl))
 
 
 @pytest.mark.parametrize("cache", ["k_cache", "v_cache"])
@@ -219,7 +222,8 @@ def test_nan_in_selected_kv_propagates(cache, impl):
 
 
 @pytest.mark.parametrize("cache", ["k_cache", "v_cache"])
-def test_sm100_nan_stays_in_the_rows_that_selected_it(cache):
+@pytest.mark.parametrize("impl", SM100_IMPLS)
+def test_sm100_nan_stays_in_the_rows_that_selected_it(cache, impl):
     """A NaN in a K or V row that one row of a merged request selected must
     not reach the request's other rows (0 x NaN is NaN on the tensor core)."""
     if not is_sm100_supported():
@@ -231,7 +235,7 @@ def test_sm100_nan_stays_in_the_rows_that_selected_it(cache):
         x.indices[other][x.indices[other] == pos] = -1
     slot = int(x.req_to_token[x.row_req[row], pos])
     getattr(x, cache).view(torch.uint8)[slot, :, 37] = 0x7F
-    out, ref = _run(x, impl="sm100"), _reference(x)
+    out, ref = _run(x, impl=impl), _reference(x)
     assert torch.isnan(ref[row]).any() and not torch.isnan(ref[row + 1 : row + 4]).any()
     assert torch.equal(torch.isnan(out), torch.isnan(ref))
 
@@ -247,6 +251,24 @@ def test_cuda_graph_replay_matches_eager(impl):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(captured, eager)
+
+
+def test_sm100_fp8_pv_split_lists_graph_replay():
+    """Below one CTA per SM the fp8 PV kernel splits the longest lists over the
+    idle SMs and merges the halves; graph replays reuse the handshake counters."""
+    if not is_sm100_supported():
+        pytest.skip("needs tcgen05")
+    x = _make_inputs(40, 4, 6000, seed=21, shared=True)
+    eager = _run(x, impl="sm100_fp8_pv")
+    torch.testing.assert_close(eager, _reference(x), atol=5e-3, rtol=1e-2)
+    assert torch.equal(eager, _run(x, impl="sm100_fp8_pv"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _run(x, impl="sm100_fp8_pv")
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured, eager)
 
 
 def _fp8_backend(enabled):
@@ -314,9 +336,11 @@ def test_backend_routes_fp8_decode_to_kernel(monkeypatch, enabled):
 
 
 @pytest.mark.parametrize("mode,width", [("DECODE", 1), ("TARGET_VERIFY", 4)])
-def test_backend_routes_fp8_decode_to_sm100_kernel(mode, width):
+@pytest.mark.parametrize("impl", SM100_IMPLS)
+def test_backend_routes_fp8_decode_to_sm100_kernel(mode, width, impl):
     """With SGLANG_ENABLE_QSA_SPARSE_DECODE_SM100 on SM100, decode / verify run
-    qsa_sparse_decode_sm100, a verify chain as the rows of one request."""
+    qsa_sparse_decode_sm100, a verify chain as the rows of one request; with
+    SGLANG_QSA_SPARSE_DECODE_SM100_FP8_PV also on, its fp8 PV product."""
     if not is_sm100_supported():
         pytest.skip("needs tcgen05")
     from sglang.srt.environ import envs
@@ -331,7 +355,9 @@ def test_backend_routes_fp8_decode_to_sm100_kernel(mode, width):
     pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
     pool.quant_method = UnquantizedKVCacheMethod()
     pool.dtype = torch.float8_e4m3fn
-    with envs.SGLANG_ENABLE_QSA_SPARSE_DECODE_SM100.override(True):
+    with envs.SGLANG_ENABLE_QSA_SPARSE_DECODE_SM100.override(
+        True
+    ), envs.SGLANG_QSA_SPARSE_DECODE_SM100_FP8_PV.override(impl == "sm100_fp8_pv"):
         backend = module.QwenSparseAttnBackend(SimpleNamespace(token_to_kv_pool=pool))
     assert backend._use_sparse_decode_sm100 and not backend._use_sparse_decode_cuda
     x = _make_inputs(24, width, 6000, seed=1, shared=True)
@@ -359,7 +385,7 @@ def test_backend_routes_fp8_decode_to_sm100_kernel(mode, width):
         backend._try_fused_kv_attention(x.q, x.q, x.q, layer, batch, x.indices) is None
     )
     out = backend._forward_paged_attention(x.q, layer, batch, x.indices)
-    assert torch.equal(out, _run(x, impl="sm100").reshape(x.q.shape[0], -1))
+    assert torch.equal(out, _run(x, impl=impl).reshape(x.q.shape[0], -1))
 
 
 if __name__ == "__main__":
