@@ -1474,6 +1474,9 @@ class Envs:
     # The same on SM100 / SM103 with tcgen05; the tokens of a verify chain share
     # the KV reads of their request.
     SGLANG_ENABLE_QSA_SPARSE_DECODE_SM100 = EnvBool(False)
+    # With SGLANG_ENABLE_QSA_SPARSE_DECODE_SM100: PV on the fp8 V with two block-scaled
+    # e4m3 terms of P (changes rounding), and the longest lists split over idle SMs.
+    SGLANG_QSA_SPARSE_DECODE_SM100_FP8_PV = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)

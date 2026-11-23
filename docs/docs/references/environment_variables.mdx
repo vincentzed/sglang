@@ -1752,6 +1752,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QSA_SPARSE_DECODE_SM100_FP8_PV</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>SGLANG_ENABLE_QSA_SPARSE_DECODE_SM100=1</code>: run the PV product on the fp8 V pool with P as two block-scaled e4m3 terms (<code>kind::mxf8f6f4</code>), and split the longest lists over idle SMs below one CTA per SM. Changes rounding: per-row error 1.3-1.9x the default kernel, within one bf16 ulp in max abs.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_FP8_BLOCK_GEMV</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On SM90, route small-M (decode) blockwise-FP8 linears and router-gate logits to the Hopper GEMV kernels, and tune the KDA recurrent decode tiling.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>

@@ -318,6 +318,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             and fp8_pool
             and is_sm100_supported()
         )
+        self._sparse_decode_sm100_fp8_pv = (
+            envs.SGLANG_QSA_SPARSE_DECODE_SM100_FP8_PV.get()
+        )
         self._use_sparse_decode_cuda = (
             envs.SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA.get()
             and fp8_pool
@@ -2137,6 +2140,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                     rows_per_request=(
                         int(forward_batch.spec_info.draft_token_num) if verify else 1
                     ),
+                    fp8_pv=self._sparse_decode_sm100_fp8_pv,
                 )
             else:
                 output = qsa_sparse_decode(**pool_read)
