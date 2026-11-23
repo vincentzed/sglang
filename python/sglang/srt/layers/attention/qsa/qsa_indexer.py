@@ -58,6 +58,32 @@ def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
 _QSA_PREFILL_SELECT_MIN_ROWS = 8192
 
 
+_QSA_PREFILL_TOPK_MIN_SCORES = 1 << 23
+
+
+def _use_cuda_prefill_topk(
+    q: torch.Tensor,
+    compressed_keys: torch.Tensor,
+    block_topk: int,
+    max_row_keys: Optional[int],
+) -> bool:
+    row_keys = compressed_keys.shape[0] if max_row_keys is None else max_row_keys
+    return (
+        envs.SGLANG_ENABLE_QSA_PREFILL_TOPK_CUDA.get()
+        and q.shape[0] * row_keys >= _QSA_PREFILL_TOPK_MIN_SCORES
+        and q.is_cuda
+        and is_sm100_supported()
+        and q.dtype == torch.float8_e4m3fn
+        and compressed_keys.dtype == torch.float8_e4m3fn
+        and q.shape[0] > 0
+        and q.shape[1] == 4
+        and q.shape[2] == 128
+        and compressed_keys.shape[0] > 0
+        and block_topk == 512
+        and not is_batch_invariant_mode_enabled()
+    )
+
+
 def _use_cuda_prefill_select(
     q: torch.Tensor, compressed_keys: torch.Tensor, block_topk: int
 ) -> bool:
@@ -474,6 +500,16 @@ class QSAIndexer(MultiPlatformOp):
         kernel ran as thousands of one-CTA launches. Selection is unchanged: the
         top-k reads only each row's own section and returns indices relative to
         the row's start either way."""
+        if _use_cuda_prefill_topk(q, compressed_keys, self.block_topk, max_row_keys):
+            from sglang.kernels.ops.attention.qsa_prefill_topk import qsa_prefill_topk
+
+            return expand_qsa_block_indices(
+                qsa_prefill_topk(q, compressed_keys, row_starts, row_ends),
+                query_positions,
+                sequence_lengths_for_rows,
+                compress_ratio=self.compress_ratio,
+                token_topk=self.token_topk,
+            )
         if _use_cuda_prefill_select(q, compressed_keys, self.block_topk):
             from sglang.kernels.ops.attention.qsa_prefill_select import (
                 qsa_prefill_select,
