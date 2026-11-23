@@ -2028,6 +2028,9 @@ class Envs:
     SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # GDN prefill with the FlashInfer kernel: the conv writes l2-normalized q/k/v planes,
+    # the gates take one launch, and a tracked prefill stores only the checkpoints it reads.
+    SGLANG_OPT_GDN_FLASHINFER_PREFILL_FUSION = EnvBool(False)
     # Sequences a captured GDN extend bucket accepts (at most the request pool); a
     # larger prefill batch runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)

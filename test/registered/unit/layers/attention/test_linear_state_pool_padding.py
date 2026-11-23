@@ -84,7 +84,7 @@ class TestLinearStatePoolPadding(CustomTestCase):
                 gate = torch.zeros((1, 1, 1))
                 with patch(
                     "sglang.kernels.ops.attention.fla.l2norm.gdn_prefill_qkv_prepare_fwd",
-                    side_effect=lambda q, k, v: (q, k, v),
+                    side_effect=lambda q, k, v, **kw: (q, k, v),
                 ):
                     kernel.extend(
                         qkv,

@@ -202,6 +202,7 @@ def gdn_prefill_qkv_prepare_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
     eps: float = 1e-6,
+    joint_qk: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare Q/K/V for FlashInfer, materializing only strided inputs."""
     if q.ndim != 3 or k.shape != q.shape or v.ndim != 3:
@@ -225,6 +226,14 @@ def gdn_prefill_qkv_prepare_fwd(
     if D > 512:
         raise ValueError(f"GDN fused prepare supports head dim <= 512, got {D}")
     if q.is_contiguous() and k.is_contiguous() and v.is_contiguous():
+        if (
+            joint_qk
+            and k.untyped_storage().data_ptr() == q.untyped_storage().data_ptr()
+            and k.storage_offset() == q.storage_offset() + q.numel()
+        ):
+            qk = q.as_strided((2, *q.shape), (q.numel(), *q.stride()))
+            q_out, k_out = l2norm_fwd(qk, eps)
+            return q_out, k_out, v
         return l2norm_fwd(q, eps), l2norm_fwd(k, eps), v
 
     q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)

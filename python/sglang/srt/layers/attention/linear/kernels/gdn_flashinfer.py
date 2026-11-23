@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -131,13 +132,22 @@ def maybe_build_flashinfer_checkpoint_plan(
         raise ValueError("Tracked GDN state precedes the first FlashInfer checkpoint.")
     assert track_checkpoint_src.numel() == forward_metadata.track_ssm_h_dst.numel()
 
+    num_state_checkpoints = int(checkpoint_cu_starts[-1])
+    if envs.SGLANG_OPT_GDN_FLASHINFER_PREFILL_FUSION.get():
+        rows = torch.full((num_state_checkpoints,), -1, dtype=torch.int32)
+        rows[track_checkpoint_src] = torch.arange(
+            track_checkpoint_src.numel(), dtype=torch.int32
+        )
+        forward_metadata.state_checkpoint_indices = rows.to(device, non_blocking=True)
+        track_checkpoint_src = torch.arange(track_checkpoint_src.numel())
+        num_state_checkpoints = track_checkpoint_src.numel()
     forward_metadata.track_ssm_h_src = track_checkpoint_src.to(
         device, non_blocking=True
     )
     forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.to(
         device, non_blocking=True
     )
-    forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
+    forward_metadata.num_state_checkpoints = num_state_checkpoints
     forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
 
 
@@ -251,6 +261,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     # extend() gathers each request's state by pool index and scatters the
     # final state back the same way, so any slot pitch works.
     extend_honors_slot_pitch = True
+    accepts_normalized_qk = True
+    _joint_qk_l2norm: bool = False
 
     def __init__(self):
         (
@@ -281,6 +293,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ] = {}
         self._verify_intermediate_buffers: dict[tuple, torch.Tensor] = {}
         self._alignment_fallback_warned = False
+        self._joint_qk_l2norm = envs.SGLANG_OPT_GDN_FLASHINFER_PREFILL_FUSION.get()
+        self.defers_prefill_gates = envs.SGLANG_OPT_GDN_FLASHINFER_PREFILL_FUSION.get()
         # FlashInfer writes through mutable state/workspace pointers, so misaligned
         # inputs must fall back to Triton rather than use temporary copies.
         from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
@@ -566,12 +580,20 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         from sglang.kernels.ops.attention.fla.l2norm import (
             gdn_prefill_qkv_prepare_fwd,
         )
+        from sglang.kernels.ops.attention.linear.fused_gdn_gating import (
+            fused_gdn_alpha_beta,
+        )
 
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
 
-        q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(q[0], k[0], v[0])
+        if kwargs.get("qk_normalized"):
+            q_fi, k_fi, v_fi = q[0], k[0], v[0]
+        else:
+            q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(
+                q[0], k[0], v[0], joint_qk=self._joint_qk_l2norm
+            )
 
         output = kwargs.get("output")
         output_fi = None
@@ -597,9 +619,14 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if not output_fi.is_contiguous():
                 raise ValueError("FlashInfer GDN prefill output must be contiguous")
 
-        # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
-        alpha_fi = torch.exp(g[0].to(torch.float32))
-        beta_fi = beta[0].to(torch.float32)
+        if g is None:
+            alpha_fi, beta_fi = fused_gdn_alpha_beta(
+                kwargs["A_log"], kwargs["a"], kwargs["b"], kwargs["dt_bias"]
+            )
+        else:
+            # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
+            alpha_fi = torch.exp(g[0].to(torch.float32))
+            beta_fi = beta[0].to(torch.float32)
 
         ssm_cache_indices, live_rows, initial_state_fi = gather_pool_states(
             ssm_states, cache_indices
@@ -629,6 +656,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=state_checkpoint_cu_starts,
             checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+            checkpoint_state_indices=kwargs.get("state_checkpoint_indices"),
         )
 
         # Write back state to pool
@@ -661,7 +689,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         checkpoint_cu_starts: Optional[torch.Tensor],
         checkpoint_every_n_tokens: int,
         use_cp: str | bool = "auto",
+        checkpoint_state_indices: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if checkpoint_state_indices is not None:
+            kwargs = {"checkpoint_state_indices": checkpoint_state_indices}
+        else:
+            kwargs = {}
         return self._prefill_fn(
             q=q,
             k=k,
@@ -679,6 +712,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             use_cp=use_cp,
+            **kwargs,
         )
 
     def prewarm_extend(
@@ -763,6 +797,23 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 **checkpoints,
                 checkpoint_every_n_tokens=every_n_tokens,
                 use_cp=False,
+            )
+            num_runs += 1
+        if envs.SGLANG_OPT_GDN_FLASHINFER_PREFILL_FUSION.get() and (
+            checkpoint_every_n_tokens > 0
+        ):
+            checkpoints = modes[checkpoint_every_n_tokens]
+            self._run_prefill(
+                **inputs,
+                **checkpoints,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                use_cp=False,
+                checkpoint_state_indices=torch.full(
+                    (checkpoints["state_checkpoints"].shape[0],),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
             )
             num_runs += 1
 
