@@ -1036,6 +1036,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def set_mamba_path_cap_counts_host(self, enabled: bool) -> None:
         self._binding.set_mamba_path_cap_counts_host(enabled)
 
+    def set_mamba_path_cap_grid(self, grid: int) -> None:
+        self._binding.set_mamba_path_cap_grid(grid)
+
     @property
     def is_host_memory_buffer_only(self) -> bool:
         return self._binding.is_host_memory_buffer_only()

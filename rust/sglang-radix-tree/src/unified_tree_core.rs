@@ -682,6 +682,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// The per-path Mamba cap also counts host copies and frees the host
     /// copies of the states it caps (opt-in, decided at HiCache init).
     pub(crate) mamba_path_cap_counts_host: bool,
+    /// The per-path Mamba cap keeps the deepest state of each span of this
+    /// many tokens on the path on top of the cap; 0 keeps none.
+    pub(crate) mamba_path_cap_grid: usize,
 
     /// Per-component monotonic sources for lock-segment UUIDs.
     pub(crate) component_uuid_counters: [i64; NUM_COMPONENT_TYPES],
@@ -1071,6 +1074,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             namespaced_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
             mamba_path_cap_counts_host: false,
+            mamba_path_cap_grid: 0,
             component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
             device: params.device,
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
@@ -3920,6 +3924,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Make the per-path Mamba cap count and free host copies; opt-in, decided at HiCache init.
     pub fn set_mamba_path_cap_counts_host(&mut self, enabled: bool) {
         self.mamba_path_cap_counts_host = enabled;
+    }
+
+    /// Keep the deepest Mamba state of each `grid`-token span past the path cap; 0 turns it off.
+    pub fn set_mamba_path_cap_grid(&mut self, grid: usize) {
+        self.mamba_path_cap_grid = grid;
     }
 
     pub fn enable_storage(&self) -> bool {
