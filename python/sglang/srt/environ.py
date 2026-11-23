@@ -2045,6 +2045,10 @@ class Envs:
     # checkpoint only when it fills (as fp32 checkpoints do) instead of after every
     # accepted verify window.
     SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD = EnvBool(False)
+    # GDN ReplaySSM commit with a bf16 checkpoint and the compact bf16 ring on SM100: fold
+    # the full rings in a CUDA tcgen05 kernel instead of the Triton commit (which then
+    # writes only track rows).
+    SGLANG_OPT_GDN_REPLAYSSM_FOLD_CUDA = EnvBool(False)
     # GDN ReplaySSM spec-verify with a bf16 checkpoint and the compact bf16 ring:
     # run the verify in the CUDA tensor-core kernel instead of the Triton kernel.
     SGLANG_ENABLE_GDN_REPLAYSSM_VERIFY_CUDA = EnvBool(False)

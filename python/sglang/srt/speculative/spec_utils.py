@@ -1392,6 +1392,7 @@ def commit_mamba_states_after_verify(
                 spec_state.temporal.dtype != torch.float32
                 and not envs.SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD.get()
             ),
+            fold_cuda=envs.SGLANG_OPT_GDN_REPLAYSSM_FOLD_CUDA.get(),
             mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
