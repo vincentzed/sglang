@@ -437,6 +437,71 @@ def test_select_prefill_tokens_relative_matches_absolute(
     assert longer_than_topk > 0, "no row exercises the top-k cut"
 
 
+def test_cuda_prefill_topk_is_exact_topk_of_its_scores(monkeypatch):
+    """Per row, the 512 best of the raw head sums the kernel scores, ties to the
+    lower key index; the sums match fp64 and short rows get 0..len-1, then -1."""
+    from sglang.kernels.ops.attention import qsa_prefill_topk as topk_module
+    from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
+    from sglang.srt.utils.device import is_sm100_supported
+
+    if not is_sm100_supported():
+        pytest.skip("needs an SM100 GPU")
+    device = torch.device("cuda")
+    q, k, starts, ends, width = _packed_prefill_case(
+        [704, 3008, 1504, 9008],
+        37,
+        device,
+        torch.float8_e4m3fn,
+        seed=7,
+        empty_rows=True,
+    )
+    q.view(torch.uint8)[::5] = 0
+    k.view(torch.uint8)[100:2000:3] = k.view(torch.uint8)[99]
+    lengths = (ends - starts).long()
+    indexer = SimpleNamespace(token_topk=2048, compress_ratio=RATIO, block_topk=512)
+    seq_lens = torch.where(lengths > 0, lengths * RATIO, 2).to(torch.int32)
+    args = (indexer, q, k, starts, ends, (seq_lens - 1).long(), seq_lens)
+    reference = QSAIndexer.select_prefill_tokens(*args, max_row_keys=width)
+
+    monkeypatch.setenv("SGLANG_ENABLE_QSA_PREFILL_TOPK_CUDA", "1")
+    monkeypatch.setattr(qsa_indexer_module, "_QSA_PREFILL_TOPK_MIN_SCORES", 1)
+    calls = []
+    cuda_topk = topk_module.qsa_prefill_topk
+    monkeypatch.setattr(
+        topk_module, "qsa_prefill_topk", lambda *a: calls.append(1) or cuda_topk(*a)
+    )
+    full = QSAIndexer.select_prefill_tokens(*args, max_row_keys=width)
+    assert len(calls) == 1
+    own = torch.zeros(q.shape[0], width, dtype=torch.float32, device=device)
+    blocks = cuda_topk(q, k, starts, ends, 0, own)
+    for splits in (1, 7):
+        again = cuda_topk(q, k, starts, ends, splits)
+        assert torch.equal(blocks.sort(1).values, again.sort(1).values)
+
+    over_topk = 0
+    for row in range(q.shape[0]):
+        length = int(lengths[row])
+        if length <= indexer.block_topk:
+            expect = torch.arange(512, device=device, dtype=torch.int32)
+            assert torch.equal(blocks[row], torch.where(expect < length, expect, -1))
+            assert torch.equal(full[row], reference[row]), row
+            continue
+        row_scores = own[row, :length]
+        start = int(starts[row])
+        dots = q[row, :4].double() @ k[start : start + length, 0].double().T
+        expected = dots.relu().sum(0).float()
+        torch.testing.assert_close(row_scores, expected, rtol=1e-5, atol=1e-4)
+        cut = torch.topk(row_scores, indexer.block_topk).values[-1]
+        above = torch.nonzero(row_scores > cut).flatten()
+        ties = torch.nonzero(row_scores == cut).flatten()
+        expect = torch.cat([above, ties[: indexer.block_topk - above.numel()]])
+        assert torch.equal(blocks[row].long().sort().values, expect.sort().values), row
+        picked = torch.unique(full[row][full[row] >= 0].long() // RATIO)
+        assert torch.equal(picked[picked < length], expect.sort().values), row
+        over_topk += 1
+    assert over_topk > 0, "no row exercises the top-k cut"
+
+
 def test_prefill_max_row_keys_reads_host_lengths_only():
     """The relative logits width comes from host lengths: the prefill tuple when
     set, else the scheduler's seq_lens_cpu; with neither it is None (the

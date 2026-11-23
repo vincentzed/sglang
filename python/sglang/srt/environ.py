@@ -1474,6 +1474,9 @@ class Envs:
     # warmup. Opt-in: the extra forward needs transient activation headroom
     # that small-VRAM or tightly-packed configs may not have.
     SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
+    # QSA (Qwen4-Exp) prefill block selection on SM100 / SM103 with an fp8_e4m3
+    # indexer cache: fused tcgen05 scoring and exact top-512, no score matrix.
+    SGLANG_ENABLE_QSA_PREFILL_TOPK_CUDA = EnvBool(False)
     # Opt-in BF16 GEMM dispatch for measured Cosmos3 GEN shapes on RTX PRO 6000.
     SGLANG_OPT_COSMOS3_SM120_GEMM = EnvBool(False)
     SGLANG_ENABLE_FLUX3_PRIMS_TS_AUTOTUNE = EnvBool(False)

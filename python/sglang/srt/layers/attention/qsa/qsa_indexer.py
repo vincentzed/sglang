@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -35,7 +36,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.device import is_gfx95_supported
+from sglang.srt.utils.device import is_gfx95_supported, is_sm100_supported
 
 _is_npu = is_npu()
 
@@ -52,6 +53,32 @@ def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     max_padded_rows = max(block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row)
     max_padded_rows = max(block_q, max_padded_rows // block_q * block_q)
     return min(rows, max_padded_rows)
+
+
+_QSA_PREFILL_TOPK_MIN_SCORES = 1 << 23
+
+
+def _use_cuda_prefill_topk(
+    q: torch.Tensor,
+    compressed_keys: torch.Tensor,
+    block_topk: int,
+    max_row_keys: Optional[int],
+) -> bool:
+    row_keys = compressed_keys.shape[0] if max_row_keys is None else max_row_keys
+    return (
+        envs.SGLANG_ENABLE_QSA_PREFILL_TOPK_CUDA.get()
+        and q.shape[0] * row_keys >= _QSA_PREFILL_TOPK_MIN_SCORES
+        and q.is_cuda
+        and is_sm100_supported()
+        and q.dtype == torch.float8_e4m3fn
+        and compressed_keys.dtype == torch.float8_e4m3fn
+        and q.shape[0] > 0
+        and q.shape[1] == 4
+        and q.shape[2] == 128
+        and compressed_keys.shape[0] > 0
+        and block_topk == 512
+        and not is_batch_invariant_mode_enabled()
+    )
 
 
 class QSAIndexer(MultiPlatformOp):
@@ -452,6 +479,16 @@ class QSAIndexer(MultiPlatformOp):
         kernel ran as thousands of one-CTA launches. Selection is unchanged: the
         top-k reads only each row's own section and returns indices relative to
         the row's start either way."""
+        if _use_cuda_prefill_topk(q, compressed_keys, self.block_topk, max_row_keys):
+            from sglang.kernels.ops.attention.qsa_prefill_topk import qsa_prefill_topk
+
+            return expand_qsa_block_indices(
+                qsa_prefill_topk(q, compressed_keys, row_starts, row_ends),
+                query_positions,
+                sequence_lengths_for_rows,
+                compress_ratio=self.compress_ratio,
+                token_topk=self.token_topk,
+            )
         rows = q.shape[0]
         output = torch.empty(
             (rows, self.token_topk + self.compress_ratio - 1),
