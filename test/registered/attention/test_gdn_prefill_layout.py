@@ -1,8 +1,10 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.attention.fla import layernorm_gated
 from sglang.kernels.ops.attention.fla.l2norm import (
     gdn_prefill_qkv_prepare_fwd,
     l2norm_fwd,
@@ -88,6 +90,26 @@ class TestGdnPrefillLayout(unittest.TestCase):
                     actual[:valid_tokens], expected[:valid_tokens], rtol=0, atol=0
                 )
                 torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
+
+    def test_wide_row_blocks_match_default_gated_norm(self):
+        device = torch.device("cuda")
+        sm_count = layernorm_gated._get_sm_count(device)
+        rows = 4 * layernorm_gated.WIDE_ROWS_PER_BLOCK * sm_count + 5
+        torch.manual_seed(0)
+        x = torch.randn(rows, self.HEAD_DIM, dtype=torch.bfloat16, device=device)
+        z = torch.randn_like(x)
+        weight = torch.randn(self.HEAD_DIM, dtype=x.dtype, device=device)
+
+        def run():
+            return rms_norm_gated(x=x, weight=weight, bias=None, z=z, is_rms_norm=True)
+
+        expected = run()
+        with patch.object(layernorm_gated, "_wide_rows", True):
+            self.assertEqual(
+                layernorm_gated.calc_rows_per_block(rows, device),
+                layernorm_gated.WIDE_ROWS_PER_BLOCK,
+            )
+            torch.testing.assert_close(run(), expected, rtol=0, atol=0)
 
     def _projection_views(self, dtype):
         qkv_dim = (
