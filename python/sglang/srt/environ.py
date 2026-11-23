@@ -2044,6 +2044,18 @@ class Envs:
     # Gated RMSNorm (the GDN output norm): 16 rows per block on 4 warps for
     # launches with many rows per SM (a prefill) instead of 4 rows on 1 warp.
     SGLANG_OPT_GATED_NORM_WIDE_ROWS = EnvBool(False)
+    # GDN target verify: the conv, gated norm and verify kernel read q|k|v, z, b
+    # and a as strided views of the in_proj output instead of a split copy.
+    SGLANG_OPT_GDN_VERIFY_PROJ_VIEWS = EnvBool(False)
+    # Accepted conv-window scatter after a verify: 8192-element programs on 8
+    # warps instead of 1024-element programs on 4.
+    SGLANG_OPT_CONV_WINDOW_SCATTER_WIDE_BLOCKS = EnvBool(False)
+    # Qwen4 PLE short conv in target verify: one kernel (window build, depthwise
+    # conv, SiLU, residual add and the per-step state cache) instead of three.
+    SGLANG_OPT_QWEN4_VERIFY_CONV_ONE_PASS = EnvBool(False)
+    # Greedy top-1 EAGLE/NEXTN draft steps: the draft argmax reads the LM head's
+    # BF16 logits instead of an FP32 copy of them.
+    SGLANG_OPT_DRAFT_TOP1_BF16_LOGITS = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
