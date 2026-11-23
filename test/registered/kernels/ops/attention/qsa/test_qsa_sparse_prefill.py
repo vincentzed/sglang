@@ -1,6 +1,7 @@
 """qsa_sparse_prefill_sm100 (tcgen05, groups of consecutive rows over the union
-of their selected positions) against the Triton chunk-prefill path it replaces,
-plus the backend wiring behind SGLANG_ENABLE_QSA_SPARSE_PREFILL_SM100.
+of their selected positions, on fp8 K and bf16 V packed per sequence) against
+the Triton chunk-prefill path it replaces, plus the backend wiring behind
+SGLANG_ENABLE_QSA_SPARSE_PREFILL_SM100.
 
 Shapes follow Qwen4-Exp QSA layers: 24 q heads over 2 KV heads, head_dim 256,
 an fp8_e4m3 KV pool and top-k rows of 2048 block-expanded positions plus a
@@ -97,25 +98,9 @@ def _make_inputs(seqs, seed, repeat_a_position=False):
     )
 
 
-def _run(x):
-    return qsa_sparse_prefill_sm100(
-        x.q,
-        x.k_cache,
-        x.v_cache,
-        x.req_to_token,
-        x.req_indices,
-        x.indices,
-        x.cu_q,
-        x.lens_t,
-        SCALE,
-        extend_lens=x.extend,
-        max_seq_len=max(x.lens),
-    )
-
-
-def _triton(x):
+def _pack(x, **dtypes):
     cu_k = F.pad(x.lens_t.cumsum(0), (1, 0)).int()
-    packed_k, packed_v = pack_qsa_prefill_kv(
+    packed = pack_qsa_prefill_kv(
         k=x.k_cache,
         v=x.v_cache,
         req_to_token=x.req_to_token,
@@ -123,8 +108,30 @@ def _triton(x):
         cu_k=cu_k,
         total_k=sum(x.lens),
         max_k=max(x.lens),
-        output_dtype=x.q.dtype,
+        **dtypes,
     )
+    return cu_k, *packed
+
+
+def _run(x, rows_per_group=None):
+    cu_k, packed_k, packed_v = _pack(x, value_dtype=torch.bfloat16)
+    return qsa_sparse_prefill_sm100(
+        x.q,
+        packed_k,
+        packed_v,
+        x.indices,
+        x.cu_q,
+        cu_k,
+        x.lens_t,
+        SCALE,
+        extend_lens=x.extend,
+        max_seq_len=max(x.lens),
+        rows_per_group=rows_per_group,
+    )
+
+
+def _triton(x):
+    cu_k, packed_k, packed_v = _pack(x, output_dtype=x.q.dtype)
     return sparse_gqa_fwd_interface_triton_ck(
         x.q, packed_k, packed_v, x.indices, x.cu_q, cu_k, x.lens_t, SCALE
     )
@@ -139,17 +146,38 @@ def _triton(x):
         [(40000, 300), (1000, 77)],
     ],
 )
-def test_matches_triton_chunk_prefill(seqs):
+@pytest.mark.parametrize("rows_per_group", [4, 8])
+def test_matches_triton_chunk_prefill(seqs, rows_per_group):
     """The first rows of a sequence (fewer positions than top-k), a cached
     prefix, several sequences in one batch, groups cut short at the end of a
     sequence, and -1 padding."""
     x = _make_inputs(seqs, seed=len(seqs) + seqs[0][1])
-    torch.testing.assert_close(_run(x), _triton(x), atol=5e-3, rtol=1e-2)
+    torch.testing.assert_close(
+        _run(x, rows_per_group), _triton(x), atol=1e-2, rtol=2e-2
+    )
+
+
+@pytest.mark.parametrize("rows_per_group", [4, 8])
+@pytest.mark.parametrize("key_byte", [0x68, 0x78])
+def test_scores_far_above_the_first_tiles_move_the_reference(rows_per_group, key_byte):
+    """The positions from 3000 on score 2^92 (e4m3 0x68 = 64) or 2^369 (0x78 =
+    256) times the ones before them: the softmax reference moves in the middle
+    of a group's list, in the tile where the scores first cross it."""
+    x = _make_inputs([(6000, 70)], seed=7)
+    x.q[:, :, 0] = 16.0
+    positions = torch.arange(x.lens[0], device="cuda")
+    slots = x.req_to_token[1, : x.lens[0]].long()
+    x.k_cache.view(torch.uint8)[slots, :, 0] = torch.where(
+        positions >= 3000, key_byte, 0
+    )[:, None].to(torch.uint8)
+    torch.testing.assert_close(
+        _run(x, rows_per_group), _triton(x), atol=1e-2, rtol=2e-2
+    )
 
 
 def test_a_repeated_position_keeps_the_rows_of_its_group_apart():
     x = _make_inputs([(3000, 24)], seed=3, repeat_a_position=True)
-    torch.testing.assert_close(_run(x), _triton(x), atol=5e-3, rtol=1e-2)
+    torch.testing.assert_close(_run(x), _triton(x), atol=1e-2, rtol=2e-2)
 
 
 def test_rows_do_not_depend_on_the_rest_of_the_batch():
@@ -247,6 +275,6 @@ def test_backend_routes_extend_to_sm100_kernel(monkeypatch, enabled):
             topk_indices=x.indices,
         )
         torch.testing.assert_close(
-            out.reshape(x.q.shape), _triton(x), atol=5e-3, rtol=1e-2
+            out.reshape(x.q.shape), _triton(x), atol=1e-2, rtol=2e-2
         )
         assert calls == (routed_rows if enabled else [])

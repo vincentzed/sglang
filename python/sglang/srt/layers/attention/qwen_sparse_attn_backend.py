@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
-_SPARSE_PREFILL_SM100_MIN_ROWS = 8192
+_SPARSE_PREFILL_SM100_MIN_ROWS = 256
 
 
 def _flatten_qsa_kv_cache(cache: torch.Tensor, name: str) -> torch.Tensor:
@@ -326,6 +326,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     _use_sparse_decode_cuda: bool = False
     _use_sparse_decode_sm100: bool = False
     _use_sparse_prefill_sm100: bool = False
+    _sparse_prefill_sm100_logged: bool = False
 
     def __init__(self, runner=None) -> None:
         self.runner = runner
@@ -1723,7 +1724,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
             (1, 0),
         ).contiguous()
-        if (
+        use_prefill_sm100 = (
             self._use_sparse_prefill_sm100
             and save_kv_cache
             and num_valid_rows >= _SPARSE_PREFILL_SM100_MIN_ROWS
@@ -1731,24 +1732,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             and max(sequence_lens) <= MAX_KV_LEN
             and layer.head_dim == 256
             and q.dtype == torch.bfloat16
+            and layer.tp_q_head_num % (4 * layer.tp_k_head_num) == 0
             and layer.tp_q_head_num <= MAX_HEADS_PER_KV_HEAD * layer.tp_k_head_num
-        ):
-            pool = self.token_to_kv_pool
-            output = qsa_sparse_prefill_sm100(
-                q.contiguous(),
-                pool.layer_router.read(layer.layer_id).key(),
-                pool.layer_router.read(layer.layer_id).value(),
-                self.req_to_token_pool.req_to_token,
-                forward_batch.req_pool_indices,
-                topk_indices,
-                cu_seqlens_q,
-                forward_batch.seq_lens.to(q.device, dtype=torch.int32),
-                layer.scaling,
-                extend_lens=extend_lens,
-                max_seq_len=max(sequence_lens),
-            )
-            return self._pad_extend_output(output, num_output_rows)
-        if not any(prefix_lens):
+        )
+        if not any(prefix_lens) and not use_prefill_sm100:
             output = sparse_gqa_fwd_interface_triton(
                 q.contiguous(),
                 k[:num_valid_rows].contiguous(),
@@ -1782,8 +1769,31 @@ class QwenSparseAttnBackend(AttentionBackend):
             cu_k=cu_seqlens_k,
             total_k=sum(sequence_lens),
             max_k=max(sequence_lens, default=1),
-            output_dtype=q.dtype,
+            output_dtype=None if use_prefill_sm100 else q.dtype,
+            value_dtype=q.dtype if use_prefill_sm100 else None,
         )
+        if use_prefill_sm100:
+            if not self._sparse_prefill_sm100_logged:
+                self._sparse_prefill_sm100_logged = True
+                logger.info(
+                    "QSA prefill sparse attention runs qsa_sparse_prefill_sm100 "
+                    "(first use: %d rows, layer %d)",
+                    num_valid_rows,
+                    layer.layer_id,
+                )
+            output = qsa_sparse_prefill_sm100(
+                q.contiguous(),
+                packed_k,
+                packed_v,
+                topk_indices,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                sequence_lens_tensor,
+                layer.scaling,
+                extend_lens=extend_lens,
+                max_seq_len=max(sequence_lens),
+            )
+            return self._pad_extend_output(output, num_output_rows)
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
             packed_k,

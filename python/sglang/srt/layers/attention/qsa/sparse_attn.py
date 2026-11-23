@@ -343,14 +343,25 @@ def _pack_qsa_prefill_kv(
 
 
 def pack_qsa_prefill_kv(
-    *, k, v, req_to_token, req_indices, cu_k, total_k, max_k, output_dtype=None
+    *,
+    k,
+    v,
+    req_to_token,
+    req_indices,
+    cu_k,
+    total_k,
+    max_k,
+    output_dtype=None,
+    value_dtype=None,
 ):
     heads, dim = k.shape[1:]
     packed_k = torch.empty(
         (total_k, heads, dim), dtype=output_dtype or k.dtype, device=k.device
     )
     packed_v = torch.empty(
-        (total_k, heads, dim), dtype=output_dtype or v.dtype, device=v.device
+        (total_k, heads, dim),
+        dtype=value_dtype or output_dtype or v.dtype,
+        device=v.device,
     )
     batch_size = req_indices.numel()
     blocks_per_request = triton.cdiv(max_k * heads * dim, 1024)

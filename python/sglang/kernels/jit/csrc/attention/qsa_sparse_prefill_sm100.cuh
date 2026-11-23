@@ -1,6 +1,6 @@
-// QSA prefill sparse attention over an FP8 E4M3 KV pool on SM100 (tcgen05): a union kernel merges the top-k rows of
-// kRows consecutive query rows of a sequence into one ascending slot list with a row mask per slot, an attention
-// kernel attends that list once per KV head.
+// QSA prefill sparse attention on SM100 (tcgen05) over the sequences' K (fp8 e4m3) and V (bf16) packed back to back:
+// a union kernel merges the top-k rows of kRows consecutive query rows of a sequence into one ascending list of
+// packed rows with a row mask each, an attention kernel attends that list once per KV head.
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/warp.cuh>
 
@@ -20,46 +20,60 @@ using qsa_sparse_decode::cp_async_wait;
 using qsa_sparse_decode::ex2_approx;
 using qsa_sparse_decode::kD;
 using qsa_sparse_decode_sm100::bf16x2_e4m3_terms;
-using qsa_sparse_decode_sm100::e4m3x8_f16x8;
-using qsa_sparse_decode_sm100::f32x2_f16x2;
 using qsa_sparse_decode_sm100::kMaxSmem;
 using qsa_sparse_decode_sm100::kPlane;
-using qsa_sparse_decode_sm100::kRescale;
-using qsa_sparse_decode_sm100::kThreads;
 using qsa_sparse_decode_sm100::kTile;
 using qsa_sparse_decode_sm100::kWorkers;
 using tcgen05 = device::ptx::TCGen05<1>;
 
-constexpr int kStages = 2;  // V items (128 slots x 128 d) in shared memory
-constexpr int kRing = 8;    // tiles of entries in shared memory
+constexpr int kBlock = kWorkers + 64;  // the workers, the warp that issues the QK MMAs and the one of the PV MMAs
+constexpr int kSync = kWorkers + 32;   // a named barrier joins the workers and one issuing warp
+constexpr int kRing = 8;               // tiles of entries in shared memory
+constexpr float kMove = 40.f;          // log2 distance of a score above its head's reference that moves the reference
 constexpr int kUnionThreads = 512;
 constexpr int kMeta = 4;  // per group: slots, first row, rows, sequence
 
 struct UnionParams {
-  const int32_t* idx;           // [R, TOPK] logical positions, -1 = hole
-  const int32_t* cu_q;          // [S + 1] first row of each sequence
-  const int32_t* kv_len;        // [S] sequence length with its rows
-  const int32_t* req;           // [S] row of req_to_token
-  const int32_t* req_to_token;  // [requests, context]
-  int32_t* slots;               // [G, cap]
-  uint8_t* masks;               // [G, cap]
-  int32_t* meta;                // [G, kMeta]
-  int64_t stride_idx, stride_r2t;
+  const int32_t* idx;     // [R, TOPK] logical positions, -1 = hole
+  const int32_t* cu_q;    // [S + 1] first row of each sequence
+  const int32_t* cu_k;    // [S + 1] first packed K / V row of each sequence
+  const int32_t* kv_len;  // [S] sequence length with its rows
+  int32_t* slots;         // [G, cap] packed K / V rows
+  uint8_t* masks;         // [G, cap]
+  int32_t* meta;          // [G, kMeta]
+  int64_t stride_idx;
   int32_t topk, cap, nseq, map_words;
 };
 
 struct Params {
   const uint16_t* q;  // bf16 [R, HQ, D]
-  const uint8_t* k;   // fp8 e4m3 [slots, HKV, D]
-  const uint8_t* v;
+  const uint8_t* k;   // fp8 e4m3 [rows, HKV, D]
+  const uint8_t* v;   // bf16 [rows, HKV, D]
   const int32_t* slots;
   const uint8_t* masks;
   const int32_t* meta;
   uint16_t* out;  // bf16 [R, HQ, D]
-  int64_t stride_qr, stride_qh, stride_kslot, stride_kh, stride_or, stride_oh;
+  int64_t stride_qr, stride_qh, stride_krow, stride_kh, stride_vrow, stride_vh, stride_or, stride_oh;
   float qk_scale;
   int32_t cap, HKV;
 };
+
+SGL_DEVICE uint32_t f32x2_bf16x2(const float lo, const float hi) {
+  uint32_t r;
+  asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
+  return r;
+}
+
+// true on every thread of the warpgroup that waits on barrier `id` when `pred` holds on one of them
+SGL_DEVICE bool any_in_warpgroup(const int id, const bool pred) {
+  uint32_t r;
+  asm volatile(
+      "{\n .reg .pred p, q;\n setp.ne.u32 q, %1, 0;\n bar.red.or.pred p, %2, 128, q;\n selp.u32 %0, 1, 0, p;\n}"
+      : "=r"(r)
+      : "r"(static_cast<uint32_t>(pred)), "r"(id)
+      : "memory");
+  return r != 0;
+}
 
 // bit 8 i set when byte i of `w` is not zero
 SGL_DEVICE uint32_t used_bytes(const uint32_t w) {
@@ -100,7 +114,7 @@ __global__ void __launch_bounds__(kUnionThreads) union_kernel(const __grid_const
   const int n = min(kRows, q1 - row0);
   const int vis0 = p.kv_len[s] - q1 + row0 + 1;  // positions row0 may attend
   const int words = (vis0 + n + 2) >> 2;
-  const int32_t* const r2t = p.req_to_token + static_cast<int64_t>(p.req[s]) * p.stride_r2t;
+  const int base = p.cu_k[s];
   int32_t* const out_slot = p.slots + static_cast<int64_t>(group) * p.cap;
   uint8_t* const out_mask = p.masks + static_cast<int64_t>(group) * p.cap;
 
@@ -151,7 +165,7 @@ __global__ void __launch_bounds__(kUnionThreads) union_kernel(const __grid_const
       while (used != 0) {
         const int b = __ffs(used) - 1;
         used &= used - 1;
-        out_slot[o] = r2t[4 * w + (b >> 3)];
+        out_slot[o] = base + 4 * w + (b >> 3);
         out_mask[o] = static_cast<uint8_t>(word >> b);
         ++o;
       }
@@ -165,7 +179,7 @@ __global__ void __launch_bounds__(kUnionThreads) union_kernel(const __grid_const
         for (int c = tid; c < p.topk; c += threads) {
           const int pos = row[c];
           const bool ok = pos >= 0 && pos < vis0 + j;
-          out_slot[j * p.topk + c] = ok ? r2t[pos] : 0;
+          out_slot[j * p.topk + c] = ok ? base + pos : 0;
           out_mask[j * p.topk + c] = ok ? static_cast<uint8_t>(1u << j) : 0;
           if (ok) last = j * p.topk + c + 1;
         }
@@ -191,34 +205,41 @@ __global__ void __launch_bounds__(kUnionThreads) union_kernel(const __grid_const
 
 template <int kRows, int kHeads>
 struct Layout {
-  static constexpr int kReal = kRows * kHeads;                                       // head columns, query row major
-  static constexpr int kNQ = (2 * kReal + 7) & -8;                                   // QK N: hi terms, lo terms, zeros
-  static constexpr int kPer = ((kReal + 3) / 4 + 1) & -2;                            // heads of one softmax warpgroup
-  static constexpr int kWin = kPer <= 4 ? 4 : kPer <= 8 ? 8 : kPer <= 16 ? 16 : 32;  // TMEM columns per term
+  static constexpr int kReal = kRows * kHeads;  // head columns, query row major
+  static constexpr int kNQ = 2 * kReal;         // QK N: hi terms, lo terms
+  static constexpr int kPer = kReal / 4;        // heads of one softmax warpgroup: those of kRows / 4 query rows
+  // P row and O lane of head n: 32 (n / kPer) + n % kPer
   static constexpr int kQPlane = kNQ * 128;
-  static constexpr int kTmemCols = 512;             // S [kNQ], O [kD]
-  static constexpr int op_v = 0;                    // f16 V tile, 4 planes [slot][64 d]
-  static constexpr int op_k = op_v + 4 * kPlane;    // fp8 K tile, 2 planes [slot][128 d]
-  static constexpr int stg = op_k + 2 * kPlane;     // fp8 V items
-  static constexpr int q = stg + kStages * kPlane;  // e4m3 Q terms, 2 planes [column][128 d]
-  static constexpr int pr = q + 2 * kQPlane;        // f16 P, 2 planes [slot][64 heads]
-  static constexpr int ent = pr + 2 * kPlane;       // slots of kRing tiles
+  static constexpr int kTmemCols = 512;           // S [kNQ], O [kD]
+  static constexpr int op_v = 0;                  // bf16 V tile, 4 planes [slot][64 d]
+  static constexpr int op_k = op_v + 4 * kPlane;  // fp8 K tiles of even / odd t, 2 planes [slot][128 d] each
+  static constexpr int q = op_k + 4 * kPlane;     // e4m3 Q terms, 2 planes [column][128 d]
+  static constexpr int pr = q + 2 * kQPlane;      // bf16 P, 2 planes [slot][64 heads]
+  static constexpr int ent = pr + 2 * kPlane;     // packed rows of kRing tiles
   static constexpr int msk = ent + kRing * kTile * 4;
   static constexpr int red = msk + kRing * kTile;  // [128][4 warps] f32
   static constexpr int fac = red + 128 * 16;       // [128] f32
   static constexpr int ref = fac + 128 * 4;        // [128] f32: -reference of each head, log2 units
-  static constexpr int refn = ref + 128 * 4;
-  static constexpr int flag = refn + 128 * 4;  // [16 warps] u8, u32
-  static constexpr int bar = flag + 24;        // mbarriers: QK, PV
+  static constexpr int has = ref + 128 * 4;        // [128] u32: the head has a reference
+  static constexpr int off = has + 128 * 4;        // [16] f32: -inf
+  static constexpr int flag = off + 64;            // [2][16 warps] u8, [4 warpgroups] u8
+  static constexpr int bar = flag + 40;            // mbarriers: QK, PV
   static constexpr int tmem = bar + 16;
   static constexpr int bytes = tmem + 8;
 };
 
 // Worker: the group's q heads as e4m3 terms in the 128 B-swizzled QK operand, rows [0, kReal) hi and
-// [kReal, 2 kReal) lo; rows past `rows` query rows are zero. Returns the score scale in log2 units.
-template <int kRows, int kHeads>
-SGL_DEVICE float
-split_q(const Params& p, const int row0, const int rows, const int kvh, uint8_t* const s_q, float* const s_red) {
+// [kReal, 2 kReal) lo; rows past `rows` query rows are zero. `after_scan` runs once the workers' pending copies
+// are in. Returns the score scale in log2 units.
+template <int kRows, int kHeads, typename AfterScan>
+SGL_DEVICE float split_q(
+    const Params& p,
+    const int row0,
+    const int rows,
+    const int kvh,
+    uint8_t* const s_q,
+    float* const s_red,
+    const AfterScan after_scan) {
   using Lay = Layout<kRows, kHeads>;
   constexpr int kReal = Lay::kReal;
   const int tid = threadIdx.x;
@@ -238,7 +259,9 @@ split_q(const Params& p, const int row0, const int rows, const int kvh, uint8_t*
   }
   qtop = device::warp::reduce_max(qtop);
   if ((tid & 31) == 0) s_red[tid >> 5] = __uint_as_float(qtop);
+  cp_async_wait<0>();
   device::ptx::bar_sync(3, kWorkers);
+  after_scan();
 #pragma unroll
   for (int w = 0; w < kWorkers / 32; ++w)
     qtop = max(qtop, __float_as_uint(s_red[w]));
@@ -246,11 +269,11 @@ split_q(const Params& p, const int row0, const int rows, const int kvh, uint8_t*
   const int qexp = static_cast<int>(qtop >> 7);
   const int shift = qexp == 0 ? 0 : min(max(134 - qexp, -126), 126);
   const float qmul = __int_as_float((127 + shift) << 23);
-  for (int i = tid; i < Lay::kNQ * 16; i += kWorkers) {
-    *reinterpret_cast<uint4*>(s_q + ((i & 15) >> 3) * Lay::kQPlane + tcgen05::sw128_off(i >> 4, i & 7)) =
-        make_uint4(0, 0, 0, 0);
+  for (int i = real * 16 + tid; i < kReal * 16; i += kWorkers) {
+    uint8_t* dst = s_q + ((i & 15) >> 3) * Lay::kQPlane;
+    *reinterpret_cast<uint4*>(dst + tcgen05::sw128_off(i >> 4, i & 7)) = make_uint4(0, 0, 0, 0);
+    *reinterpret_cast<uint4*>(dst + tcgen05::sw128_off(kReal + (i >> 4), i & 7)) = make_uint4(0, 0, 0, 0);
   }
-  device::ptx::bar_sync(3, kWorkers);
   for (int i = tid; i < real * 16; i += kWorkers) {
     const int n = i >> 4;
     const int c = i & 15;
@@ -274,10 +297,11 @@ split_q(const Params& p, const int row0, const int rows, const int kvh, uint8_t*
   return p.qk_scale * __int_as_float(0x3FB8AA3B) * __int_as_float((127 - shift) << 23);
 }
 
-// The MMA warp: barrier 1 = the K tile of the next QK is in, barrier 2 = P and V of this tile are written.
+// The issuing warps. QK waits on barrier 1 = the K tile of the next QK is in and S is read, PV on barrier 2 = P and
+// V of this tile are written.
 // QK: S [slot][column] = K [slot][d] Q [column][d]; PV: O [head][d] += P [head][slot] V [d][slot].
 template <int kRows, int kHeads>
-SGL_DEVICE void issue_mmas(const int tiles, const uint32_t t_s, uint8_t* const smem) {
+SGL_DEVICE void issue_mmas(const bool pv_warp, const int tiles, const uint32_t t_s, uint8_t* const smem) {
   using Lay = Layout<kRows, kHeads>;
   uint64_t* const s_bar = reinterpret_cast<uint64_t*>(smem + Lay::bar);
   const bool issuer = (threadIdx.x & 31) == 0;
@@ -288,15 +312,15 @@ SGL_DEVICE void issue_mmas(const int tiles, const uint32_t t_s, uint8_t* const s
   auto pdesc = tcgen05::make_desc_kmajor_sw128(smem + Lay::pr);
   pdesc.leading_byte_offset = kPlane >> 4;
   const uint32_t idesc_qk = tcgen05::make_instr_desc_f8<kTile, Lay::kNQ>().bits;
-  const uint32_t idesc_pv = tcgen05::make_instr_desc_f16(128, kD, true, true);
-  const auto qk = [&]() {
+  const uint32_t idesc_pv = tcgen05::make_instr_desc_f16(128, kD, true, true) | (1u << 7) | (1u << 10);  // bf16
+  const auto qk = [&](const int t) {
     if (issuer) {
       tcgen05::fence_after_thread_sync();
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
         tcgen05::mma_f8_ss(
             t_s,
-            kdesc.advance_bytes((i >> 2) * kPlane + (i & 3) * 32).bits,
+            kdesc.advance_bytes(((t & 1) * 2 + (i >> 2)) * kPlane + (i & 3) * 32).bits,
             qdesc.advance_bytes((i >> 2) * Lay::kQPlane + (i & 3) * 32).bits,
             idesc_qk,
             i > 0);
@@ -304,36 +328,41 @@ SGL_DEVICE void issue_mmas(const int tiles, const uint32_t t_s, uint8_t* const s
       tcgen05::commit(s_bar);
     }
   };
-  device::ptx::bar_sync(1, kThreads);
-  if (tiles > 0) qk();
-  for (int t = 0; t < tiles; ++t) {
-    device::ptx::bar_sync(1, kThreads);
-    if (t + 1 < tiles) qk();
-    device::ptx::bar_sync(2, kThreads);
-    if (issuer) {
-      tcgen05::fence_after_thread_sync();
+  if (pv_warp) {
+    for (int t = 0; t < tiles; ++t) {
+      device::ptx::bar_sync(2, kSync);
+      if (issuer) {
+        tcgen05::fence_after_thread_sync();
 #pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        tcgen05::mma_f16_ss(
-            t_s + Lay::kNQ,
-            pdesc.advance_bytes(i * 2048).bits,
-            vdesc.advance_bytes(i * 2048).bits,
-            idesc_pv,
-            t > 0 || i > 0);
+        for (int i = 0; i < 8; ++i) {
+          tcgen05::mma_f16_ss(
+              t_s + Lay::kNQ,
+              pdesc.advance_bytes(i * 2048).bits,
+              vdesc.advance_bytes(i * 2048).bits,
+              idesc_pv,
+              t > 0 || i > 0);
+        }
+        tcgen05::commit(s_bar + 1);
       }
-      tcgen05::commit(s_bar + 1);
     }
+    return;
+  }
+  device::ptx::bar_sync(1, kSync);
+  if (tiles > 0) qk(0);
+  for (int t = 0; t < tiles; ++t) {
+    device::ptx::bar_sync(1, kSync);
+    if (t + 1 < tiles) qk(t + 1);
   }
 }
 
 template <int kRows, int kHeads>
-__global__ void __launch_bounds__(kThreads, 1) attn_kernel(const __grid_constant__ Params p) {
+__global__ void __launch_bounds__(kBlock, 1) attn_kernel(const __grid_constant__ Params p) {
   using Lay = Layout<kRows, kHeads>;
   constexpr int kReal = Lay::kReal;
   constexpr int kPer = Lay::kPer;
-  constexpr int kWin = Lay::kWin;
+  constexpr int kSegs = kRows / 4;  // query rows of a softmax warpgroup, kHeads columns each
   static_assert(Lay::bytes <= kMaxSmem && kReal <= 128 && Lay::kNQ + kD <= Lay::kTmemCols);
-  static_assert(kPer <= kHeads || kPer == 2 * kHeads, "a softmax warpgroup spans at most two query rows");
+  static_assert(kRows % 4 == 0 && kHeads % 4 == 0 && kHeads <= 16 && kPer <= 32);
   extern __shared__ __align__(1024) uint8_t smem[];
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -344,20 +373,20 @@ __global__ void __launch_bounds__(kThreads, 1) attn_kernel(const __grid_constant
   const int kvh = blockIdx.x % p.HKV;
   uint8_t* const s_opv = smem + Lay::op_v;
   uint8_t* const s_opk = smem + Lay::op_k;
-  uint8_t* const s_stg = smem + Lay::stg;
   uint8_t* const s_p = smem + Lay::pr;
   uint32_t* const s_ent = reinterpret_cast<uint32_t*>(smem + Lay::ent);
   uint8_t* const s_msk = smem + Lay::msk;
   float* const s_red = reinterpret_cast<float*>(smem + Lay::red);
   float* const s_fac = reinterpret_cast<float*>(smem + Lay::fac);
   float* const s_ref = reinterpret_cast<float*>(smem + Lay::ref);
-  float* const s_refn = reinterpret_cast<float*>(smem + Lay::refn);
-  uint8_t* const s_flag = smem + Lay::flag;
-  uint32_t* const s_any = reinterpret_cast<uint32_t*>(smem + Lay::flag + 16);
+  uint32_t* const s_has = reinterpret_cast<uint32_t*>(smem + Lay::has);
+  float* const s_off = reinterpret_cast<float*>(smem + Lay::off);
+  uint8_t* const s_moved = smem + Lay::flag + 32;  // per warpgroup: 1 a reference moved, 2 a head has none
   uint64_t* const s_bar = reinterpret_cast<uint64_t*>(smem + Lay::bar);
   uint32_t* const s_tmem = reinterpret_cast<uint32_t*>(smem + Lay::tmem);
   const float ninf = __int_as_float(0xFF800000);
   const bool worker = warp < kWorkers / 32;
+  const bool pv_warp = warp == kWorkers / 32 + 1;
   const int32_t* const meta = p.meta + static_cast<int64_t>(group) * kMeta;
   const int tiles = (meta[0] + kTile - 1) / kTile;
   const int row0 = meta[1];
@@ -368,42 +397,15 @@ __global__ void __launch_bounds__(kThreads, 1) attn_kernel(const __grid_constant
     device::ptx::mbar_init(s_bar + 1, 1);
     device::ptx::fence_barrier_init();
   }
-  float sc = 0.f;
-  if (worker) {
-    sc = split_q<kRows, kHeads>(p, row0, rows, kvh, smem + Lay::q, s_red);
-    for (int i = tid; i < 2 * kPlane / 16; i += kWorkers)
-      *reinterpret_cast<uint4*>(s_p + i * 16) = make_uint4(0, 0, 0, 0);
-    if (tid < 128) s_ref[tid] = 1e30f;
-    device::ptx::fence_proxy_async_shared();
-  } else {
-    tcgen05::alloc(s_tmem, Lay::kTmemCols);
-    tcgen05::relinquish_alloc_permit();
-    tcgen05::fence_before_thread_sync();
-  }
-  __syncthreads();
-  tcgen05::fence_after_thread_sync();
-
-  const uint32_t t_s = *s_tmem + (static_cast<uint32_t>((warp & 3) * 32) << 16);
-  const uint32_t t_o = t_s + Lay::kNQ;
-  if (!worker) {
-    issue_mmas<kRows, kHeads>(tiles, t_s, smem);
-    device::ptx::bar_sync(1, kThreads);
-    tcgen05::dealloc(*s_tmem, Lay::kTmemCols);
-    return;
-  }
-
   const int32_t* const slots = p.slots + static_cast<int64_t>(group) * p.cap;
   const uint8_t* const masks = p.masks + static_cast<int64_t>(group) * p.cap;
-  // a worker moves 16-byte chunk gc of the K rows of slots gk + 32 i of a tile, and chunk vc of the V rows of
-  // slots vk and vk + 64 of an item: one cache line per copy
+  // a worker moves 16-byte chunk gc of the K rows of slots gk + 32 i of a tile
   const int gk = tid >> 4;
   const int gc = tid & 15;
   const int vk = tid >> 3;
   const int vc = tid & 7;
-  const int first = wg * kPer;  // this thread's heads: first + i, i < heads
-  const int heads = min(max(kReal - first, 0), kPer);
-  const int j0 = first / kHeads;  // their query rows: j0, then j0 + 1 from head i = split
-  const int split = (j0 + 1) * kHeads - first;
+  const int first = wg * kPer;  // this thread's heads: first + i, those of query rows j0 + r
+  const int j0 = wg * kSegs;
   uint32_t n_qk = 0;
   uint32_t n_pv = 0;
 
@@ -418,195 +420,216 @@ __global__ void __launch_bounds__(kThreads, 1) attn_kernel(const __grid_constant
   const auto gather_k = [&](const int t) {
     if (t < tiles) {
       const uint8_t* base = p.k + kvh * p.stride_kh + gc * 16;
-      const uint32_t dst = device::ptx::to_shared(s_opk + (gc >> 3) * kPlane);
+      const uint32_t dst = device::ptx::to_shared(s_opk + ((t & 1) * 2 + (gc >> 3)) * kPlane);
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const int e = (t % kRing) * kTile + gk + 32 * i;
         cp_async16(
             dst + tcgen05::sw128_off(gk + 32 * i, gc & 7),
-            base + static_cast<int64_t>(s_ent[e]) * p.stride_kslot,
+            base + static_cast<int64_t>(s_ent[e]) * p.stride_krow,
             s_msk[e] != 0 ? 16 : 0);
       }
     }
   };
-  // V item 2 t + h: d [128 h, 128 h + 128) of the V rows of tile t
-  const auto gather_v = [&](const int item, const uint32_t stage) {
-    if (item < 2 * tiles) {
-      const uint8_t* base = p.v + kvh * p.stride_kh + (item & 1) * 128 + vc * 16;
-      const uint32_t dst = device::ptx::to_shared(s_stg + stage * kPlane);
+  // this thread's V copies of a tile: chunks vc + 8 j of the rows of slots vk and vk + 64
+  const uint8_t* const v_base = p.v + kvh * p.stride_vh + vc * 16;
+  const uint32_t v_dst[2] = {
+      device::ptx::to_shared(s_opv) + tcgen05::sw128_off(vk, vc),
+      device::ptx::to_shared(s_opv) + tcgen05::sw128_off(vk + 64, vc)};
+  // and its P stores: bf16 pairs of kStore heads each
+  constexpr int kStore = kPer % 8 == 0 ? 8 : 4;
+  uint8_t* p_dst[kPer / kStore];
 #pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        const int e = ((item >> 1) % kRing) * kTile + vk + 64 * i;
-        cp_async16(
-            dst + tcgen05::sw128_off(vk + 64 * i, vc),
-            base + static_cast<int64_t>(s_ent[e]) * p.stride_kslot,
-            s_msk[e] != 0 ? 16 : 0);
-      }
-    }
-  };
-  const auto convert_v = [&](const int item, const uint32_t stage) {
-    const uint8_t* src = s_stg + stage * kPlane;
-    uint8_t* dst = s_opv + ((item & 1) * 2 + (vc >> 2)) * kPlane;
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      const int slot = vk + 64 * i;
-      const uint4 raw = *reinterpret_cast<const uint4*>(src + tcgen05::sw128_off(slot, vc));
-      *reinterpret_cast<uint4*>(dst + tcgen05::sw128_off(slot, 2 * (vc & 3))) = e4m3x8_f16x8(raw.x, raw.y);
-      *reinterpret_cast<uint4*>(dst + tcgen05::sw128_off(slot, 2 * (vc & 3) + 1)) = e4m3x8_f16x8(raw.z, raw.w);
-    }
-  };
-  // P of this thread's slot and heads, in pairs
-  const auto store_p = [&](const float (&pv)[kPer]) {
-#pragma unroll
-    for (int i = 0; i < kPer; i += 2) {
-      const int n = first + i;
-      if (i < heads) {
-        uint8_t* row = s_p + (n >> 6) * kPlane + tl * 128;
-        *reinterpret_cast<uint32_t*>(row + ((((n >> 3) & 7) ^ (tl & 7)) << 4) + ((2 * n) & 15)) =
-            f32x2_f16x2(pv[i], i + 1 < heads ? pv[i + 1] : 0.f);
-      }
-    }
-  };
-  // scores of this thread's slot and heads in log2 units: (hi + lo) * sc + bias, -inf where not selected
-  const auto load_scores = [&](float (&x)[kPer], const float* bias, const uint32_t mine) {
-    const bool on0 = ((mine >> j0) & 1u) != 0;
-    const bool on1 = ((mine >> (j0 + 1)) & 1u) != 0;
-    float term[kWin];
-    tcgen05::ld_32x32b<kWin>(t_s + kReal + first, term);
-    tcgen05::wait_ld();
-#pragma unroll
-    for (int i = 0; i < kPer; ++i)
-      x[i] = bias != nullptr && i < heads ? fmaf(term[i], sc, bias[first + i]) : term[i] * sc;
-    tcgen05::ld_32x32b<kWin>(t_s + first, term);
-    tcgen05::wait_ld();
-    tcgen05::fence_before_thread_sync();
-#pragma unroll
-    for (int i = 0; i < kPer; ++i)
-      x[i] = (i < split ? on0 : on1) && i < heads ? fmaf(term[i], sc, x[i]) : ninf;
-  };
+  for (int u = 0; u < kPer / kStore; ++u) {
+    const int n = 32 * wg + kStore * u;
+    p_dst[u] = s_p + (n >> 6) * kPlane + tl * 128 + ((((n >> 3) & 7) ^ (tl & 7)) << 4) + ((2 * n) & 15);
+  }
   const auto wait_pv = [&]() {
     if (n_pv > 0) device::ptx::mbar_wait_parity(s_bar + 1, (n_pv - 1) & 1);
   };
 
+  float sc = 0.f;
+  if (worker) {
+    // the first entries land under the scan of q, the first two K tiles under its conversion
 #pragma unroll
-  for (int t = 0; t < 5; ++t)
-    load_entries(t);
-  cp_async_commit();
-  cp_async_wait<0>();
-  device::ptx::bar_sync(3, kWorkers);
-  gather_k(0);
-  gather_v(0, 0);
-  gather_v(1, 1);
-  cp_async_commit();
-  cp_async_wait<0>();
-  device::ptx::fence_proxy_async_shared();
-  device::ptx::bar_arrive(1, kThreads);
+    for (int t = 0; t < 5; ++t)
+      load_entries(t);
+    cp_async_commit();
+    sc = split_q<kRows, kHeads>(p, row0, rows, kvh, smem + Lay::q, s_red, [&]() {
+      gather_k(0);
+      gather_k(1);
+      cp_async_commit();
+    });
+    // P rows of no head stay zero
+    for (int i = tid; i < 16 * kTile; i += kWorkers) {
+      const int c = i / kTile;
+      *reinterpret_cast<uint4*>(s_p + (c >> 3) * kPlane + tcgen05::sw128_off(i % kTile, c & 7)) =
+          make_uint4(0, 0, 0, 0);
+    }
+    if (tid < 128) {
+      s_ref[tid] = 0.f;
+      s_has[tid] = 0;
+    }
+    if (tid < 16) s_off[tid] = ninf;
+    cp_async_wait<0>();
+    device::ptx::fence_proxy_async_shared();
+  } else if (!pv_warp) {
+    tcgen05::alloc(s_tmem, Lay::kTmemCols);
+    tcgen05::relinquish_alloc_permit();
+    tcgen05::fence_before_thread_sync();
+  }
+  __syncthreads();
+  tcgen05::fence_after_thread_sync();
+
+  const uint32_t t_s = *s_tmem + (worker ? static_cast<uint32_t>((warp & 3) * 32) << 16 : 0u);
+  const uint32_t t_o = t_s + Lay::kNQ;
+  if (!worker) {
+    issue_mmas<kRows, kHeads>(pv_warp, tiles, t_s, smem);
+    if (!pv_warp) {
+      device::ptx::bar_sync(1, kSync);
+      tcgen05::dealloc(*s_tmem, Lay::kTmemCols);
+    }
+    return;
+  }
+  device::ptx::bar_arrive(1, kSync);
 
   float ls[kPer];  // sum of p over this thread's slots
 #pragma unroll
   for (int i = 0; i < kPer; ++i)
     ls[i] = 0.f;
+  uint32_t lack = 1;  // a head of the group has no reference yet
 
 #pragma unroll 1
   for (int t = 0; t < tiles; ++t) {
     device::ptx::mbar_wait_parity(s_bar, n_qk & 1);
     ++n_qk;
     tcgen05::fence_after_thread_sync();
-    gather_k(t + 1);
+    // scores of this thread's slot in log2 units over the references: (hi + lo) * sc - reference, -inf for the
+    // rows that did not select the slot
+    const uint32_t mine = s_msk[(t % kRing) * kTile + tl];
+    float x[kPer];
+#pragma unroll
+    for (int r = 0; r < kSegs; ++r) {
+      const float* bias = ((mine >> (j0 + r)) & 1u) != 0 ? s_ref + first + r * kHeads : s_off;
+      float term[16];
+      tcgen05::ld_32x32b<16>(t_s + kReal + first + r * kHeads, term);
+      tcgen05::wait_ld();
+#pragma unroll
+      for (int i = 0; i < kHeads; i += 4) {
+        const float4 b = *reinterpret_cast<const float4*>(bias + i);
+        x[r * kHeads + i] = fmaf(term[i], sc, b.x);
+        x[r * kHeads + i + 1] = fmaf(term[i + 1], sc, b.y);
+        x[r * kHeads + i + 2] = fmaf(term[i + 2], sc, b.z);
+        x[r * kHeads + i + 3] = fmaf(term[i + 3], sc, b.w);
+      }
+      tcgen05::ld_32x32b<16>(t_s + first + r * kHeads, term);
+      tcgen05::wait_ld();
+#pragma unroll
+      for (int i = 0; i < kHeads; ++i)
+        x[r * kHeads + i] = fmaf(term[i], sc, x[r * kHeads + i]);
+    }
+    // S of this tile is read and K(t + 1) is in: QK of tile t + 1 may go
+    tcgen05::fence_before_thread_sync();
+    cp_async_wait<0>();
+    device::ptx::fence_proxy_async_shared();
+    device::ptx::bar_arrive(1, kSync);
+    gather_k(t + 2);
     load_entries(t + 5);
     cp_async_commit();
-    const uint32_t mine = s_msk[(t % kRing) * kTile + tl];
-    float pv[kPer];
-    load_scores(pv, s_ref, mine);
     float top = ninf;
 #pragma unroll
-    for (int i = 0; i < kPer; ++i) {
-      top = fmaxf(top, pv[i]);
-      pv[i] = ex2_approx(pv[i]);
-    }
-    top = device::warp::reduce_max(top);
-    if (lane == 0) s_flag[warp] = top > kRescale ? 1 : 0;
-    device::ptx::bar_sync(3, kWorkers);
-
-    const uint2 flags = *reinterpret_cast<const uint2*>(s_flag);
-    const uint2 flags2 = *reinterpret_cast<const uint2*>(s_flag + 8);
-    if ((flags.x | flags.y | flags2.x | flags2.y) != 0) {
-      // some head is more than kRescale above its reference (or has none yet): move those references to the
-      // tile maxima, rescale their sums and O, and redo this tile's P
-      tcgen05::fence_after_thread_sync();
-      load_scores(pv, nullptr, mine);
+    for (int i = 0; i < kPer; ++i)
+      top = fmaxf(top, x[i]);
+    if (any_in_warpgroup(4 + wg, top > kMove || lack != 0)) {
+      // a score of this tile is kMove over its head's reference, or a head has none: where the tile's maximum is
+      // kMove over the reference (or there is none) it becomes the reference, and the head's sums and O are rescaled
 #pragma unroll
       for (int i = 0; i < kPer; ++i) {
-        const float m = device::warp::reduce_max(pv[i]);
-        if (lane == 0 && i < heads) s_red[(first + i) * 4 + (warp & 3)] = m;
+        x[i] -= s_ref[first + i];
+        const float m = device::warp::reduce_max(x[i]);
+        if (lane == 0) s_red[(first + i) * 4 + (warp & 3)] = m;
       }
-      if (tid == 0) *s_any = 0;
-      device::ptx::bar_sync(3, kWorkers);
-      bool moved = false;
-#pragma unroll
-      for (int i = 0; i < kPer; ++i) {
-        if (i < heads) {
-          const float4 r4 = *reinterpret_cast<const float4*>(s_red + (first + i) * 4);
-          const float m = fmaxf(fmaxf(r4.x, r4.y), fmaxf(r4.z, r4.w));
-          const float nm = s_ref[first + i];
-          const float ref = -nm;
-          const bool move = m > ref + kRescale;
-          const float f = move ? ex2_approx(ref - m) : 1.f;
-          const float next = move ? -m : nm;
-          ls[i] *= f;
-          pv[i] = ex2_approx(pv[i] + next);
-          moved |= move && ref > -1e29f;
-          if (lane == 0 && (warp & 3) == 0) {
-            s_fac[first + i] = f;
-            s_refn[first + i] = next;
-          }
-        }
-      }
-      if (moved && lane == 0 && (warp & 3) == 0) *s_any = 1;
-      device::ptx::bar_sync(3, kWorkers);
+      device::ptx::bar_sync(4 + wg, 128);
       if (lane == 0 && (warp & 3) == 0) {
+        uint32_t state = 0;
 #pragma unroll
         for (int i = 0; i < kPer; ++i) {
-          if (i < heads) s_ref[first + i] = s_refn[first + i];
+          const int n = first + i;
+          const float4 r4 = *reinterpret_cast<const float4*>(s_red + n * 4);
+          const float m = fmaxf(fmaxf(r4.x, r4.y), fmaxf(r4.z, r4.w));
+          const float nm = s_ref[n];
+          const bool had = s_has[n] != 0;
+          const bool move = had ? m > kMove - nm : m > ninf;
+          s_fac[n] = move && had ? ex2_approx(-nm - m) : 1.f;
+          s_ref[n] = move ? -m : nm;
+          s_has[n] = had || move ? 1u : 0u;
+          state |= (move && had ? 1u : 0u) | (had || move ? 0u : 2u);
         }
+        s_moved[wg] = static_cast<uint8_t>(state);
       }
-      if (*s_any != 0 && t > 0) {
+      device::ptx::bar_sync(4 + wg, 128);
+      const uint32_t state = s_moved[wg];
+      lack = state & 2u;
+#pragma unroll
+      for (int i = 0; i < kPer; ++i) {
+        ls[i] *= s_fac[first + i];
+        x[i] += s_ref[first + i];
+      }
+      if ((state & 1u) != 0 && t > 0 && (warp & 3) == wg) {
         wait_pv();
         tcgen05::fence_after_thread_sync();
-        const float f = tl < kReal ? s_fac[tl] : 1.f;
-#pragma unroll
-        for (int b = 0; b < 4; ++b) {
+        const float f = lane < kPer ? s_fac[first + lane] : 1.f;
+#pragma unroll 4
+        for (int b = 0; b < kD / 16; ++b) {
           float o[16];
-          tcgen05::ld_32x32b<16>(t_o + 64 * wg + 16 * b, o);
+          tcgen05::ld_32x32b<16>(t_o + 16 * b, o);
           tcgen05::wait_ld();
 #pragma unroll
           for (int e = 0; e < 16; ++e)
             o[e] *= f;
-          tcgen05::st_32x32b<16>(t_o + 64 * wg + 16 * b, o);
+          tcgen05::st_32x32b<16>(t_o + 16 * b, o);
         }
         tcgen05::wait_st();
-        tcgen05::fence_before_thread_sync();
       }
     }
+    uint32_t pp[kPer / 2];
 #pragma unroll
-    for (int i = 0; i < kPer; ++i)
-      ls[i] += pv[i];
-    // K(t + 1) and V(t) are in and S of this tile is read: QK of tile t + 1 may go
+    for (int i = 0; i < kPer; i += 2) {
+      const float p0 = ex2_approx(x[i]);
+      const float p1 = ex2_approx(x[i + 1]);
+      ls[i] += p0;
+      ls[i + 1] += p1;
+      pp[i / 2] = f32x2_bf16x2(p0, p1);
+    }
+    const uint8_t* v_row[2];
+    int v_bytes[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int e = (t % kRing) * kTile + vk + 64 * i;
+      v_row[i] = v_base + static_cast<int64_t>(s_ent[e]) * p.stride_vrow;
+      v_bytes[i] = s_msk[e] != 0 ? 16 : 0;
+    }
+    // the P and V operands are free once the PV of tile t - 1 is in: only copies and stores from here to PV(t)
+    wait_pv();
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        cp_async16(v_dst[i] + j * kPlane, v_row[i] + j * 128, v_bytes[i]);
+    }
+    cp_async_commit();
+#pragma unroll
+    for (int u = 0; u < kPer / kStore; ++u) {
+      if constexpr (kStore == 8) {
+        *reinterpret_cast<uint4*>(p_dst[u]) = make_uint4(pp[4 * u], pp[4 * u + 1], pp[4 * u + 2], pp[4 * u + 3]);
+      } else {
+        *reinterpret_cast<uint2*>(p_dst[u]) = make_uint2(pp[2 * u], pp[2 * u + 1]);
+      }
+    }
     cp_async_wait<0>();
     device::ptx::fence_proxy_async_shared();
-    device::ptx::bar_arrive(1, kThreads);
-
-    // the P and V operands are free once the PV of tile t - 1 is in
-    wait_pv();
-    store_p(pv);
-    convert_v(2 * t, 0);
-    convert_v(2 * t + 1, 1);
-    device::ptx::fence_proxy_async_shared();
     ++n_pv;
-    device::ptx::bar_arrive(2, kThreads);
-    gather_v(2 * t + 2, 0);
-    gather_v(2 * t + 3, 1);
-    cp_async_commit();
+    device::ptx::bar_arrive(2, kSync);
   }
   cp_async_wait<0>();
 
@@ -616,25 +639,24 @@ __global__ void __launch_bounds__(kThreads, 1) attn_kernel(const __grid_constant
 #pragma unroll
   for (int i = 0; i < kPer; ++i) {
     const float sum = device::warp::reduce_sum(ls[i]);
-    if (lane == 0 && i < heads) s_red[(first + i) * 4 + (warp & 3)] = sum;
+    if (lane == 0) s_red[(first + i) * 4 + (warp & 3)] = sum;
   }
   device::ptx::bar_sync(3, kWorkers);
   if (lane == 0 && (warp & 3) == 0) {
 #pragma unroll
     for (int i = 0; i < kPer; ++i) {
-      if (i < heads) {
-        const float4 r4 = *reinterpret_cast<const float4*>(s_red + (first + i) * 4);
-        const float sum = (r4.x + r4.y) + (r4.z + r4.w);
-        s_fac[first + i] = sum > 0.f ? 1.f / sum : 0.f;
-      }
+      const float4 r4 = *reinterpret_cast<const float4*>(s_red + (first + i) * 4);
+      const float sum = (r4.x + r4.y) + (r4.z + r4.w);
+      s_fac[first + i] = sum > 0.f ? 1.f / sum : 0.f;
     }
   }
   device::ptx::bar_sync(3, kWorkers);
-  // lane tl of O is head column tl; this thread writes its d [64 wg, 64 wg + 64)
-  const bool live = tl < rows * kHeads;
-  const float inv = live ? s_fac[tl] : 0.f;
+  // lane tl of O is head (tl / 32) kPer + tl % 32; this thread writes its d [64 wg, 64 wg + 64)
+  const int head = (tl >> 5) * kPer + (tl & 31);
+  const bool live = (tl & 31) < kPer && head < rows * kHeads;
+  const float inv = live ? s_fac[head] : 0.f;
   uint16_t* const dst =
-      p.out + (row0 + tl / kHeads) * p.stride_or + (kvh * kHeads + tl % kHeads) * p.stride_oh + 64 * wg;
+      p.out + (row0 + head / kHeads) * p.stride_or + (kvh * kHeads + head % kHeads) * p.stride_oh + 64 * wg;
 #pragma unroll
   for (int b = 0; b < 4; ++b) {
     float o[16];
@@ -657,7 +679,7 @@ __global__ void __launch_bounds__(kThreads, 1) attn_kernel(const __grid_constant
     }
   }
   tcgen05::fence_before_thread_sync();
-  device::ptx::bar_arrive(1, kThreads);
+  device::ptx::bar_arrive(1, kSync);
 }
 
 }  // namespace qsa_sparse_prefill_sm100
@@ -668,10 +690,9 @@ struct QsaSparsePrefillSm100 {
   run(const tvm::ffi::TensorView q,
       const tvm::ffi::TensorView k,
       const tvm::ffi::TensorView v,
-      const tvm::ffi::TensorView req_to_token,
-      const tvm::ffi::TensorView req,
       const tvm::ffi::TensorView idx,
       const tvm::ffi::TensorView cu_q,
+      const tvm::ffi::TensorView cu_k,
       const tvm::ffi::TensorView kv_len,
       const tvm::ffi::TensorView slots,
       const tvm::ffi::TensorView masks,
@@ -683,10 +704,8 @@ struct QsaSparsePrefillSm100 {
     using namespace qsa_sparse_prefill_sm100;
     auto R_ = SymbolicSize{"rows"};
     auto HQ_ = SymbolicSize{"q_heads"};
-    auto S_ = SymbolicSize{"slots"};
+    auto S_ = SymbolicSize{"kv_rows"};
     auto HKV_ = SymbolicSize{"kv_heads"};
-    auto NR_ = SymbolicSize{"reqs"};
-    auto CTX_ = SymbolicSize{"ctx"};
     auto TOPK_ = SymbolicSize{"topk"};
     auto NS_ = SymbolicSize{"seqs"};
     auto NS1_ = SymbolicSize{"seqs_plus_1"};
@@ -695,13 +714,12 @@ struct QsaSparsePrefillSm100 {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
     TensorMatcher({R_, HQ_, kD}).with_dtype<bf16_t>().with_device(device).with_strides({-1, -1, 1}).verify(q);
-    // fp8 e4m3 pools passed as uint8 views
+    // fp8 e4m3 K and bf16 V passed as uint8 views
     TensorMatcher({S_, HKV_, kD}).with_dtype<uint8_t>().with_device(device).with_strides({-1, -1, 1}).verify(k);
-    TensorMatcher({S_, HKV_, kD}).with_dtype<uint8_t>().with_device(device).with_strides({-1, -1, 1}).verify(v);
-    TensorMatcher({NR_, CTX_}).with_dtype<int32_t>().with_device(device).with_strides({-1, 1}).verify(req_to_token);
-    TensorMatcher({NS_}).with_dtype<int32_t>().with_device(device).with_strides({1}).verify(req);
+    TensorMatcher({S_, HKV_, 2 * kD}).with_dtype<uint8_t>().with_device(device).with_strides({-1, -1, 1}).verify(v);
     TensorMatcher({R_, TOPK_}).with_dtype<int32_t>().with_device(device).with_strides({-1, 1}).verify(idx);
     TensorMatcher({NS1_}).with_dtype<int32_t>().with_device(device).with_strides({1}).verify(cu_q);
+    TensorMatcher({NS1_}).with_dtype<int32_t>().with_device(device).with_strides({1}).verify(cu_k);
     TensorMatcher({NS_}).with_dtype<int32_t>().with_device(device).with_strides({1}).verify(kv_len);
     TensorMatcher({NG_, CAP_}).with_dtype<int32_t>().with_device(device).with_strides({CAP_, 1}).verify(slots);
     TensorMatcher({NG_, CAP_}).with_dtype<uint8_t>().with_device(device).with_strides({CAP_, 1}).verify(masks);
@@ -712,12 +730,12 @@ struct QsaSparsePrefillSm100 {
     const int64_t groups = NG_.unwrap();
     const int64_t cap = CAP_.unwrap();
     RuntimeCheck(HQ_.unwrap() == hkv * kHeads, "q heads per kv head must match the kernel");
-    RuntimeCheck(NS1_.unwrap() == NS_.unwrap() + 1, "cu_q holds one more entry than there are sequences");
+    RuntimeCheck(NS1_.unwrap() == NS_.unwrap() + 1, "cu_q and cu_k hold one more entry than there are sequences");
     RuntimeCheck(topk > 0 && cap % kTile == 0 && cap >= kRows * topk, "slots must hold every column in whole tiles");
-    RuntimeCheck(k.stride(0) == v.stride(0) && k.stride(1) == v.stride(1), "K and V pools must share strides");
     const auto a16 = [](const void* ptr) { return reinterpret_cast<uintptr_t>(ptr) % 16 == 0; };
     RuntimeCheck(
-        a16(k.data_ptr()) && a16(v.data_ptr()) && k.stride(0) % 16 == 0 && k.stride(1) % 16 == 0,
+        a16(k.data_ptr()) && a16(v.data_ptr()) && k.stride(0) % 16 == 0 && k.stride(1) % 16 == 0 &&
+            v.stride(0) % 16 == 0 && v.stride(1) % 16 == 0,
         "K / V rows must be 16-byte aligned");
     RuntimeCheck(a16(q.data_ptr()) && q.stride(0) % 8 == 0 && q.stride(1) % 8 == 0, "q rows must be 16-byte aligned");
     RuntimeCheck(
@@ -731,14 +749,12 @@ struct QsaSparsePrefillSm100 {
     const auto union_params = UnionParams{
         .idx = static_cast<const int32_t*>(idx.data_ptr()),
         .cu_q = static_cast<const int32_t*>(cu_q.data_ptr()),
+        .cu_k = static_cast<const int32_t*>(cu_k.data_ptr()),
         .kv_len = static_cast<const int32_t*>(kv_len.data_ptr()),
-        .req = static_cast<const int32_t*>(req.data_ptr()),
-        .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
         .slots = static_cast<int32_t*>(slots.data_ptr()),
         .masks = static_cast<uint8_t*>(masks.data_ptr()),
         .meta = static_cast<int32_t*>(meta.data_ptr()),
         .stride_idx = idx.stride(0),
-        .stride_r2t = req_to_token.stride(0),
         .topk = static_cast<int32_t>(topk),
         .cap = static_cast<int32_t>(cap),
         .nseq = static_cast<int32_t>(NS_.unwrap()),
@@ -754,8 +770,10 @@ struct QsaSparsePrefillSm100 {
         .out = static_cast<uint16_t*>(out.data_ptr()),
         .stride_qr = q.stride(0),
         .stride_qh = q.stride(1),
-        .stride_kslot = k.stride(0),
+        .stride_krow = k.stride(0),
         .stride_kh = k.stride(1),
+        .stride_vrow = v.stride(0),
+        .stride_vh = v.stride(1),
         .stride_or = out.stride(0),
         .stride_oh = out.stride(1),
         .qk_scale = static_cast<float>(qk_scale),
@@ -767,7 +785,7 @@ struct QsaSparsePrefillSm100 {
     LaunchKernel(static_cast<uint32_t>(groups), kUnionThreads, dev, union_smem)(union_kernel<kRows>, union_params);
     constexpr int smem = Layout<kRows, kHeads>::bytes;
     runtime::set_max_dynamic_smem_per_device<attn_kernel<kRows, kHeads>>(dev, smem);
-    LaunchKernel(static_cast<uint32_t>(groups * hkv), kThreads, dev, smem)(attn_kernel<kRows, kHeads>, params);
+    LaunchKernel(static_cast<uint32_t>(groups * hkv), kBlock, dev, smem)(attn_kernel<kRows, kHeads>, params);
   }
 };
 
