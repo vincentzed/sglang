@@ -940,7 +940,7 @@ class Envs:
     # of this many tokens on the path, while at least the given fraction of the
     # host Mamba pool is free. 0 (default) keeps only the cap.
     SGLANG_MAMBA_PATH_CAP_GRID = EnvInt(0)
-    SGLANG_MAMBA_PATH_CAP_GRID_MIN_FREE = EnvFloat(0.15)
+    SGLANG_MAMBA_PATH_CAP_GRID_MIN_FREE = EnvFloat(0.05)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
