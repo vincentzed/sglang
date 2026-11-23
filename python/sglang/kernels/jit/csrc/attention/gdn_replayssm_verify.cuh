@@ -79,6 +79,7 @@ struct Layout {
   static constexpr int sc = aux;                 // f32 [16][8] decayed key-history scores
   static constexpr int coef = sc + kL * 8 * 4;   // f32 [4][8] rows of A and F
   static constexpr int ex = coef + kS * 8 * 4;   // f32 [4] decays, [4] betas, total decay, [4] gates
+  static constexpr int tables = 1024;           // after the key products: two table buffers in aux
   static constexpr int b = aux + 4 * kColPlane;  // operand columns [2 K halves][16][128 B]
   static constexpr int a = b + 2 * kColPlane;    // checkpoint [2 K halves][128 rows][128 B]
   static constexpr int bar = a + 2 * kPlane;     // mbarriers: checkpoint in, product done, small products done
@@ -222,9 +223,6 @@ __global__ void __launch_bounds__(kThreads, Layout::per_sm) verify_kernel(const 
   const int n = blockIdx.y;
   const int heads = p.hv_per_h;
   const int hv0 = h * heads;
-  float* const s_sc = reinterpret_cast<float*>(smem + Lay::sc);
-  float* const s_coef = reinterpret_cast<float*>(smem + Lay::coef);
-  float* const s_ex = reinterpret_cast<float*>(smem + Lay::ex);
   uint64_t* const s_bar = reinterpret_cast<uint64_t*>(smem + Lay::bar);
   uint32_t* const s_tmem = reinterpret_cast<uint32_t*>(smem + Lay::tmem);
 
@@ -284,22 +282,21 @@ __global__ void __launch_bounds__(kThreads, Layout::per_sm) verify_kernel(const 
       const int hv = hv0 + j;
       const GateInputs in = next;
       next = load_gates(p, ring, token, r, base, hv + 1, j + 1 < heads);
-      tcgen05::fence_before_thread_sync();
       if (j == 0) {
+        tcgen05::fence_before_thread_sync();
         device::ptx::bar_sync(1, kThreads);
-      } else {
-        device::ptx::bar_sync(3, kThreads);
-      }
-      tcgen05::fence_after_thread_sync();
-      const uint32_t t_d = *s_tmem;
-      bool issued = false;
-      if (lane == 0) {
-        issued = mbar_test_parity(s_bar, j & 1);
-        if (issued) {
-          issue_product(t_d, adesc, kPlane, kD, bdesc);
-          tcgen05::commit(s_bar + 1);
+        tcgen05::fence_after_thread_sync();
+      } else if (j >= 2) {
+        if (j & 1) {
+          device::ptx::bar_sync(4, kThreads);
+        } else {
+          device::ptx::bar_sync(3, kThreads);
         }
       }
+      float* const s_sc = reinterpret_cast<float*>(smem + Lay::aux + (j & 1) * Lay::tables);
+      float* const s_coef = s_sc + kL * 8;
+      float* const s_ex = s_coef + kS * 8;
+      const uint32_t t_d = *s_tmem;
       const float x = bf_lo(in.a) + gate_value(in.bias, p.dtb16);
       const float sp = x <= 20.f ? logf(1.f + expf(x)) : x;
       const float gate = live ? -expf(gate_value(in.rate, p.alog16)) * sp : 0.f;
@@ -376,19 +373,25 @@ __global__ void __launch_bounds__(kThreads, Layout::per_sm) verify_kernel(const 
         s_ex[2 * kS + lane] = decay;
         s_ex[3 * kS + lane] = gate;
       }
-      if (lane == 0 && !issued) {
+      if (j >= 1) {
+        device::ptx::bar_sync(5, kThreads);
+        tcgen05::fence_after_thread_sync();
+      }
+      if (lane == 0) {
         device::ptx::mbar_wait_parity(s_bar, j & 1);
         issue_product(t_d, adesc, kPlane, kD, bdesc);
         tcgen05::commit(s_bar + 1);
       }
-      tcgen05::fence_before_thread_sync();
-      device::ptx::bar_sync(2, kThreads);
+      __syncwarp();
+      device::ptx::bar_arrive(2, kThreads);
       if (lane == 0 && j + 1 < heads) {
         device::ptx::mbar_wait_parity(s_bar + 1, j & 1);
         load_checkpoint(p, s_bar, s_a, hv + 1, slot);
       }
     }
+    device::ptx::bar_sync(5, kThreads);
     device::ptx::bar_sync(3, kThreads);
+    if (heads >= 2) device::ptx::bar_sync(4, kThreads);
     tcgen05::fence_after_thread_sync();
     tcgen05::dealloc(*s_tmem, kTmemCols);
     return;
@@ -478,6 +481,9 @@ __global__ void __launch_bounds__(kThreads, Layout::per_sm) verify_kernel(const 
     const int hv = hv0 + j;
     device::ptx::bar_sync(2, kThreads);
     tcgen05::fence_after_thread_sync();
+    const float* const s_sc = reinterpret_cast<const float*>(smem + Lay::aux + (j & 1) * Lay::tables);
+    const float* const s_coef = s_sc + kL * 8;
+    const float* const s_ex = s_coef + kS * 8;
     const float4 c0 = *reinterpret_cast<const float4*>(s_coef + 4);
     const float4 a1 = *reinterpret_cast<const float4*>(s_coef + 8);
     const float4 c1 = *reinterpret_cast<const float4*>(s_coef + 12);
@@ -504,6 +510,8 @@ __global__ void __launch_bounds__(kThreads, Layout::per_sm) verify_kernel(const 
     float hw[kCols];
     tcgen05::ld_32x32b<kCols>(t_d, hw);
     tcgen05::wait_ld();
+    tcgen05::fence_before_thread_sync();
+    device::ptx::bar_arrive(5, kThreads);
     float hq[kS], hk[kS];
 #pragma unroll
     for (int s = 0; s < kS; ++s) {
@@ -581,8 +589,11 @@ __global__ void __launch_bounds__(kThreads, Layout::per_sm) verify_kernel(const 
         }
       }
     }
-    tcgen05::fence_before_thread_sync();
-    device::ptx::bar_sync(3, kThreads);
+    if (j & 1) {
+      device::ptx::bar_arrive(4, kThreads);
+    } else {
+      device::ptx::bar_arrive(3, kThreads);
+    }
   }
 }
 
