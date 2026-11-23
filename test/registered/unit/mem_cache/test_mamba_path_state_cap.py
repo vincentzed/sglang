@@ -20,6 +20,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import MambaEvictExcessPathStates
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.mamba import (
@@ -58,6 +59,7 @@ class _FakeTreeCore:
             )
         }
         self.mamba_path_cap_counts_host = False
+        self.mamba_path_cap_grid = 0
         self.evicted = []
         self.cascaded = []
         # No joint token/window LRU: this tree keeps no window.
@@ -148,6 +150,29 @@ class TestMambaPathStateCap(unittest.TestCase):
                 for node in nodes
             )
         )
+
+    def test_unified_cache_grid_keeps_a_state_behind_a_tail_rewrite(self):
+        # States at depths 1..6. The two deepest end inside the last grid span;
+        # a request that rewrites that span needs a state at depth <= 4.
+        for grid, kept in ((0, [4, 5]), (4, [2, 3, 4, 5])):
+            with self.subTest(grid=grid):
+                component, nodes, core, cache = _build_unified_chain(cap=2, length=6)
+                for index, node in enumerate(nodes):
+                    node.key = RadixKey([index])
+                core.mamba_path_cap_grid = grid
+
+                component._evict_excess_path_states(
+                    nodes[-1], defaultdict(list), defaultdict(list), []
+                )
+
+                self.assertEqual(
+                    [
+                        index
+                        for index, node in enumerate(nodes)
+                        if node.component_data[ComponentType.MAMBA].value is not None
+                    ],
+                    kept,
+                )
 
     def test_unified_cache_cap_is_soft_for_fork_and_locked_nodes(self):
         component, nodes, core, cache = _build_unified_chain(cap=1, length=4)
