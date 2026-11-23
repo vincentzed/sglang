@@ -1,9 +1,16 @@
-// GDN ReplaySSM speculative verify over a bf16 checkpoint and the circular compact (d, k, g) ring: the
-// outputs of up to 4 draft tokens per request and this window's ring records, without committing.
+// GDN ReplaySSM speculative verify over a bf16 checkpoint and the circular compact (d, k, g) ring on SM100: the
+// outputs of up to 4 draft tokens per request and this window's ring records, without committing. One CTA per
+// (request, value head); TMA streams the checkpoint into the tcgen05 operand, and the same operand columns give
+// the key-history scores and the window Gram matrix, so threads only normalize q / k and finish each row.
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
+
+#include <sgl_kernel/ptx/async.cuh>
+#include <sgl_kernel/ptx/barrier.cuh>
+#include <sgl_kernel/ptx/tcgen05.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -14,13 +21,19 @@ namespace sglang {
 
 namespace gdn_replayssm_verify {
 
+using tcgen05 = device::ptx::TCGen05<1>;
+
 constexpr int kD = 128;
 constexpr int kS = 4;
 constexpr int kL = 16;
-constexpr int kCols = 16;
-constexpr int kWarps = 4;
-constexpr int kThreads = kWarps * 32;
+constexpr int kCols = 16;                // operand columns: q hi, k hi, q lo, k lo of the 4 tokens
+constexpr int kWorkers = 128;            // thread = checkpoint row = TMEM lane
+constexpr int kThreads = kWorkers + 32;  // and the warp that issues the copies and the MMAs
 constexpr int kEarly = 8;
+constexpr int kPlane = kD * 128;        // 128 checkpoint rows x 64 K
+constexpr int kColPlane = kCols * 128;  // 16 operand columns x 64 K
+constexpr int kTmemCols = 4 * kCols;  // checkpoint, key history hi, lo, Gram
+constexpr int kSmemPerSM = 233472;
 constexpr unsigned kFull = 0xffffffffu;
 
 constexpr uint32_t pack_pairs(const int (&v)[16]) {
@@ -35,6 +48,7 @@ constexpr uint32_t kPairRows = pack_pairs(kPairRow);
 constexpr uint32_t kPairCols = pack_pairs(kPairCol);
 
 struct Params {
+  CUtensorMap h0_map;     // bf16 [slots, HV * 128, 128] in tiles of 128 rows x 64 K, 128 B swizzle
   const uint16_t* q;      // bf16 [tokens, H, 128]
   const uint16_t* k;      // bf16 [tokens, H, 128]
   const uint16_t* v;      // bf16 [tokens, HV, 128]
@@ -43,7 +57,6 @@ struct Params {
   const void* A_log;      // fp32 or bf16 [HV]
   const void* dt_bias;    // fp32 or bf16 [HV]
   uint16_t* o;            // bf16 [tokens, HV, 128]
-  const uint16_t* h0;     // bf16 [slots, HV, 128, 128]
   uint16_t* d_hi;         // bf16 [rings, HV, 16, 128]
   uint16_t* d_lo;         // bf16 [rings, HV, 16, 128]
   uint16_t* k_hi;         // bf16 [rings, H, 16, 128]
@@ -55,26 +68,24 @@ struct Params {
   const int32_t* write_pos;
   const int32_t* cache_base;
   const int8_t* is_flush;
-  int64_t s_q, s_k, s_v, s_a, s_b, s_o, s_h0, s_dhi, s_dlo, s_khi, s_klo, s_g;
+  int64_t s_q, s_k, s_v, s_a, s_b, s_o, s_dhi, s_dlo, s_khi, s_klo, s_g;
   int64_t s_qsl, s_si, s_ri, s_wp, s_cb, s_fl;
   float scale;
   int32_t hv_per_h, null_block_id;
-  bool qsl64, si64, ri64, gate16;
+  bool qsl64, si64, ri64, alog16, dtb16;
 };
 
-constexpr int kXStride = kD + 8;
-
-struct Smem {
-  uint16_t x[kCols][kXStride];
-  float hw[kD][8];
-  float sc_hi[kL][8];
-  float sc_lo[kL][8];
-  float sc[kL][8];
-  float gram[kCols][kCols];
-  float af[16];
-  float ex[32];
-  float gs[kS];
-  float beta[kS];
+struct Layout {
+  static constexpr int aux = 0;                  // key history hi, lo [2][2 K halves][16][128 B]; then the tables
+  static constexpr int sc = aux;                 // f32 [16][8] decayed key-history scores
+  static constexpr int coef = sc + kL * 8 * 4;   // f32 [4][8] rows of A and F
+  static constexpr int ex = coef + kS * 8 * 4;   // f32 [4] decays, [4] betas, total decay, [4] gates
+  static constexpr int b = aux + 4 * kColPlane;  // operand columns [2 K halves][16][128 B]
+  static constexpr int a = b + 2 * kColPlane;    // checkpoint [2 K halves][128 rows][128 B]
+  static constexpr int bar = a + 2 * kPlane;     // mbarriers: checkpoint in, product done, small products done
+  static constexpr int tmem = bar + 24;
+  static constexpr int bytes = tmem + 8;
+  static constexpr int per_sm = kSmemPerSM / (bytes + 1024);
 };
 
 SGL_DEVICE int64_t load_index(const void* p, const int64_t i, const bool is64) {
@@ -101,131 +112,132 @@ SGL_DEVICE uint4 load_u4(const uint16_t* p) {
   return *reinterpret_cast<const uint4*>(p);
 }
 
-SGL_DEVICE void mma_bf16(
-    float (&d)[4],
-    const uint32_t a0,
-    const uint32_t a1,
-    const uint32_t a2,
-    const uint32_t a3,
-    const uint32_t b0,
-    const uint32_t b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
-      "{%0, %1, %2, %3};"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
-
-SGL_DEVICE void tile_product(
-    float (&acc)[2][4], const uint4 (&r0)[4], const uint4 (&r1)[4], const uint16_t* col0, const uint16_t* col1) {
-#pragma unroll
-  for (int s = 0; s < 4; ++s) {
-    const uint4 c0 = load_u4(col0 + 32 * s);
-    const uint4 c1 = load_u4(col1 + 32 * s);
-    mma_bf16(acc[0], r0[s].x, r1[s].x, r0[s].y, r1[s].y, c0.x, c0.y);
-    mma_bf16(acc[1], r0[s].x, r1[s].x, r0[s].y, r1[s].y, c1.x, c1.y);
-    mma_bf16(acc[0], r0[s].z, r1[s].z, r0[s].w, r1[s].w, c0.z, c0.w);
-    mma_bf16(acc[1], r0[s].z, r1[s].z, r0[s].w, r1[s].w, c1.z, c1.w);
-  }
-}
-
-SGL_DEVICE void load_rows(uint4 (&r)[4], const uint16_t* row, const bool ok) {
-#pragma unroll
-  for (int s = 0; s < 4; ++s)
-    r[s] = ok ? load_u4(row + 32 * s) : make_uint4(0, 0, 0, 0);
-}
-
-SGL_DEVICE void store_rows(float (*dst)[8], const int row, const int t, const float (&acc)[2][4]) {
-  *reinterpret_cast<float2*>(dst[row] + 2 * t) = make_float2(acc[0][0] + acc[1][0], acc[0][1] + acc[1][1]);
-  *reinterpret_cast<float2*>(dst[row + 8] + 2 * t) = make_float2(acc[0][2] + acc[1][2], acc[0][3] + acc[1][3]);
-}
-
 SGL_DEVICE float pick(const float x0, const float x1, const float x2, const float x3, const int i) {
   return i == 0 ? x0 : i == 1 ? x1 : i == 2 ? x2 : x3;
 }
 
-template <bool kUsePDL>
-__global__ void __launch_bounds__(kThreads) verify_kernel(const __grid_constant__ Params p) {
-  __shared__ __align__(16) Smem sm;
-  device::PDLWaitPrimary<kUsePDL>();
+SGL_DEVICE bool mbar_test_parity(uint64_t* bar, const uint32_t parity) {
+  uint32_t done;
+  asm volatile(
+      "{\n\t.reg .pred p;\n\tmbarrier.test_wait.parity.shared.b64 p, [%1], %2;\n\tselp.u32 %0, 1, 0, p;\n\t}"
+      : "=r"(done)
+      : "r"(device::ptx::to_shared(bar)), "r"(parity)
+      : "memory");
+  return done != 0;
+}
 
+// D[m rows of A][16 operand columns] over K = 128, into TMEM columns t_cols
+SGL_DEVICE void issue_product(
+    const uint32_t t_cols,
+    const tcgen05::SmemDesc adesc,
+    const uint32_t a_plane,
+    const uint32_t m,
+    const tcgen05::SmemDesc bdesc) {
+  const uint32_t idesc = tcgen05::make_instr_desc_f16(m, kCols, false, false) | (1u << 7) | (1u << 10);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    tcgen05::mma_f16_ss(
+        t_cols,
+        adesc.advance_bytes((i >> 2) * a_plane + (i & 3) * 32).bits,
+        bdesc.advance_bytes((i >> 2) * kColPlane + (i & 3) * 32).bits,
+        idesc,
+        i > 0);
+  }
+}
+
+SGL_DEVICE float sum8(float x) {
+  x += __shfl_xor_sync(kFull, x, 4);
+  x += __shfl_xor_sync(kFull, x, 2);
+  x += __shfl_xor_sync(kFull, x, 1);
+  return x;
+}
+
+template <bool kUsePDL>
+__global__ void __launch_bounds__(kThreads, Layout::per_sm) verify_kernel(const __grid_constant__ Params p) {
+  using Lay = Layout;
+  extern __shared__ __align__(1024) uint8_t smem[];
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  const int g = lane >> 2;
-  const int t = lane & 3;
+  const bool issuer = warp == kWorkers / 32;
   const int hv = blockIdx.x;
   const int n = blockIdx.y;
   const int h = hv / p.hv_per_h;
+  float* const s_sc = reinterpret_cast<float*>(smem + Lay::sc);
+  float* const s_coef = reinterpret_cast<float*>(smem + Lay::coef);
+  float* const s_ex = reinterpret_cast<float*>(smem + Lay::ex);
+  uint64_t* const s_bar = reinterpret_cast<uint64_t*>(smem + Lay::bar);
+  uint32_t* const s_tmem = reinterpret_cast<uint32_t*>(smem + Lay::tmem);
 
+  if (issuer) {
+    tcgen05::alloc(s_tmem, kTmemCols);
+    tcgen05::relinquish_alloc_permit();
+  }
+  device::PDLWaitPrimary<kUsePDL>();
+
+  const int64_t slot = load_index(p.state_idx, n * p.s_si, p.si64);
   const int64_t bos = load_index(p.qsl, n * p.s_qsl, p.qsl64);
   const int64_t eos = load_index(p.qsl, (n + 1) * p.s_qsl, p.qsl64);
-  const int64_t slot = load_index(p.state_idx, n * p.s_si, p.si64);
   const int64_t ring = load_index(p.ring_idx, n * p.s_ri, p.ri64);
   const int S = static_cast<int>(min(eos - bos, static_cast<int64_t>(kS)));
-  uint16_t* out = p.o + bos * p.s_o + hv * kD + tid;
   if (slot <= p.null_block_id) {
+    if (issuer) {
+      tcgen05::dealloc(*s_tmem, kTmemCols);
+    } else {
 #pragma unroll
-    for (int s = 0; s < kS; ++s) {
-      if (s < S) out[s * p.s_o] = 0;
+      for (int s = 0; s < kS; ++s) {
+        if (s < S) p.o[(bos + s) * p.s_o + hv * kD + tid] = 0;
+      }
+    }
+    return;
+  }
+  if (issuer && lane == 0) {
+    device::ptx::mbar_init(s_bar, 1);
+    device::ptx::mbar_init(s_bar + 1, 1);
+    device::ptx::mbar_init(s_bar + 2, 1);
+    device::ptx::fence_barrier_init();
+    const uint32_t dst = device::ptx::to_shared(smem + Lay::a);
+    device::ptx::mbar_arrive_expect_tx(s_bar, 2 * kPlane);
+    device::ptx::cp_async_bulk_tensor_3d(dst, &p.h0_map, 0, hv * kD, static_cast<int32_t>(slot), s_bar);
+    device::ptx::cp_async_bulk_tensor_3d(dst + kPlane, &p.h0_map, kD / 2, hv * kD, static_cast<int32_t>(slot), s_bar);
+  }
+  const int8_t flush = p.is_flush[ring * p.s_fl];
+  const int r = min(max(p.write_pos[ring * p.s_wp], 0), kL);
+  const int base = p.cache_base[ring * p.s_cb];
+  if (flush != 0) {
+    if (issuer) {
+      if (lane == 0) device::ptx::mbar_wait_parity(s_bar, 0);
+      tcgen05::dealloc(*s_tmem, kTmemCols);
     }
     return;
   }
 
-  const int8_t flush = p.is_flush[ring * p.s_fl];
-  const int32_t write_pos = p.write_pos[ring * p.s_wp];
-  const int32_t cache_base = p.cache_base[ring * p.s_cb];
-  const int c = tid >> 4;
-  const int ws = c & 3;
-  const int chunk = tid & 15;
-  const bool wlive = ws < S;
-  const bool is_k = c >= kS;
-  const int64_t wtoken = bos + (wlive ? ws : 0);
-  const uint4 raw = load_u4((is_k ? p.k + wtoken * p.s_k : p.q + wtoken * p.s_q) + h * kD + chunk * 8);
-  uint16_t v_raw[kS];
-#pragma unroll
-  for (int s = 0; s < kS; ++s)
-    v_raw[s] = p.v[(bos + (s < S ? s : 0)) * p.s_v + hv * kD + tid];
-  const uint16_t* state = p.h0 + slot * p.s_h0 + static_cast<int64_t>(hv) * kD * kD + (2 * warp * 16 + g) * kD + 8 * t;
-  uint4 ra[2][4], rb[2][4];
-  load_rows(ra[0], state, true);
-  load_rows(ra[1], state + 8 * kD, true);
-
-  if (flush != 0) return;
-  const int r = min(max(write_pos, 0), kL);
-  const int base = cache_base;
-  const bool hist = warp < 2 && r > 0;
-  if (hist) {
-    const uint16_t* keys =
-        (warp == 0 ? p.k_hi + ring * p.s_khi : p.k_lo + ring * p.s_klo) + static_cast<int64_t>(h) * kL * kD + 8 * t;
-    load_rows(rb[0], keys + ((base + g) & (kL - 1)) * kD, g < r);
-    load_rows(rb[1], keys + ((base + g + 8) & (kL - 1)) * kD, g + 8 < r);
-  } else {
-    load_rows(rb[0], state + 16 * kD, true);
-    load_rows(rb[1], state + 24 * kD, true);
-  }
-  float* gates = p.g + ring * p.s_g + hv * kL;
-  uint16_t* d_hi = p.d_hi + ring * p.s_dhi + static_cast<int64_t>(hv) * kL * kD + tid;
-  uint16_t* d_lo = p.d_lo + ring * p.s_dlo + static_cast<int64_t>(hv) * kL * kD + tid;
-  uint16_t dh_raw[kEarly], dl_raw[kEarly];
-#pragma unroll
-  for (int i = 0; i < kEarly; ++i) {
-    const int phys = (base + i) & (kL - 1);
-    dh_raw[i] = i < r ? d_hi[phys * kD] : 0;
-    dl_raw[i] = i < r ? d_lo[phys * kD] : 0;
-  }
-
-  if (warp == 3) {
+  if (issuer) {
     const int s = lane & 3;
     const bool live = s < S;
     const int64_t token = bos + (live ? s : 0);
-    const float x = bf_lo(p.a[token * p.s_a + hv]) + load_gate(p.dt_bias, hv, p.gate16);
+    const float x = bf_lo(p.a[token * p.s_a + hv]) + load_gate(p.dt_bias, hv, p.dtb16);
     const float bv = bf_lo(p.b[token * p.s_b + hv]);
-    const float rate = load_gate(p.A_log, hv, p.gate16);
+    const float rate = load_gate(p.A_log, hv, p.alog16);
     float gh[kL];
 #pragma unroll
     for (int i = 0; i < kL; ++i)
-      gh[i] = i < r ? gates[(base + i) & (kL - 1)] : 0.f;
+      gh[i] = i < r ? p.g[ring * p.s_g + hv * kL + ((base + i) & (kL - 1))] : 0.f;
+    tcgen05::fence_before_thread_sync();
+    device::ptx::bar_sync(1, kThreads);
+    tcgen05::fence_after_thread_sync();
+    const uint32_t t_d = *s_tmem;
+    const auto adesc = tcgen05::make_desc_kmajor_sw128(smem + Lay::a);
+    const auto bdesc = tcgen05::make_desc_kmajor_sw128(smem + Lay::b);
+    bool issued = false;
+    if (lane == 0) {
+      issued = mbar_test_parity(s_bar, 0);
+      if (issued) {
+        issue_product(t_d, adesc, kPlane, kD, bdesc);
+        tcgen05::commit(s_bar + 1);
+      }
+    }
+
     const float sp = x <= 20.f ? logf(1.f + expf(x)) : x;
     const float gate = live ? -expf(rate) * sp : 0.f;
     const float beta = live ? 1.f / (1.f + expf(-bv)) : 0.f;
@@ -233,25 +245,113 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(const __grid_constant_
     const float G1 = G0 + __shfl_sync(kFull, gate, 1);
     const float G2 = G1 + __shfl_sync(kFull, gate, 2);
     const float G3 = G2 + __shfl_sync(kFull, gate, 3);
-    float arg;
-    if (lane < 4) {
-      arg = pick(G0, G1, G2, G3, lane);
-    } else if (lane < 10) {
-      const int pi = (kPairRows >> (2 * (lane - 4))) & 3;
-      const int pj = (kPairCols >> (2 * (lane - 4))) & 3;
-      arg = pick(G0, G1, G2, G3, pi) - pick(G0, G1, G2, G3, pj);
-    } else {
-      const int j = lane - 11;
-      arg = 0.f;
+    float arg = 0.f;
+    if (lane < kL || lane == kL + 10) {
 #pragma unroll
       for (int i = 0; i < kL; ++i) {
-        if (i > j) arg += gh[i];
+        if (lane == kL + 10 || i > lane) arg += gh[i];
       }
+    } else if (lane < kL + 4) {
+      arg = pick(G0, G1, G2, G3, lane - kL);
+    } else if (lane < kL + 10) {
+      const int pi = (kPairRows >> (2 * (lane - kL - 4))) & 3;
+      const int pj = (kPairCols >> (2 * (lane - kL - 4))) & 3;
+      arg = pick(G0, G1, G2, G3, pi) - pick(G0, G1, G2, G3, pj);
     }
-    sm.ex[lane] = expf(arg);
+    const float e = expf(arg);
+    const float eG = __shfl_sync(kFull, e, kL + s);
+    const float decay = __shfl_sync(kFull, e, kL + 10);
+    float pe[kS];
+#pragma unroll
+    for (int j = 0; j < kS; ++j) {
+      const int hi = max(s, j);
+      const int lo = min(s, j);
+      pe[j] = __shfl_sync(kFull, e, kL + 4 + hi * (hi - 1) / 2 + lo);
+    }
+
+    device::ptx::mbar_wait_parity(s_bar + 2, 0);
+    tcgen05::fence_after_thread_sync();
+    float gr[kCols], sh[kCols], sl[kCols];
+    tcgen05::ld_32x32b<kCols>(t_d + 3 * kCols, gr);
+    if (r > 0) {
+      tcgen05::ld_32x32b<kCols>(t_d + kCols, sh);
+      tcgen05::ld_32x32b<kCols>(t_d + 2 * kCols, sl);
+    }
+    tcgen05::wait_ld();
+    if (r > 0 && lane < kL) {
+      float sc[2 * kS];
+#pragma unroll
+      for (int m = 0; m < 2 * kS; ++m)
+        sc[m] = ((sh[m] + sh[2 * kS + m]) + (sl[m] + sl[2 * kS + m])) * e;
+      *reinterpret_cast<float4*>(s_sc + lane * 8) = make_float4(sc[0], sc[1], sc[2], sc[3]);
+      *reinterpret_cast<float4*>(s_sc + lane * 8 + 4) = make_float4(sc[4], sc[5], sc[6], sc[7]);
+    }
+    float kx[2 * kS];
+#pragma unroll
+    for (int m = 0; m < 2 * kS; ++m) {
+      kx[m] = gr[m] + gr[2 * kS + m];
+      kx[m] += __shfl_xor_sync(kFull, kx[m], 8);
+    }
+    if (lane >= kS && lane < 2 * kS) {
+      float af[2 * kS];
+#pragma unroll
+      for (int j = 0; j < kS; ++j) {
+        af[j] = j < s ? beta * pe[j] * kx[kS + j] : 0.f;
+        af[kS + j] = j < s ? 0.f : j == s ? kx[j] : pe[j] * kx[j];
+      }
+      *reinterpret_cast<float4*>(s_coef + s * 8) = make_float4(af[0], af[1], af[2], af[3]);
+      *reinterpret_cast<float4*>(s_coef + s * 8 + 4) = make_float4(af[4], af[5], af[6], af[7]);
+    }
     if (lane < kS) {
-      sm.gs[lane] = gate;
-      sm.beta[lane] = beta;
+      s_ex[lane] = eG;
+      s_ex[kS + lane] = beta;
+      s_ex[2 * kS + lane] = decay;
+      s_ex[3 * kS + lane] = gate;
+    }
+    if (lane == 0 && !issued) {
+      device::ptx::mbar_wait_parity(s_bar, 0);
+      issue_product(t_d, adesc, kPlane, kD, bdesc);
+      tcgen05::commit(s_bar + 1);
+    }
+    tcgen05::fence_before_thread_sync();
+    device::ptx::bar_sync(2, kThreads);
+    device::ptx::bar_sync(3, kThreads);
+    tcgen05::fence_after_thread_sync();
+    tcgen05::dealloc(*s_tmem, kTmemCols);
+    return;
+  }
+
+  const int c = tid >> 4;
+  const int ws = c & 3;
+  const int chunk = tid & 15;
+  const int row = tid >> 3;
+  const int part = tid & 7;
+  const bool wlive = ws < S;
+  const bool is_k = c >= kS;
+  const int64_t wtoken = bos + (wlive ? ws : 0);
+  const uint4 raw = load_u4((is_k ? p.k + wtoken * p.s_k : p.q + wtoken * p.s_q) + h * kD + chunk * 8);
+  const int64_t hv_off = static_cast<int64_t>(hv) * kL * kD + tid;
+  uint16_t* const d_hi = p.d_hi + ring * p.s_dhi + hv_off;
+  uint16_t* const d_lo = p.d_lo + ring * p.s_dlo + hv_off;
+  uint16_t v_raw[kS];
+  uint32_t d_raw[kEarly];
+#pragma unroll
+  for (int s = 0; s < kS; ++s)
+    v_raw[s] = p.v[(bos + (s < S ? s : 0)) * p.s_v + hv * kD + tid];
+#pragma unroll
+  for (int i = 0; i < kEarly; ++i) {
+    const int phys = (base + i) & (kL - 1);
+    d_raw[i] = i < r ? d_hi[phys * kD] | (static_cast<uint32_t>(d_lo[phys * kD]) << 16) : 0u;
+  }
+  uint4 key_hi[2], key_lo[2];
+  {
+    const int64_t off = (static_cast<int64_t>(h) * kL + ((base + row) & (kL - 1))) * kD + part * 16;
+    const uint16_t* hi = p.k_hi + ring * p.s_khi + off;
+    const uint16_t* lo = p.k_lo + ring * p.s_klo + off;
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+      key_hi[e] = row < r ? load_u4(hi + 8 * e) : make_uint4(0, 0, 0, 0);
+      key_lo[e] = row < r ? load_u4(lo + 8 * e) : make_uint4(0, 0, 0, 0);
     }
   }
 
@@ -263,9 +363,7 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(const __grid_constant_
     for (int e = 0; e < 8; ++e)
       ss += x[e] * x[e];
     ss += __shfl_xor_sync(kFull, ss, 8);
-    ss += __shfl_xor_sync(kFull, ss, 4);
-    ss += __shfl_xor_sync(kFull, ss, 2);
-    ss += __shfl_xor_sync(kFull, ss, 1);
+    ss = sum8(ss);
     float rn = wlive ? 1.f / sqrtf(ss + 1e-6f) : 0.f;
     if (!is_k) rn *= p.scale;
     uint32_t hi[4], lo[4];
@@ -280,97 +378,75 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(const __grid_constant_
     }
     const uint4 hi4 = make_uint4(hi[0], hi[1], hi[2], hi[3]);
     const uint4 lo4 = make_uint4(lo[0], lo[1], lo[2], lo[3]);
-    *reinterpret_cast<uint4*>(sm.x[c] + chunk * 8) = hi4;
-    *reinterpret_cast<uint4*>(sm.x[8 + c] + chunk * 8) = lo4;
+    uint8_t* const col = smem + Lay::b + (chunk >> 3) * kColPlane;
+    *reinterpret_cast<uint4*>(col + tcgen05::sw128_off(c, chunk & 7)) = hi4;
+    *reinterpret_cast<uint4*>(col + tcgen05::sw128_off(2 * kS + c, chunk & 7)) = lo4;
     if (is_k && wlive && hv % p.hv_per_h == 0 && r + ws < kL) {
       const int64_t off = (static_cast<int64_t>(h) * kL + ((base + r + ws) & (kL - 1))) * kD + chunk * 8;
       *reinterpret_cast<uint4*>(p.k_hi + ring * p.s_khi + off) = hi4;
       *reinterpret_cast<uint4*>(p.k_lo + ring * p.s_klo + off) = lo4;
     }
   }
-  __syncthreads();
-
-  const uint16_t* c0 = sm.x[g] + 8 * t;
-  const uint16_t* c1 = sm.x[8 + g] + 8 * t;
-  {
-    float acc[2][4] = {};
-    tile_product(acc, ra[0], ra[1], c0, c1);
-    store_rows(sm.hw, 2 * warp * 16 + g, t, acc);
-  }
-  if (hist) {
-    load_rows(ra[0], state + 16 * kD, true);
-    load_rows(ra[1], state + 24 * kD, true);
-  }
-  {
-    float acc[2][4] = {};
-    tile_product(acc, rb[0], rb[1], c0, c1);
-    if (hist) {
-      store_rows(warp == 0 ? sm.sc_hi : sm.sc_lo, g, t, acc);
-    } else {
-      store_rows(sm.hw, (2 * warp + 1) * 16 + g, t, acc);
+  if (r > 0) {
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+      const int c16 = 2 * part + e;
+      uint8_t* const dst = smem + Lay::aux + (c16 >> 3) * kColPlane + tcgen05::sw128_off(row, c16 & 7);
+      *reinterpret_cast<uint4*>(dst) = key_hi[e];
+      *reinterpret_cast<uint4*>(dst + 2 * kColPlane) = key_lo[e];
     }
   }
-  if (hist) {
-    float acc[2][4] = {};
-    tile_product(acc, ra[0], ra[1], c0, c1);
-    store_rows(sm.hw, (2 * warp + 1) * 16 + g, t, acc);
-  }
-  if (warp == 2) {
-    load_rows(ra[0], c0, true);
-    load_rows(ra[1], c1, true);
-    float acc[2][4] = {};
-    tile_product(acc, ra[0], ra[1], c0, c1);
-    *reinterpret_cast<float2*>(sm.gram[g] + 2 * t) = make_float2(acc[0][0], acc[0][1]);
-    *reinterpret_cast<float2*>(sm.gram[g] + 8 + 2 * t) = make_float2(acc[1][0], acc[1][1]);
-    *reinterpret_cast<float2*>(sm.gram[g + 8] + 2 * t) = make_float2(acc[0][2], acc[0][3]);
-    *reinterpret_cast<float2*>(sm.gram[g + 8] + 8 + 2 * t) = make_float2(acc[1][2], acc[1][3]);
-  }
-  __syncthreads();
-
-  {
-    const int j = tid >> 3;
-    if (j < r) sm.sc[j][tid & 7] = (sm.sc_hi[j][tid & 7] + sm.sc_lo[j][tid & 7]) * sm.ex[11 + j];
-    if (tid < 16) {
-      const int pi = (kPairRows >> (2 * tid)) & 3;
-      const int pj = (kPairCols >> (2 * tid)) & 3;
-      const int ra = 4 + pi;
-      const int cb = (tid < 6 ? 4 : 0) + pj;
-      const float dot = sm.gram[ra][cb] + sm.gram[ra][cb + 8] + sm.gram[ra + 8][cb] + sm.gram[ra + 8][cb + 8];
-      float w;
-      if (tid < 6) {
-        w = sm.beta[pi] * sm.ex[4 + tid];
-      } else {
-        w = pi == pj ? 1.f : sm.ex[4 + pj * (pj - 1) / 2 + pi];
-      }
-      sm.af[tid] = w * dot;
+  device::ptx::fence_proxy_async_shared();
+  device::ptx::bar_sync(1, kThreads);
+  tcgen05::fence_after_thread_sync();
+  const uint32_t t_d = *s_tmem + (static_cast<uint32_t>(warp * 32) << 16);
+  if (tid == 0) {
+    const auto bdesc = tcgen05::make_desc_kmajor_sw128(smem + Lay::b);
+    issue_product(t_d + 3 * kCols, bdesc, kColPlane, 64, bdesc);
+    if (r > 0) {
+      const auto kdesc = tcgen05::make_desc_kmajor_sw128(smem + Lay::aux);
+      issue_product(t_d + kCols, kdesc, kColPlane, 64, bdesc);
+      issue_product(t_d + 2 * kCols, kdesc.advance_bytes(2 * kColPlane), kColPlane, 64, bdesc);
     }
+    tcgen05::commit(s_bar + 2);
   }
-  __syncthreads();
+  device::ptx::bar_sync(2, kThreads);
+  tcgen05::fence_after_thread_sync();
 
-  const float4 a0 = *reinterpret_cast<const float4*>(sm.af);
-  const float4 a1 = *reinterpret_cast<const float4*>(sm.af + 4);
-  const float4 a2 = *reinterpret_cast<const float4*>(sm.af + 8);
-  const float4 a3 = *reinterpret_cast<const float4*>(sm.af + 12);
-  const float a10 = a0.x, a20 = a0.y, a21 = a0.z, a30 = a0.w, a31 = a1.x, a32 = a1.y;
-  const float f00 = a1.z, f01 = a1.w, f02 = a2.x, f03 = a2.y, f11 = a2.z, f12 = a2.w;
-  const float f13 = a3.x, f22 = a3.y, f23 = a3.z, f33 = a3.w;
+  const float4 c0 = *reinterpret_cast<const float4*>(s_coef + 4);
+  const float4 a1 = *reinterpret_cast<const float4*>(s_coef + 8);
+  const float4 c1 = *reinterpret_cast<const float4*>(s_coef + 12);
+  const float4 a2 = *reinterpret_cast<const float4*>(s_coef + 16);
+  const float4 c2 = *reinterpret_cast<const float4*>(s_coef + 20);
+  const float4 a3 = *reinterpret_cast<const float4*>(s_coef + 24);
+  const float4 c3 = *reinterpret_cast<const float4*>(s_coef + 28);
+  const float4 eG4 = *reinterpret_cast<const float4*>(s_ex);
+  const float4 beta4 = *reinterpret_cast<const float4*>(s_ex + kS);
+  const float eG[kS] = {eG4.x, eG4.y, eG4.z, eG4.w};
+  const float beta[kS] = {beta4.x, beta4.y, beta4.z, beta4.w};
+  const float a10 = a1.x, a20 = a2.x, a21 = a2.y, a30 = a3.x, a31 = a3.y, a32 = a3.z;
+  const float f00 = c0.x, f01 = c0.y, f02 = c0.z, f03 = c0.w, f11 = c1.y;
+  const float f12 = c1.z, f13 = c1.w, f22 = c2.z, f23 = c2.w, f33 = c3.w;
   const float t10 = -a10;
   const float t21 = -a21;
   const float t32 = -a32;
   const float t20 = -a20 - a21 * t10;
   const float t31 = -a31 - a32 * t21;
   const float t30 = -a30 - a31 * t10 - a32 * t20;
-  const float4 eG4 = *reinterpret_cast<const float4*>(sm.ex);
-  const float4 beta4 = *reinterpret_cast<const float4*>(sm.beta);
-  const float eG[kS] = {eG4.x, eG4.y, eG4.z, eG4.w};
-  const float beta[kS] = {beta4.x, beta4.y, beta4.z, beta4.w};
 
-  const float4 hq4 = *reinterpret_cast<const float4*>(sm.hw[tid]);
-  const float4 hk4 = *reinterpret_cast<const float4*>(sm.hw[tid] + 4);
-  float hq[kS] = {hq4.x, hq4.y, hq4.z, hq4.w};
-  float hk[kS] = {hk4.x, hk4.y, hk4.z, hk4.w};
+  device::ptx::mbar_wait_parity(s_bar + 1, 0);
+  tcgen05::fence_after_thread_sync();
+  float hw[kCols];
+  tcgen05::ld_32x32b<kCols>(t_d, hw);
+  tcgen05::wait_ld();
+  float hq[kS], hk[kS];
+#pragma unroll
+  for (int s = 0; s < kS; ++s) {
+    hq[s] = hw[s] + hw[2 * kS + s];
+    hk[s] = hw[kS + s] + hw[3 * kS + s];
+  }
   if (r > 0) {
-    const float decay = sm.ex[10];
+    const float decay = s_ex[2 * kS];
 #pragma unroll
     for (int s = 0; s < kS; ++s) {
       hq[s] *= decay;
@@ -379,13 +455,18 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(const __grid_constant_
     for (int i = 0; i < r; ++i) {
       float d;
       if (i < kEarly) {
-        d = bf_lo(dh_raw[i]) + bf_lo(dl_raw[i]);
+        uint32_t w = d_raw[0];
+#pragma unroll
+        for (int e = 1; e < kEarly; ++e) {
+          if (i == e) w = d_raw[e];
+        }
+        d = bf_lo(w) + bf_hi(w);
       } else {
         const int phys = (base + i) & (kL - 1);
         d = bf_lo(d_hi[phys * kD]) + bf_lo(d_lo[phys * kD]);
       }
-      const float4 sq = *reinterpret_cast<const float4*>(sm.sc[i]);
-      const float4 sk = *reinterpret_cast<const float4*>(sm.sc[i] + 4);
+      const float4 sq = *reinterpret_cast<const float4*>(s_sc + i * 8);
+      const float4 sk = *reinterpret_cast<const float4*>(s_sc + i * 8 + 4);
       hq[0] = fmaf(d, sq.x, hq[0]);
       hq[1] = fmaf(d, sq.y, hq[1]);
       hq[2] = fmaf(d, sq.z, hq[2]);
@@ -413,6 +494,7 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(const __grid_constant_
       eG[2] * hq[2] + D[0] * f02 + D[1] * f12 + D[2] * f22,
       eG[3] * hq[3] + D[0] * f03 + D[1] * f13 + D[2] * f23 + D[3] * f33,
   };
+  uint16_t* const out = p.o + bos * p.s_o + hv * kD + tid;
 #pragma unroll
   for (int s = 0; s < kS; ++s) {
     if (s < S) {
@@ -422,10 +504,12 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(const __grid_constant_
         const uint32_t dh = to_bf(D[s]);
         d_hi[phys * kD] = static_cast<uint16_t>(dh);
         d_lo[phys * kD] = static_cast<uint16_t>(to_bf(D[s] - bf_lo(dh)));
-        if (tid == 0) gates[phys] = sm.gs[s];
+        if (tid == 0) p.g[ring * p.s_g + hv * kL + phys] = s_ex[3 * kS + s];
       }
     }
   }
+  tcgen05::fence_before_thread_sync();
+  device::ptx::bar_arrive(3, kThreads);
 }
 
 }  // namespace gdn_replayssm_verify
@@ -501,17 +585,24 @@ struct GdnReplaySSMVerify {
     const int64_t rows = B_.unwrap();
     const int64_t num_h = H_.unwrap();
     const int64_t num_hv = HV_.unwrap();
+    const int64_t slots = Slots_.unwrap();
     RuntimeCheck(B1_.unwrap() == rows + 1, "query_start_loc needs rows + 1 entries");
     RuntimeCheck(num_h > 0 && num_hv % num_h == 0, "value heads must be a multiple of key heads");
-    RuntimeCheck(A_log.dtype().bits == dt_bias.dtype().bits, "A_log and dt_bias must share a dtype");
     const auto aligned = [](const tvm::ffi::TensorView t) {
       return reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0 && t.stride(0) % 8 == 0;
     };
     RuntimeCheck(
         aligned(q) && aligned(k) && aligned(h0) && aligned(k_hi) && aligned(k_lo),
         "q, k, the checkpoint and the key rings must be 16-byte aligned per row");
-    if (rows == 0) return;
+    if (rows == 0 || slots == 0) return;
     const auto params = Params{
+        .h0_map = tma::make_map(
+            h0.data_ptr(),
+            CU_TENSOR_MAP_DATA_TYPE_UINT16,
+            {kD, static_cast<cuuint64_t>(num_hv * kD), static_cast<cuuint64_t>(slots)},
+            {kD * 2, static_cast<cuuint64_t>(h0.stride(0) * 2)},
+            {kD / 2, kD, 1},
+            {.swizzle = CU_TENSOR_MAP_SWIZZLE_128B}),
         .q = static_cast<const uint16_t*>(q.data_ptr()),
         .k = static_cast<const uint16_t*>(k.data_ptr()),
         .v = static_cast<const uint16_t*>(v.data_ptr()),
@@ -520,7 +611,6 @@ struct GdnReplaySSMVerify {
         .A_log = A_log.data_ptr(),
         .dt_bias = dt_bias.data_ptr(),
         .o = static_cast<uint16_t*>(o.data_ptr()),
-        .h0 = static_cast<const uint16_t*>(h0.data_ptr()),
         .d_hi = static_cast<uint16_t*>(d_hi.data_ptr()),
         .d_lo = static_cast<uint16_t*>(d_lo.data_ptr()),
         .k_hi = static_cast<uint16_t*>(k_hi.data_ptr()),
@@ -538,7 +628,6 @@ struct GdnReplaySSMVerify {
         .s_a = a.stride(0),
         .s_b = b.stride(0),
         .s_o = o.stride(0),
-        .s_h0 = h0.stride(0),
         .s_dhi = d_hi.stride(0),
         .s_dlo = d_lo.stride(0),
         .s_khi = k_hi.stride(0),
@@ -556,10 +645,14 @@ struct GdnReplaySSMVerify {
         .qsl64 = qsl.dtype().bits == 64,
         .si64 = state_idx.dtype().bits == 64,
         .ri64 = ring_idx.dtype().bits == 64,
-        .gate16 = A_log.dtype().bits == 16,
+        .alog16 = A_log.dtype().bits == 16,
+        .dtb16 = dt_bias.dtype().bits == 16,
     };
+    const DLDevice dev = device.unwrap();
+    constexpr int smem = Layout::bytes;
+    runtime::set_max_dynamic_smem_per_device<verify_kernel<kUsePDL>>(dev, smem);
     const dim3 grid(static_cast<uint32_t>(num_hv), static_cast<uint32_t>(rows));
-    LaunchKernel(grid, kThreads, device.unwrap()).enable_pdl(kUsePDL)(verify_kernel<kUsePDL>, params);
+    LaunchKernel(grid, kThreads, dev, smem).enable_pdl(kUsePDL)(verify_kernel<kUsePDL>, params);
   }
 };
 
