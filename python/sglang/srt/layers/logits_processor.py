@@ -572,6 +572,7 @@ class LogitsProcessor(nn.Module):
         self.sharded_verify = False
         self._sharded_verify_temperature_keys = False
         self.keep_decode_logits_dtype = False
+        self.mxfp8_lm_head = envs.SGLANG_ONLINE_MXFP8_LM_HEAD.get()
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -1492,6 +1493,15 @@ class LogitsProcessor(nn.Module):
                 )
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
+            elif (
+                self.mxfp8_lm_head
+                and hidden_states.is_cuda
+                and hidden_states.shape[0] > 0
+                and lm_head.weight.dtype == torch.bfloat16
+                and lm_head.weight.shape[0] % 128 == 0
+                and lm_head.weight.shape[1] % 32 == 0
+            ):
+                logits = mxfp8_lm_head_matmul(hidden_states, lm_head)
             else:
                 lhs = hidden_states.to(lm_head.weight.dtype)
                 if out is not None and out.dtype == lm_head.weight.dtype:
@@ -1895,6 +1905,26 @@ def _reassemble_tp_lm_head_all_to_all_output(
 
 def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
     return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
+
+
+def mxfp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
+    from flashinfer import block_scale_interleave, mm_mxfp8, mxfp8_quantize
+
+    weight = lm_head.weight
+    cache = getattr(weight, "_mxfp8_weight_cache", None)
+    if cache is None or cache[0].shape != weight.shape:
+        n, k = weight.shape
+        w_q, w_sf = mxfp8_quantize(
+            weight.to(torch.bfloat16), is_sf_swizzled_layout=False
+        )
+        w_sf = block_scale_interleave(
+            w_sf.view(torch.uint8).reshape(n, k // 32).contiguous()
+        ).contiguous()
+        cache = (w_q, w_sf)
+        weight._mxfp8_weight_cache = cache
+    h_q, h_sf = mxfp8_quantize(hidden.to(torch.bfloat16), is_sf_swizzled_layout=True)
+    logits = mm_mxfp8(h_q, cache[0].t(), h_sf, cache[1], backend="cute-dsl")
+    return logits if logits.dtype == hidden.dtype else logits.to(hidden.dtype)
 
 
 def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
