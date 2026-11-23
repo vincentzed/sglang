@@ -2044,6 +2044,10 @@ class Envs:
     # Gated RMSNorm (the GDN output norm): 16 rows per block on 4 warps for
     # launches with many rows per SM (a prefill) instead of 4 rows on 1 warp.
     SGLANG_OPT_GATED_NORM_WIDE_ROWS = EnvBool(False)
+    # GDN prefill, FlashInfer: one long sequence runs as two halves at once (the
+    # second from a zero state, beside its state transition on a second stream),
+    # then the second half takes the first half's state by one batched GEMM.
+    SGLANG_OPT_GDN_PREFILL_TWO_WAY = EnvBool(False)
     # GDN prefill, FlashInfer: a tracked prefill stores only the checkpoints the
     # radix cache reads (the others' pool rows are -1) instead of one per chunk.
     SGLANG_OPT_GDN_PREFILL_SPARSE_CHECKPOINTS = EnvBool(False)

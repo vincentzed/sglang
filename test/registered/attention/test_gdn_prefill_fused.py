@@ -1,3 +1,4 @@
+import math
 import os
 import unittest
 from types import SimpleNamespace
@@ -20,13 +21,28 @@ from sglang.kernels.ops.mamba.gdn_prefill_conv import (
 from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=40, stage="base-b", runner_config="1-gpu-small")
 
 HEAD_DIM = 128
 
 
 def _is_sm100() -> bool:
     return is_cuda() and torch.cuda.get_device_capability()[0] == 10
+
+
+def _recurrent_reference(q, k, v, alpha, beta, state):
+    """Token-by-token gated delta rule in FP32 for one sequence; state is [HV, V, K]."""
+    group = v.shape[1] // q.shape[1]
+    s = state.float().clone()
+    out = torch.empty(v.shape, dtype=torch.float32, device=v.device)
+    for t in range(q.shape[0]):
+        qt = q[t].float().repeat_interleave(group, 0) / math.sqrt(q.shape[-1])
+        kt = k[t].float().repeat_interleave(group, 0)
+        s.mul_(alpha[t][:, None, None])
+        delta = (v[t].float() - torch.einsum("hvk,hk->hv", s, kt)) * beta[t][:, None]
+        s.add_(delta[:, :, None] * kt[:, None, :])
+        out[t] = torch.einsum("hvk,hk->hv", s, qt)
+    return out, s
 
 
 def _conv_reference(x, weight, states, starts, cache_indices, has_initial_state):
@@ -200,6 +216,62 @@ class TestGdnPrefillFused(unittest.TestCase):
                         bool(((out.float() - ref.float()).abs() <= ulp).all())
                     )
                 torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
+
+    @unittest.skipIf(not _is_sm100(), "FlashInfer's SM100 GDN prefill kernel")
+    def test_two_way_prefill_matches_one_pass_and_fp32_reference(self):
+        from sglang.srt.layers.attention.linear.kernels import gdn_flashinfer
+
+        torch.manual_seed(0)
+        tokens = gdn_flashinfer._TWO_WAY_MIN_TOKENS + 96
+        heads_qk, heads_v = 2, 6
+        q = F.normalize(
+            torch.randn(1, tokens, heads_qk, HEAD_DIM, device="cuda"), dim=-1
+        )
+        k = F.normalize(
+            torch.randn(1, tokens, heads_qk, HEAD_DIM, device="cuda"), dim=-1
+        )
+        q, k = q.bfloat16(), k.bfloat16()
+        v = (torch.randn(1, tokens, heads_v, HEAD_DIM, device="cuda") * 0.5).bfloat16()
+        g = -torch.rand(1, tokens, heads_v, device="cuda") * 0.1
+        beta = torch.rand(1, tokens, heads_v, device="cuda")
+        pool = (
+            torch.randn(4, heads_v, HEAD_DIM, HEAD_DIM, device="cuda") * 0.1
+        ).bfloat16()
+        cache_indices = torch.tensor([2], device="cuda", dtype=torch.int32)
+        query_start_loc = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+        kernel = gdn_flashinfer.FlashInferGDNKernel()
+        results = {}
+        for two_way in (False, True):
+            states = pool.clone()
+            kernel._two_way = two_way
+            with patch.object(
+                kernel, "_run_prefill_two_way", wraps=kernel._run_prefill_two_way
+            ) as spy:
+                out, _, _ = kernel.extend(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ssm_states=states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    extend_seq_lens_cpu=[tokens],
+                    qk_normalized=True,
+                )
+            self.assertEqual(spy.call_count, int(two_way))
+            results[two_way] = (out[0].float(), states[2].float())
+        ref_out, ref_state = _recurrent_reference(
+            q[0], k[0], v[0], torch.exp(g[0]), beta[0], pool[2]
+        )
+        one_out, one_state = results[False]
+        two_out, two_state = results[True]
+        out_err = (two_out - ref_out).abs().max().item()
+        state_err = (two_state - ref_state).abs().max().item()
+        self.assertLessEqual(out_err, 2 * (one_out - ref_out).abs().max().item() + 1e-3)
+        self.assertLessEqual(
+            state_err, 2 * (one_state - ref_state).abs().max().item() + 1e-3
+        )
 
     @unittest.skipIf(not _is_sm100(), "FlashInfer's SM100 GDN prefill kernel")
     def test_sparse_checkpoints_match_dense_checkpoints(self):

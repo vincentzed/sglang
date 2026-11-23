@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _FLASHINFER_GDN_ALIGNMENT = 32
+_TWO_WAY_MIN_TOKENS = 4096
 
 
 def copy_verify_intermediate_rows(
@@ -263,6 +264,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     extend_honors_slot_pitch = True
     accepts_normalized_qk = True
     _joint_qk_l2norm: bool = False
+    _two_way: bool = False
 
     def __init__(self):
         (
@@ -295,6 +297,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self._alignment_fallback_warned = False
         self._joint_qk_l2norm = envs.SGLANG_OPT_GDN_PREFILL_SPLIT_CONV.get()
         self.defers_prefill_gates = envs.SGLANG_OPT_GDN_PREFILL_ALPHA_GATES.get()
+        self._two_way = envs.SGLANG_OPT_GDN_PREFILL_TWO_WAY.get() and sm_major == 10
+        self._two_way_zero_v: Optional[torch.Tensor] = None
         # FlashInfer writes through mutable state/workspace pointers, so misaligned
         # inputs must fall back to Triton rather than use temporary copies.
         from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
@@ -644,20 +648,41 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if num_state_checkpoints > 0
             else None
         )
-        output_fi, output_state_fi = self._run_prefill(
-            q=q_fi,
-            k=k_fi,
-            v=v_fi,
-            alpha=alpha_fi,
-            beta=beta_fi,
-            initial_state=initial_state_fi,
-            cu_seqlens=cu_seqlens,
-            output=output_fi,
-            state_checkpoints=state_checkpoints,
-            checkpoint_cu_starts=state_checkpoint_cu_starts,
-            checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
-            checkpoint_state_indices=kwargs.get("state_checkpoint_indices"),
-        )
+        seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
+        if (
+            self._two_way
+            and state_checkpoints is None
+            and seq_lens_cpu is not None
+            and len(seq_lens_cpu) == 1
+            and seq_lens_cpu[0] >= _TWO_WAY_MIN_TOKENS
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            output_fi, output_state_fi = self._run_prefill_two_way(
+                q=q_fi,
+                k=k_fi,
+                v=v_fi,
+                alpha=alpha_fi,
+                beta=beta_fi,
+                initial_state=initial_state_fi,
+                cu_seqlens=cu_seqlens,
+                output=output_fi,
+                num_tokens=seq_lens_cpu[0],
+            )
+        else:
+            output_fi, output_state_fi = self._run_prefill(
+                q=q_fi,
+                k=k_fi,
+                v=v_fi,
+                alpha=alpha_fi,
+                beta=beta_fi,
+                initial_state=initial_state_fi,
+                cu_seqlens=cu_seqlens,
+                output=output_fi,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=state_checkpoint_cu_starts,
+                checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+                checkpoint_state_indices=kwargs.get("state_checkpoint_indices"),
+            )
 
         # Write back state to pool
         scatter_pool_states(ssm_states, ssm_cache_indices, live_rows, output_state_fi)
@@ -714,6 +739,81 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             use_cp=use_cp,
             **kwargs,
         )
+
+    def _run_prefill_two_way(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        output: Optional[torch.Tensor],
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        half = num_tokens // 128 * 64
+        tail = num_tokens - half
+        num_v_heads, head_v_dim, head_k_dim = initial_state.shape[1:]
+        if self._two_way_zero_v is None or self._two_way_zero_v.shape[0] < tail:
+            self._two_way_zero_v = v.new_zeros((tail, *v.shape[1:]))
+            self._two_way_eye = (
+                torch.eye(head_k_dim, dtype=torch.float32, device=v.device)
+                .expand(1, num_v_heads, head_v_dim, head_k_dim)
+                .contiguous()
+            )
+            self._two_way_stream = torch.cuda.Stream(v.device)
+        states = torch.empty(
+            (2, num_v_heads, head_v_dim, head_k_dim),
+            dtype=torch.float32,
+            device=v.device,
+        )
+        states[0].copy_(initial_state[0])
+        states[1].zero_()
+        if output is None:
+            output = torch.empty_like(v)
+        tail_q = torch.empty_like(v[:tail])
+        halves = torch.cat((cu_seqlens[:1], cu_seqlens[:1] + half, cu_seqlens[1:]))
+        tail_seqlens = (cu_seqlens - half).clamp_min(0)
+        main = torch.cuda.current_stream(v.device)
+        side = self._two_way_stream
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            _, transition = self._run_prefill(
+                q=q[half:num_tokens],
+                k=k[half:num_tokens],
+                v=self._two_way_zero_v[:tail],
+                alpha=alpha[half:num_tokens],
+                beta=beta[half:num_tokens],
+                initial_state=self._two_way_eye,
+                cu_seqlens=tail_seqlens,
+                output=tail_q,
+                state_checkpoints=None,
+                checkpoint_cu_starts=None,
+                checkpoint_every_n_tokens=0,
+                use_cp=False,
+            )
+        _, final = self._run_prefill(
+            q=q,
+            k=k,
+            v=v,
+            alpha=alpha,
+            beta=beta,
+            initial_state=states,
+            cu_seqlens=halves,
+            output=output,
+            state_checkpoints=None,
+            checkpoint_cu_starts=None,
+            checkpoint_every_n_tokens=0,
+            use_cp=False,
+        )
+        main.wait_stream(side)
+        mid = final[0]
+        output[half:num_tokens].transpose(0, 1).baddbmm_(
+            tail_q.transpose(0, 1), mid.to(v.dtype).transpose(1, 2)
+        )
+        return output, torch.baddbmm(final[1], mid, transition[0]).unsqueeze(0)
 
     def prewarm_extend(
         self,
@@ -814,6 +914,15 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                     dtype=torch.int32,
                     device=device,
                 ),
+            )
+            num_runs += 1
+        if self._two_way:
+            inputs["initial_state"] = inputs["initial_state"].float()
+            self._run_prefill(
+                **inputs,
+                **modes[0],
+                checkpoint_every_n_tokens=0,
+                use_cp=False,
             )
             num_runs += 1
 

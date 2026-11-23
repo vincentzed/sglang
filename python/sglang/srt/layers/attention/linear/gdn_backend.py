@@ -1743,6 +1743,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 output=kwargs.get("linear_attn_output"),
                 layer_id=layer.layer_id,
                 extend_prefix_lens=forward_batch.extend_prefix_lens,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
                 qk_normalized=fused_conv,
                 track_state=h_track_buf,
                 needs_track_state=(
