@@ -20,6 +20,11 @@ from sglang.kernels.ops.attention.qsa_sparse_decode import (
     qsa_sparse_decode,
     qsa_sparse_decode_sm100,
 )
+from sglang.kernels.ops.attention.qsa_sparse_prefill import (
+    MAX_HEADS_PER_KV_HEAD,
+    MAX_KV_LEN,
+    qsa_sparse_prefill_sm100,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
@@ -68,6 +73,7 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
+_SPARSE_PREFILL_SM100_MIN_ROWS = 8192
 
 
 def _flatten_qsa_kv_cache(cache: torch.Tensor, name: str) -> torch.Tensor:
@@ -319,6 +325,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     _kv_shard_pool: Optional[PageInterleaveKVPoolMixin] = None
     _use_sparse_decode_cuda: bool = False
     _use_sparse_decode_sm100: bool = False
+    _use_sparse_prefill_sm100: bool = False
 
     def __init__(self, runner=None) -> None:
         self.runner = runner
@@ -340,6 +347,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             envs.SGLANG_ENABLE_QSA_SPARSE_DECODE_SM100.get()
             and fp8_pool
             and is_sm100_supported()
+        )
+        self._use_sparse_prefill_sm100 = (
+            envs.SGLANG_ENABLE_QSA_SPARSE_PREFILL_SM100.get()
+            and fp8_pool
+            and is_sm100_supported()
+            and self._kv_shard_pool is None
         )
         self._use_sparse_decode_cuda = (
             envs.SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA.get()
@@ -1710,6 +1723,31 @@ class QwenSparseAttnBackend(AttentionBackend):
             forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
             (1, 0),
         ).contiguous()
+        if (
+            self._use_sparse_prefill_sm100
+            and save_kv_cache
+            and num_valid_rows >= _SPARSE_PREFILL_SM100_MIN_ROWS
+            and num_valid_rows == sum(extend_lens)
+            and max(sequence_lens) <= MAX_KV_LEN
+            and layer.head_dim == 256
+            and q.dtype == torch.bfloat16
+            and layer.tp_q_head_num <= MAX_HEADS_PER_KV_HEAD * layer.tp_k_head_num
+        ):
+            pool = self.token_to_kv_pool
+            output = qsa_sparse_prefill_sm100(
+                q.contiguous(),
+                pool.layer_router.read(layer.layer_id).key(),
+                pool.layer_router.read(layer.layer_id).value(),
+                self.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                topk_indices,
+                cu_seqlens_q,
+                forward_batch.seq_lens.to(q.device, dtype=torch.int32),
+                layer.scaling,
+                extend_lens=extend_lens,
+                max_seq_len=max(sequence_lens),
+            )
+            return self._pad_extend_output(output, num_output_rows)
         if not any(prefix_lens):
             output = sparse_gqa_fwd_interface_triton(
                 q.contiguous(),
