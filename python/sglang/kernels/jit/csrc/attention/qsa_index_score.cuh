@@ -8,6 +8,10 @@
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
+#include <sgl_kernel/ptx/async.cuh>
+#include <sgl_kernel/ptx/barrier.cuh>
+#include <sgl_kernel/ptx/tcgen05.cuh>
+
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
@@ -142,6 +146,367 @@ __global__ void __launch_bounds__(kThreads) decode_kernel(const __grid_constant_
 }
 
 }  // namespace qsa_index_score
+
+namespace qsa_index_score_sm100 {
+
+using tcgen05 = device::ptx::TCGen05<1>;
+
+constexpr int kD = 128;
+constexpr int kPageKeys = 16;
+constexpr int kPageBytes = kPageKeys * kD;
+constexpr int kTilePages = 8;
+constexpr int kTileKeys = kTilePages * kPageKeys;
+constexpr int kTileBytes = kTilePages * kPageBytes;
+constexpr int kN = 16;
+constexpr int kBBytes = kN * kD * 2;
+constexpr int kKBlockBytes = kN * 128;
+constexpr int kGroupCols = 128;
+constexpr unsigned kFull = 0xffffffffu;
+
+constexpr int kGroups = 4;
+constexpr int kStages = 8;
+constexpr int kCpWarps = 3;
+constexpr int kTmaWarp = kGroups * 4;
+constexpr int kCpWarp = kTmaWarp + 1;
+constexpr int kThreads = (kCpWarp + kCpWarps) * 32;
+constexpr int kTmaPages = kTilePages - kCpWarps;
+constexpr int kTmemCols = kGroups * kGroupCols;
+constexpr int kOpBytes = kStages * kTileBytes + kGroups * kBBytes;
+static_assert(kStages % kGroups == 0 && kTmemCols <= 512);
+
+struct Params {
+  CUtensorMap k_map;          // fp8 e4m3 keys as [cache_pages * 16, 128] bytes, 128 B swizzle, 16-row box
+  const uint8_t* k;           // fp8 e4m3 [cache_pages, 16 * 128]
+  const uint8_t* q;           // fp8 e4m3 [rows, q_heads, 128]
+  const int32_t* page_table;  // [rows, max_pages]
+  const int32_t* lens;        // [rows]
+  float* logits;              // [rows, width]
+  int64_t stride_q, stride_pt, stride_logits;
+  float scale;
+  int32_t rows, group_rows, groups, cache_pages, max_pages, width, min_scored_len;
+};
+
+struct Shared {
+  uint64_t full[kStages];
+  uint64_t empty[kStages];
+  uint64_t d_full[kGroups];
+  uint32_t tmem;
+};
+
+SGL_DEVICE uint32_t f16x2_of_e4m3x2(const uint32_t x) {
+  uint32_t r;
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<uint16_t>(x)));
+  return r;
+}
+
+SGL_DEVICE int find_group(const int32_t* prefix, const int groups, const int t) {
+  int lo = 0, hi = groups - 1;
+  while (lo < hi) {
+    const int mid = (lo + hi + 1) >> 1;
+    if (prefix[mid] <= t) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return lo;
+}
+
+SGL_DEVICE int table_row_of(const Params& p, const int g) {
+  return min((g + 1) * p.group_rows, p.rows) - 1;
+}
+
+SGL_DEVICE uint4 load_q_chunk(const Params& p, const int g, const int n, const int chunk) {
+  const int row = g * p.group_rows + (n >> 2);
+  if (g >= p.groups || (n >> 2) >= p.group_rows || row >= p.rows) return make_uint4(0, 0, 0, 0);
+  return *reinterpret_cast<const uint4*>(p.q + row * p.stride_q + (n & 3) * kD + chunk * 16);
+}
+
+SGL_DEVICE void store_b_chunk(uint8_t* s_b, const uint4 v, const int n, const int chunk) {
+  const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+  uint4 lo, hi;
+  lo.x = f16x2_of_e4m3x2(w[0]);
+  lo.y = f16x2_of_e4m3x2(w[1]);
+  lo.z = f16x2_of_e4m3x2(w[2]);
+  lo.w = f16x2_of_e4m3x2(w[3]);
+  hi.x = f16x2_of_e4m3x2(w[0] >> 16);
+  hi.y = f16x2_of_e4m3x2(w[1] >> 16);
+  hi.z = f16x2_of_e4m3x2(w[2] >> 16);
+  hi.w = f16x2_of_e4m3x2(w[3] >> 16);
+  const int k_lo = 32 * (chunk >> 1) + 8 * (chunk & 1);
+  const int k_hi = k_lo + 16;
+  *reinterpret_cast<uint4*>(s_b + (k_lo >> 6) * kKBlockBytes + tcgen05::sw128_off(n, (k_lo & 63) >> 3)) = lo;
+  *reinterpret_cast<uint4*>(s_b + (k_hi >> 6) * kKBlockBytes + tcgen05::sw128_off(n, (k_hi & 63) >> 3)) = hi;
+}
+
+template <bool kUsePDL>
+__global__ void __launch_bounds__(kThreads, 1) decode_kernel(const __grid_constant__ Params p) {
+  extern __shared__ __align__(1024) uint8_t smem_raw[];
+  uint8_t* smem = smem_raw + ((1024 - (device::ptx::to_shared(smem_raw) & 1023)) & 1023);
+  uint8_t* ring = smem;
+  uint8_t* s_b_all = smem + kStages * kTileBytes;
+  auto& sh = *reinterpret_cast<Shared*>(smem + kOpBytes);
+  int32_t* prefix = reinterpret_cast<int32_t*>(smem + kOpBytes + sizeof(Shared));
+  int32_t* npages = prefix + p.groups + 1;
+  int32_t* lim = npages + p.groups;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+
+  if (warp == kTmaWarp) {
+    if (lane == 0) {
+      device::ptx::prefetch_tensormap(&p.k_map);
+      for (int s = 0; s < kStages; ++s) {
+        device::ptx::mbar_init(&sh.full[s], 1 + 32 * kCpWarps);
+        device::ptx::mbar_init(&sh.empty[s], 4);
+      }
+      for (int w = 0; w < kGroups; ++w)
+        device::ptx::mbar_init(&sh.d_full[w], 1);
+      device::ptx::fence_barrier_init();
+    }
+    __syncwarp();
+    tcgen05::alloc(&sh.tmem, kTmemCols);
+    tcgen05::relinquish_alloc_permit();
+  }
+  device::PDLWaitPrimary<kUsePDL>();
+
+  for (int g = tid; g < p.groups; g += kThreads) {
+    const int ctx = p.lens[table_row_of(p, g)];
+    const int n = ctx > p.min_scored_len ? min((ctx + kPageKeys - 1) / kPageKeys, p.max_pages) : 0;
+    npages[g] = n;
+    prefix[g + 1] = (n + kTilePages - 1) / kTilePages;
+  }
+  __syncthreads();
+  for (int r = tid; r < p.rows; r += kThreads) {
+    const int n = p.lens[r];
+    lim[r] = min(n > p.min_scored_len ? min(n, p.width) : 0, npages[r / p.group_rows] * kPageKeys);
+  }
+  if (warp == 0) {
+    int carry = 0;
+    for (int base = 0; base < p.groups; base += 32) {
+      int v = base + lane < p.groups ? prefix[base + lane + 1] : 0;
+#pragma unroll
+      for (int o = 1; o < 32; o *= 2) {
+        const int up = __shfl_up_sync(kFull, v, o);
+        if (lane >= o) v += up;
+      }
+      if (base + lane < p.groups) prefix[base + lane + 1] = v + carry;
+      carry += __shfl_sync(kFull, v, 31);
+    }
+    if (lane == 0) prefix[0] = 0;
+  }
+  tcgen05::fence_before_thread_sync();
+  __syncthreads();
+  tcgen05::fence_after_thread_sync();
+
+  const int total = prefix[p.groups];
+  const int t_begin = static_cast<int>(static_cast<int64_t>(total) * blockIdx.x / gridDim.x);
+  const int t_end = static_cast<int>(static_cast<int64_t>(total) * (blockIdx.x + 1) / gridDim.x);
+  const int n_tiles = t_end - t_begin;
+
+  if (warp == kTmaWarp) {
+    int g = n_tiles > 0 ? find_group(prefix, p.groups, t_begin) : 0;
+    auto fetch = [&](const int b, bool& ok) -> int {
+      const int t = t_begin + 4 * b + (lane >> 3);
+      ok = false;
+      if (t >= t_end || (lane & 7) >= kTmaPages) return 0;
+      while (prefix[g + 1] <= t)
+        ++g;
+      const int page = (t - prefix[g]) * kTilePages + (lane & 7);
+      if (page >= npages[g]) return 0;
+      ok = true;
+      return p.page_table[static_cast<int64_t>(table_row_of(p, g)) * p.stride_pt + page];
+    };
+    bool next_ok;
+    int next = fetch(0, next_ok);
+    for (int b = 0; 4 * b < n_tiles; ++b) {
+      const int cur = min(max(next, 0), p.cache_pages - 1);
+      const bool cur_ok = next_ok;
+      next = fetch(b + 1, next_ok);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int i = 4 * b + j;
+        if (i >= n_tiles) break;
+        const int s = i % kStages;
+        const int pid = __shfl_sync(kFull, cur, 8 * j + (lane & 7));
+        const bool ok = __shfl_sync(kFull, cur_ok, 8 * j + (lane & 7)) && lane < 8;
+        const unsigned valid = __ballot_sync(kFull, ok);
+        device::ptx::mbar_wait_parity(&sh.empty[s], ((i / kStages) & 1) ^ 1);
+        if (lane == 0) device::ptx::mbar_arrive_expect_tx(&sh.full[s], __popc(valid) * kPageBytes);
+        __syncwarp();
+        if (ok) {
+          device::ptx::cp_async_bulk_tensor_2d(
+              device::ptx::to_shared(ring + s * kTileBytes + lane * kPageBytes),
+              &p.k_map,
+              0,
+              pid * kPageKeys,
+              &sh.full[s]);
+        }
+      }
+    }
+  } else if (warp >= kCpWarp) {
+    const int page_of_warp = kTmaPages + warp - kCpWarp;
+    int g = n_tiles > 0 ? find_group(prefix, p.groups, t_begin) : 0;
+    auto fetch = [&](const int i0, bool& ok) -> int {
+      const int t = t_begin + i0 + lane;
+      ok = false;
+      if (t >= t_end) return 0;
+      while (prefix[g + 1] <= t)
+        ++g;
+      const int page = (t - prefix[g]) * kTilePages + page_of_warp;
+      if (page >= npages[g]) return 0;
+      ok = true;
+      return p.page_table[static_cast<int64_t>(table_row_of(p, g)) * p.stride_pt + page];
+    };
+    bool next_ok;
+    int next = fetch(0, next_ok);
+    const int row_lo = lane >> 3;
+    const int chunk = lane & 7;
+    for (int i0 = 0; i0 < n_tiles; i0 += 32) {
+      const int cur = min(max(next, 0), p.cache_pages - 1);
+      const bool cur_ok = next_ok;
+      next = fetch(i0 + 32, next_ok);
+      for (int j = 0; j < 32 && i0 + j < n_tiles; ++j) {
+        const int i = i0 + j;
+        const int s = i % kStages;
+        const int pid = __shfl_sync(kFull, cur, j);
+        const bool ok = __shfl_sync(kFull, cur_ok, j);
+        device::ptx::mbar_wait_parity(&sh.empty[s], ((i / kStages) & 1) ^ 1);
+        if (ok) {
+          const uint8_t* src = p.k + static_cast<int64_t>(pid) * kPageBytes + lane * 16;
+          uint8_t* dst = ring + s * kTileBytes + page_of_warp * kPageBytes;
+#pragma unroll
+          for (int x = 0; x < 4; ++x) {
+            const int row = 4 * x + row_lo;
+            device::ptx::cp_async_16B(
+                device::ptx::to_shared(dst + row * 128 + ((chunk ^ (row & 7)) << 4)), src + x * 512);
+          }
+        }
+        asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(device::ptx::to_shared(&sh.full[s]))
+                     : "memory");
+      }
+    }
+    asm volatile("cp.async.wait_all;" ::: "memory");
+  } else {
+    const int w = warp >> 2;
+    const int m = (warp & 3) * 32 + lane;
+    const bool issuer = (warp & 3) == (w & 3);
+    const uint32_t tmem_a = sh.tmem + w * kGroupCols;
+    const uint32_t a_tmem = tmem_a + (static_cast<uint32_t>((warp & 3) * 32) << 16);
+    const uint32_t d_tmem = a_tmem + 64;
+    uint8_t* s_b = s_b_all + w * kBBytes;
+    const uint64_t bdesc0 = tcgen05::make_desc_kmajor_sw128(s_b).bits;
+    const uint32_t idesc = tcgen05::make_instr_desc_f16(128, kN, false, false);
+    const int qn = m >> 3;
+    const int qchunk = m & 7;
+    const float inv_scale = __fdividef(1.f, p.scale);
+    const int key_row = m & 15;
+    const uint8_t* key_src = ring + (m >> 4) * kPageBytes + key_row * 128;
+    int g = w < n_tiles ? find_group(prefix, p.groups, t_begin + w) : 0;
+    int g_begin = 0, g_end = -1, row0 = 0;
+    int lim_r[4];
+    uint4 qv = load_q_chunk(p, g, qn, qchunk);
+    uint4 qv_next = load_q_chunk(p, g + 1, qn, qchunk);
+    for (int i = w; i < n_tiles; i += kGroups) {
+      const int t = t_begin + i;
+      if (t >= g_end) {
+        if (g_end >= 0) {
+          const int g_prev = g;
+          while (prefix[g + 1] <= t)
+            ++g;
+          qv = g == g_prev + 1 ? qv_next : load_q_chunk(p, g, qn, qchunk);
+          qv_next = load_q_chunk(p, g + 1, qn, qchunk);
+        }
+        g_begin = prefix[g];
+        g_end = prefix[g + 1];
+        row0 = g * p.group_rows;
+#pragma unroll
+        for (int r = 0; r < 4; ++r)
+          lim_r[r] = r < p.group_rows && row0 + r < p.rows ? lim[row0 + r] : 0;
+        store_b_chunk(s_b, qv, qn, qchunk);
+        device::ptx::fence_proxy_async_shared();
+      }
+      const int s = i % kStages;
+      device::ptx::mbar_wait_parity(&sh.full[s], (i / kStages) & 1);
+      const uint8_t* src = key_src + s * kTileBytes;
+#pragma unroll
+      for (int half = 0; half < 2; ++half) {
+        uint4 raw[4];
+#pragma unroll
+        for (int c4 = 0; c4 < 4; ++c4) {
+          raw[c4] = *reinterpret_cast<const uint4*>(src + (((4 * half + c4) ^ (key_row & 7)) << 4));
+        }
+        uint32_t a[32];
+#pragma unroll
+        for (int c4 = 0; c4 < 4; ++c4) {
+          const uint32_t x[4] = {raw[c4].x, raw[c4].y, raw[c4].z, raw[c4].w};
+          const int col = 16 * (c4 >> 1) + 4 * (c4 & 1);
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            a[col + e] = f16x2_of_e4m3x2(x[e]);
+            a[col + 8 + e] = f16x2_of_e4m3x2(x[e] >> 16);
+          }
+        }
+        if (half == 1) {
+          __syncwarp();
+          if (lane == 0) device::ptx::mbar_arrive(&sh.empty[s]);
+        }
+        tcgen05::st_32x32b<32>(a_tmem + 32 * half, a);
+      }
+      tcgen05::wait_st();
+      tcgen05::fence_before_thread_sync();
+      device::ptx::bar_sync(1 + w, 128);
+      if (issuer) {
+        tcgen05::fence_after_thread_sync();
+        if (lane == 0) {
+#pragma unroll
+          for (int u = 0; u < 8; ++u) {
+            tcgen05::mma_f16_ts(
+                tmem_a + 64 + (u >> 1) * kN,
+                tmem_a + u * 8,
+                bdesc0 + (((u >> 2) * kKBlockBytes + (u & 3) * 32) >> 4),
+                idesc,
+                u & 1);
+          }
+          tcgen05::commit(&sh.d_full[w]);
+        }
+        __syncwarp();
+      }
+      device::ptx::mbar_wait_parity(&sh.d_full[w], (i / kGroups) & 1);
+      tcgen05::fence_after_thread_sync();
+      float acc[16];
+      {
+        uint32_t d[32];
+        tcgen05::ld_32x32b<32>(d_tmem, d);
+        tcgen05::wait_ld();
+#pragma unroll
+        for (int n = 0; n < 16; ++n)
+          acc[n] = __fadd_rn(__fadd_rn(0.f, __uint_as_float(d[n])), __uint_as_float(d[16 + n]));
+        tcgen05::ld_32x32b<32>(d_tmem + 32, d);
+        tcgen05::wait_ld();
+#pragma unroll
+        for (int n = 0; n < 16; ++n)
+          acc[n] = __fadd_rn(__fadd_rn(acc[n], __uint_as_float(d[n])), __uint_as_float(d[16 + n]));
+      }
+      const int pos = (t - g_begin) * kTileKeys + m;
+      float* out = p.logits + static_cast<int64_t>(row0) * p.stride_logits + pos;
+#pragma unroll
+      for (int r = 0; r < 4; ++r) {
+        const float v = (fmaxf(acc[4 * r], 0.f) + fmaxf(acc[4 * r + 1], 0.f)) +
+                        (fmaxf(acc[4 * r + 2], 0.f) + fmaxf(acc[4 * r + 3], 0.f));
+        if (pos < lim_r[r]) out[r * p.stride_logits] = v * inv_scale;
+      }
+    }
+  }
+
+  tcgen05::fence_before_thread_sync();
+  __syncthreads();
+  tcgen05::fence_after_thread_sync();
+  if (warp == kTmaWarp) tcgen05::dealloc(sh.tmem, kTmemCols);
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
+}  // namespace qsa_index_score_sm100
 
 namespace qsa_decode_topk {
 
@@ -494,6 +859,73 @@ struct QsaIndexScoreDecode {
     const dim3 grid(static_cast<uint32_t>((rows + group_rows - 1) / group_rows), static_cast<uint32_t>(splits));
     LaunchKernel(grid, kThreads, device.unwrap(), static_cast<std::size_t>(kWarps * kTileBytes))
         .enable_pdl(kUsePDL)(decode_kernel<kUsePDL>, params);
+  }
+};
+
+template <bool kUsePDL>
+struct QsaIndexScoreDecodeSm100 {
+  static void
+  run(const tvm::ffi::TensorView q,
+      const tvm::ffi::TensorView k,
+      const tvm::ffi::TensorView page_table,
+      const tvm::ffi::TensorView lens,
+      const tvm::ffi::TensorView logits,
+      double scale,
+      int64_t group_rows,
+      int64_t min_scored_len) {
+    using namespace host;
+    using namespace qsa_index_score_sm100;
+    auto R_ = SymbolicSize{"rows"};
+    auto HQ_ = SymbolicSize{"q_heads"};
+    auto P_ = SymbolicSize{"cache_pages"};
+    auto MP_ = SymbolicSize{"max_pages"};
+    auto W_ = SymbolicSize{"width"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({R_, HQ_, kD}).with_dtype<uint8_t>().with_device(device).with_strides({-1, kD, 1}).verify(q);
+    TensorMatcher({P_, kPageBytes}).with_dtype<uint8_t>().with_device(device).with_strides({kPageBytes, 1}).verify(k);
+    TensorMatcher({R_, MP_}).with_dtype<int32_t>().with_device(device).with_strides({-1, 1}).verify(page_table);
+    TensorMatcher({R_}).with_dtype<int32_t>().with_device(device).with_strides({1}).verify(lens);
+    TensorMatcher({R_, W_}).with_dtype<fp32_t>().with_device(device).with_strides({-1, 1}).verify(logits);
+    const int64_t rows = R_.unwrap();
+    RuntimeCheck(HQ_.unwrap() >= 4, "q needs at least 4 heads");
+    RuntimeCheck(group_rows >= 1 && group_rows <= 4, "group_rows must be in [1, 4]");
+    RuntimeCheck(
+        reinterpret_cast<uintptr_t>(q.data_ptr()) % 16 == 0 && q.stride(0) % 16 == 0, "q rows must be 16-byte aligned");
+    RuntimeCheck(reinterpret_cast<uintptr_t>(k.data_ptr()) % 16 == 0, "key pages must be 16-byte aligned");
+    if (rows == 0 || P_.unwrap() == 0) return;
+    const int64_t groups = (rows + group_rows - 1) / group_rows;
+    const std::size_t smem = 1024 + kOpBytes + sizeof(Shared) + 4 * (2 * groups + 1 + rows);
+    const DLDevice dev = device.unwrap();
+    RuntimeCheck(smem <= runtime::get_max_smem_per_block(dev.device_id), "too many rows for the shared memory");
+    const auto params = Params{
+        .k_map = tma::make_map(
+            k.data_ptr(),
+            CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            {static_cast<cuuint64_t>(kD), static_cast<cuuint64_t>(P_.unwrap() * kPageKeys)},
+            {static_cast<cuuint64_t>(kD)},
+            {static_cast<cuuint32_t>(kD), static_cast<cuuint32_t>(kPageKeys)},
+            {.swizzle = CU_TENSOR_MAP_SWIZZLE_128B}),
+        .k = static_cast<const uint8_t*>(k.data_ptr()),
+        .q = static_cast<const uint8_t*>(q.data_ptr()),
+        .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
+        .lens = static_cast<const int32_t*>(lens.data_ptr()),
+        .logits = static_cast<float*>(logits.data_ptr()),
+        .stride_q = q.stride(0),
+        .stride_pt = page_table.stride(0),
+        .stride_logits = logits.stride(0),
+        .scale = static_cast<float>(scale),
+        .rows = static_cast<int32_t>(rows),
+        .group_rows = static_cast<int32_t>(group_rows),
+        .groups = static_cast<int32_t>(groups),
+        .cache_pages = static_cast<int32_t>(P_.unwrap()),
+        .max_pages = static_cast<int32_t>(MP_.unwrap()),
+        .width = static_cast<int32_t>(W_.unwrap()),
+        .min_scored_len = static_cast<int32_t>(min_scored_len),
+    };
+    constexpr auto kernel = decode_kernel<kUsePDL>;
+    runtime::set_max_dynamic_smem(kernel, smem);
+    LaunchKernel(runtime::get_sm_count(dev.device_id), kThreads, dev, smem).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 

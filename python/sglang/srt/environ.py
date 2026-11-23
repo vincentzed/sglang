@@ -1500,6 +1500,10 @@ class Envs:
     # least 256 rows pick the top-512 with the exact sampled-threshold CUDA kernel (ties
     # by the lower index) instead of fast_topk.
     SGLANG_ENABLE_QSA_DECODE_TOPK_CUDA = EnvBool(False)
+    # With SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_CUDA: decode / verify launches of at
+    # least 64 requests score on SM100 / SM103 with tcgen05 f16 products of the
+    # converted keys, the same fp32 values bit for bit.
+    SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_SM100 = EnvBool(False)
     # QSA (Qwen4-Exp) prefill block selection with an fp8_e4m3 indexer cache on
     # SM100 in one CUDA kernel that never stores the [rows, keys] score matrix.
     SGLANG_ENABLE_QSA_PREFILL_SELECT_CUDA = EnvBool(False)
