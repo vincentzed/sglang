@@ -1,4 +1,4 @@
-"""GDN ReplaySSM speculative verify for the compact bf16 ring in a CUDA tensor-core
+"""GDN ReplaySSM speculative verify for the compact bf16 ring in a CUDA tcgen05
 kernel: the contract of ``gdn_replayssm_spec_decode(..., launch_mode="verify")``."""
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_sm100_supported
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -31,11 +32,13 @@ def _jit_gdn_replayssm_verify_module() -> Module:
         *args,
         cuda_files=["attention/gdn_replayssm_verify.cuh"],
         cuda_wrappers=[("verify", f"GdnReplaySSMVerify<{args}>::run")],
+        cuda_arch_policy="specific",
     )
 
 
 def prewarm_gdn_replayssm_verify_cuda() -> None:
-    _jit_gdn_replayssm_verify_module()
+    if is_sm100_supported():
+        _jit_gdn_replayssm_verify_module()
 
 
 def _rows_16_byte_aligned(t: torch.Tensor) -> bool:
@@ -84,13 +87,13 @@ def gdn_replayssm_verify_cuda_supported(
     )
     return (
         q.is_cuda
-        and torch.version.hip is None
-        and torch.cuda.get_device_capability(q.device)[0] >= 9
+        and is_sm100_supported()
         and max_spec_len <= _MAX_SPEC_LEN
+        and v.shape[1] % q.shape[1] == 0
         and all(t.dtype == torch.bfloat16 for t in half)
         and g_cache.dtype == torch.float32
-        and A_log.dtype == dt_bias.dtype
         and A_log.dtype in (torch.float32, torch.bfloat16)
+        and dt_bias.dtype in (torch.float32, torch.bfloat16)
         and A_log.is_contiguous()
         and dt_bias.is_contiguous()
         and tuple(checkpoint_state.shape[2:]) == (_DIM, _DIM)

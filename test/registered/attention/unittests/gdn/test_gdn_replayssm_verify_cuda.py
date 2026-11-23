@@ -1,4 +1,4 @@
-"""CUDA tensor-core GDN ReplaySSM verify: the Triton verify's contract on the
+"""CUDA tcgen05 GDN ReplaySSM verify: the Triton verify's contract on the
 compact bf16 ring, checked against that kernel and an fp64 gated delta rule."""
 
 import sys
@@ -8,15 +8,15 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
         not torch.cuda.is_available()
         or torch.version.hip is not None
-        or torch.cuda.get_device_capability()[0] < 9,
-        reason="the CUDA verify needs bf16 tensor cores (SM90+)",
+        or torch.cuda.get_device_capability()[0] != 10,
+        reason="the CUDA verify needs tcgen05 (SM100)",
     ),
 ]
 
@@ -26,9 +26,19 @@ STATE_ROWS = [3, 7, -1, 1, 9]
 RING_ROWS = [0, 5, 9, 2, 11]
 WRITE_POS = [0, 3, 5, 8, 14]
 SENTINEL = 7.0
+# The serving model keeps A_log in fp32 and dt_bias in bf16.
+GATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
-def _case(seed, *, spec_len=4, index_dtype=torch.int64, strided=False, flush_row=None):
+def _case(
+    seed,
+    *,
+    spec_len=4,
+    index_dtype=torch.int64,
+    strided=False,
+    flush_row=None,
+    gate_dtypes=GATE_DTYPES,
+):
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
 
     def rand(*shape, scale=1.0):
@@ -54,15 +64,20 @@ def _case(seed, *, spec_len=4, index_dtype=torch.int64, strided=False, flush_row
         is_flush[RING_ROWS[flush_row]] = 1
     mixed = rand(T, 2 * H * D + HV * D)
     q, k, v = torch.split(mixed, [H * D, H * D, HV * D], dim=-1)
+    checkpoint = rand(SLOTS, HV + (1 if strided else 0), D, D, scale=0.05)[:, :HV]
     return dict(
         q=q.reshape(T, H, D),
         k=k.reshape(T, H, D),
         v=v.reshape(T, HV, D),
         a=rand(T, HV),
         b=rand(T, HV),
-        A_log=torch.randn(HV, device=DEVICE, generator=gen) * 0.5 - 2.0,
-        dt_bias=torch.randn(HV, device=DEVICE, generator=gen) * 0.5,
-        checkpoint_state=rand(SLOTS, HV, D, D, scale=0.05),
+        A_log=(torch.randn(HV, device=DEVICE, generator=gen) * 0.5 - 2.0).to(
+            gate_dtypes[0]
+        ),
+        dt_bias=(torch.randn(HV, device=DEVICE, generator=gen) * 0.5).to(
+            gate_dtypes[1]
+        ),
+        checkpoint_state=checkpoint,
         d_cache=rand(SLOTS, HV, RING, D, scale=0.05),
         k_cache=rand(SLOTS, H, RING, D, scale=0.09),
         g_cache=-torch.rand(SLOTS, HV, RING, device=DEVICE, generator=gen) * 0.5,
@@ -186,6 +201,69 @@ def test_matches_triton_verify(seed, spec_len, index_dtype, strided):
             kept = ~written[:, None, :].expand(arm[name].shape[:3])
             assert torch.equal(arm[name][kept], case[name][kept]), name
         assert not torch.equal(cuda[name], case[name]), name
+
+
+@pytest.mark.parametrize(
+    "gate_dtypes",
+    [
+        (torch.float32, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float32),
+        (torch.bfloat16, torch.bfloat16),
+    ],
+)
+def test_gate_parameter_dtypes(gate_dtypes):
+    case = _case(4, gate_dtypes=gate_dtypes)
+    assert _supported(case, 4)
+    cuda, triton = _clone(case), _clone(case)
+    _close(_cuda(cuda), _triton(triton, 4), 1e-2)
+    _close(cuda["g_cache"], triton["g_cache"], 1e-6)
+
+
+@pytest.mark.parametrize("rows", [96, 200])
+def test_many_rows_match_triton(rows):
+    slots, spec_len = rows + 32, 4
+    gen = torch.Generator(device=DEVICE).manual_seed(5)
+    cpu = torch.Generator().manual_seed(5)
+
+    def rand(*shape, scale=1.0):
+        return (torch.randn(*shape, device=DEVICE, generator=gen) * scale).to(
+            torch.bfloat16
+        )
+
+    tokens = rows * spec_len
+    case = dict(
+        q=rand(tokens, H, D),
+        k=rand(tokens, H, D),
+        v=rand(tokens, HV, D),
+        a=rand(tokens, HV),
+        b=rand(tokens, HV),
+        A_log=torch.randn(HV, device=DEVICE, generator=gen) * 0.5 - 2.0,
+        dt_bias=rand(HV, scale=0.5),
+        checkpoint_state=rand(slots, HV, D, D, scale=0.05),
+        d_cache=rand(rows + 1, HV, RING, D, scale=0.05),
+        k_cache=rand(rows + 1, H, RING, D, scale=0.09),
+        g_cache=-torch.rand(rows + 1, HV, RING, device=DEVICE, generator=gen) * 0.5,
+        d_residual_cache=rand(rows + 1, HV, RING, D, scale=1e-4),
+        k_residual_cache=rand(rows + 1, H, RING, D, scale=2e-4),
+        query_start_loc=torch.arange(
+            0, tokens + 1, spec_len, dtype=torch.int32, device=DEVICE
+        ),
+        ssm_state_indices=torch.randperm(slots, generator=cpu)[:rows].int().to(DEVICE),
+        replay_indices=torch.randperm(rows, generator=cpu).int().to(DEVICE),
+        write_pos=torch.randint(0, 13, (rows + 1,), generator=cpu).int().to(DEVICE),
+        cache_base=torch.randint(0, RING, (rows + 1,), generator=cpu).int().to(DEVICE),
+        is_flush=torch.zeros(rows + 1, dtype=torch.int8, device=DEVICE),
+    )
+    assert _supported(case, spec_len)
+    cuda, triton = _clone(case), _clone(case)
+    _close(_cuda(cuda), _triton(triton, spec_len), 1e-2)
+    _close(
+        cuda["d_cache"].float() + cuda["d_residual_cache"].float(),
+        triton["d_cache"].float() + triton["d_residual_cache"].float(),
+        2e-3,
+    )
+    _close(cuda["g_cache"], triton["g_cache"], 1e-6)
 
 
 def test_flush_rows_are_left_alone():
