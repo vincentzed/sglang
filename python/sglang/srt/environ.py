@@ -1377,6 +1377,9 @@ class Envs:
     # since the block-scale MoE kernel lacks SwiGLU-OAI
     SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
+    # Serve the BF16 GDN in_proj_qkvz, QSA qkv_proj and LM heads of a ModelOpt mixed
+    # checkpoint in MXFP8: weights quantized once at load, activations per call.
+    SGLANG_ENABLE_ONLINE_MXFP8_DENSE = EnvBool(False)
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 
     # ===================================================================

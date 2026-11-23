@@ -18,7 +18,10 @@ from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.logits_processor import (
+    mxfp8_lm_head_matmul,
+    should_apply_lm_head_quant_method,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
@@ -67,26 +70,6 @@ def _fp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tenso
         scale_b=w_scale.t(),
         out_dtype=hidden.dtype,
     )
-
-
-def _mxfp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
-    from flashinfer import block_scale_interleave, mm_mxfp8, mxfp8_quantize
-
-    weight = lm_head.weight
-    cache = getattr(lm_head, "_mxfp8_weight_cache", None)
-    if cache is None or cache[0].shape != weight.shape:
-        n, k = weight.shape
-        w_q, w_sf = mxfp8_quantize(
-            weight.to(torch.bfloat16), is_sf_swizzled_layout=False
-        )
-        w_sf = block_scale_interleave(
-            w_sf.view(torch.uint8).reshape(n, k // 32).contiguous()
-        ).contiguous()
-        cache = (w_q, w_sf)
-        lm_head._mxfp8_weight_cache = cache
-    h_q, h_sf = mxfp8_quantize(hidden.to(torch.bfloat16), is_sf_swizzled_layout=True)
-    logits = mm_mxfp8(h_q, cache[0].t(), h_sf, cache[1], backend="cute-dsl")
-    return logits if logits.dtype == hidden.dtype else logits.to(hidden.dtype)
 
 
 def _is_pow2(n: int) -> bool:
@@ -138,7 +121,7 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
             and weight.shape[-1] % 32 == 0
             and weight.shape[0] % 128 == 0
         ):
-            return _mxfp8_lm_head_matmul(hidden, lm_head)
+            return mxfp8_lm_head_matmul(hidden, lm_head)
     return torch.matmul(hidden.to(weight.dtype), weight.T)
 
 

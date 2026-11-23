@@ -47,6 +47,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear_deterministic,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
+    flashinfer_mxfp8_blockscaled_linear,
     flashinfer_per_tensor_fp8_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -815,6 +816,29 @@ class ModelOptNvFp4EmbeddingMethod(QuantizeMethodBase):
 _BLOCK_FP8_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
 
 
+_ONLINE_MXFP8_CUTLASS_MIN_ROWS = 4096
+_ONLINE_MXFP8_DENSE_SUFFIXES = (".linear_attn.in_proj_qkvz", ".self_attn.qkv_proj")
+
+
+def _online_mxfp8_linear(input: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    rows = input.numel() // input.shape[-1]
+    backend = "cutlass" if rows >= _ONLINE_MXFP8_CUTLASS_MIN_ROWS else "cute-dsl"
+    return flashinfer_mxfp8_blockscaled_linear(input, *args, backend=backend, **kwargs)
+
+
+def _online_mxfp8_dense_method(prefix: str) -> Optional[Fp8LinearMethod]:
+    if not envs.SGLANG_ENABLE_ONLINE_MXFP8_DENSE.get() or not prefix.endswith(
+        _ONLINE_MXFP8_DENSE_SUFFIXES
+    ):
+        return None
+    method = Fp8LinearMethod(
+        Fp8Config(is_checkpoint_fp8_serialized=False, use_mxfp8=True)
+    )
+    if method.mxfp8_dense_backend.is_flashinfer_cutedsl():
+        method.w8a8_mxfp8_linear = _online_mxfp8_linear
+    return method
+
+
 class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     """Configuration for ModelOpt MIXED_PRECISION checkpoints."""
 
@@ -1091,6 +1115,10 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
+                if isinstance(layer, LinearBase):
+                    online = _online_mxfp8_dense_method(prefix)
+                    if online is not None:
+                        return online
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
