@@ -808,7 +808,6 @@ def test_sm100_decode_scoring_is_bit_identical_to_cuda(rows_per_request, monkeyp
         assert torch.equal(got, want)
     monkeypatch.setenv("SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_CUDA", "1")
     monkeypatch.setenv("SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_SM100", "1")
-    monkeypatch.setattr(mqa, "_QSA_INDEX_SCORE_SM100_MIN_REQUESTS", 1)
     sm100_calls = []
     monkeypatch.setattr(
         qsa_index_score,
@@ -857,13 +856,11 @@ def test_cuda_decode_topk_is_exact_topk_of_cuda_scores(rows_per_request, monkeyp
     from sglang.kernels.ops.attention import qsa_index_score
     from sglang.kernels.ops.attention.qsa_index_score import qsa_decode_topk
     from sglang.srt.layers.attention.qsa import mqa
-    from sglang.srt.layers.attention.qsa import qsa_indexer
     from sglang.srt.utils.device import is_sm100_supported
 
     if not is_sm100_supported():
         pytest.skip("needs an SM100 GPU")
     monkeypatch.setenv("SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_CUDA", "1")
-    monkeypatch.setattr(qsa_indexer, "_QSA_DECODE_TOPK_MIN_ROWS", 1)
     topk_calls = []
     monkeypatch.setattr(
         qsa_index_score,

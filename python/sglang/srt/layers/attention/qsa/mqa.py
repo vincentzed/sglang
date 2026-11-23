@@ -673,7 +673,6 @@ def tilelang_qsa_mqa_prefill_relative(
 # CTAs per decode row: few enough levels to bound the TileLang specializations, and
 # a grid of about four waves (at least one CTA per row).
 _DECODE_CTAS_PER_ROW_LEVELS = (1, 16, 256)
-_QSA_INDEX_SCORE_SM100_MIN_REQUESTS = 64
 
 
 @functools.lru_cache(maxsize=None)
@@ -833,7 +832,6 @@ def cuda_qsa_mqa_decode(
     score = (
         qsa_index_score_decode_sm100
         if envs.SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_SM100.get()
-        and -(-q.shape[0] // group_rows) >= _QSA_INDEX_SCORE_SM100_MIN_REQUESTS
         else qsa_index_score_decode
     )
     score(

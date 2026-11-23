@@ -61,8 +61,6 @@ _QSA_PREFILL_SELECT_MIN_ROWS = 8192
 
 _QSA_PREFILL_TOPK_MIN_SCORES = 1 << 23
 
-_QSA_DECODE_TOPK_MIN_ROWS = 256
-
 
 def _use_cuda_prefill_topk(
     q: torch.Tensor,
@@ -630,7 +628,6 @@ class QSAIndexer(MultiPlatformOp):
         if (
             use_fast_topk
             and envs.SGLANG_ENABLE_QSA_DECODE_TOPK_CUDA.get()
-            and logits.shape[0] >= _QSA_DECODE_TOPK_MIN_ROWS
             and _use_cuda_decode(q, compressed_cache, self.index_n_heads)
         ):
             from sglang.kernels.ops.attention.qsa_index_score import qsa_decode_topk
