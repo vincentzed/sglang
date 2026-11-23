@@ -2044,6 +2044,9 @@ class Envs:
     # Gated RMSNorm (the GDN output norm): 16 rows per block on 4 warps for
     # launches with many rows per SM (a prefill) instead of 4 rows on 1 warp.
     SGLANG_OPT_GATED_NORM_WIDE_ROWS = EnvBool(False)
+    # GDN prefill, FlashInfer: alpha = exp(g) and beta in one launch of 8-token
+    # tiles instead of the per-token gating kernel and an exp.
+    SGLANG_OPT_GDN_PREFILL_ALPHA_GATES = EnvBool(False)
     # QSA q/k GemmaRMSNorm + RoPE + gate: several tokens of one head per program
     # for long launches instead of one (token, head) per program.
     SGLANG_OPT_QSA_QK_NORM_ROWS = EnvBool(False)

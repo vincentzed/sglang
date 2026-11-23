@@ -284,6 +284,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self._verify_intermediate_buffers: dict[tuple, torch.Tensor] = {}
         self._alignment_fallback_warned = False
         self._joint_qk_l2norm = envs.SGLANG_OPT_GDN_PREFILL_SPLIT_CONV.get()
+        self.defers_prefill_gates = envs.SGLANG_OPT_GDN_PREFILL_ALPHA_GATES.get()
         # FlashInfer writes through mutable state/workspace pointers, so misaligned
         # inputs must fall back to Triton rather than use temporary copies.
         from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
@@ -569,6 +570,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         from sglang.kernels.ops.attention.fla.l2norm import (
             gdn_prefill_qkv_prepare_fwd,
         )
+        from sglang.kernels.ops.attention.linear.fused_gdn_gating import (
+            fused_gdn_alpha_beta,
+        )
 
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]
@@ -602,9 +606,14 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if not output_fi.is_contiguous():
                 raise ValueError("FlashInfer GDN prefill output must be contiguous")
 
-        # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
-        alpha_fi = torch.exp(g[0].to(torch.float32))
-        beta_fi = beta[0].to(torch.float32)
+        if g is None:
+            alpha_fi, beta_fi = fused_gdn_alpha_beta(
+                kwargs["A_log"], kwargs["a"], kwargs["b"], kwargs["dt_bias"]
+            )
+        else:
+            # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
+            alpha_fi = torch.exp(g[0].to(torch.float32))
+            beta_fi = beta[0].to(torch.float32)
 
         ssm_cache_indices, live_rows, initial_state_fi = gather_pool_states(
             ssm_states, cache_indices

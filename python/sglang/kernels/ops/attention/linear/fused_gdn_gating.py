@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+ALPHA_BETA_BLOCK_T = 8
+
 
 @triton.jit
 def _gdn_gating_values(
@@ -81,3 +83,69 @@ def fused_gdn_gating(
         num_warps=1,
     )
     return g, beta_output
+
+
+@triton.jit(do_not_specialize=["num_tokens"])
+def _fused_gdn_alpha_beta_kernel(
+    alpha_ptr,
+    beta_ptr,
+    A_log_ptr,
+    a_ptr,
+    b_ptr,
+    dt_bias_ptr,
+    num_tokens,
+    stride_a,
+    stride_b,
+    NUM_HEADS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    softplus_beta: tl.constexpr,
+    threshold: tl.constexpr,
+):
+    rows = tl.program_id(0).to(tl.int64) * BLOCK_T + tl.arange(0, BLOCK_T)
+    heads = tl.arange(0, BLOCK_H)
+    head_ok = heads < NUM_HEADS
+    mask = (rows < num_tokens)[:, None] & head_ok[None, :]
+    A_log = tl.load(A_log_ptr + heads, mask=head_ok)
+    dt_bias = tl.load(dt_bias_ptr + heads, mask=head_ok)
+    a = tl.load(a_ptr + rows[:, None] * stride_a + heads[None, :], mask=mask)
+    b = tl.load(b_ptr + rows[:, None] * stride_b + heads[None, :], mask=mask)
+    g, beta = _gdn_gating_values(
+        A_log[None, :], a, b, dt_bias[None, :], softplus_beta, threshold
+    )
+    offs = rows[:, None] * NUM_HEADS + heads[None, :]
+    tl.store(alpha_ptr + offs, tl.extra.cuda.libdevice.exp(g), mask=mask)
+    tl.store(beta_ptr + offs, beta.to(b_ptr.dtype.element_ty), mask=mask)
+
+
+def fused_gdn_alpha_beta(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    softplus_beta: float = 1.0,
+    threshold: float = 20.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """FP32 ``alpha = exp(-exp(A_log) * softplus(a + dt_bias))`` and
+    ``beta = sigmoid(b)``, both ``[T, H]``, in one launch."""
+    num_tokens, num_heads = a.shape
+    alpha = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=a.device)
+    beta = torch.empty_like(alpha)
+    _fused_gdn_alpha_beta_kernel[(triton.cdiv(num_tokens, ALPHA_BETA_BLOCK_T),)](
+        alpha,
+        beta,
+        A_log,
+        a,
+        b,
+        dt_bias,
+        num_tokens,
+        a.stride(0),
+        b.stride(0),
+        NUM_HEADS=num_heads,
+        BLOCK_H=triton.next_power_of_2(num_heads),
+        BLOCK_T=ALPHA_BETA_BLOCK_T,
+        softplus_beta=softplus_beta,
+        threshold=threshold,
+        num_warps=4,
+    )
+    return alpha, beta

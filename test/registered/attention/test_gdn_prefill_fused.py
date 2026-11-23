@@ -4,14 +4,31 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.attention import fused_qk_rmsnorm_rope_gate as qk_norm
+from sglang.kernels.ops.attention.linear.fused_gdn_gating import (
+    fused_gdn_alpha_beta,
+    fused_gdn_gating,
+)
 from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 
 @unittest.skipIf(not is_cuda(), "CUDA-only kernels")
 class TestGdnPrefillFused(unittest.TestCase):
+    def test_alpha_beta_match_gating_and_exp(self):
+        torch.manual_seed(0)
+        heads = 48
+        A_log = torch.randn(heads, device="cuda")
+        dt_bias = torch.randn(heads, device="cuda", dtype=torch.bfloat16)
+        for tokens in (1, 63, 1000):
+            ba = torch.randn(tokens, 2 * heads, device="cuda", dtype=torch.bfloat16)
+            b, a = ba[:, :heads], ba[:, heads:]
+            g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
+            alpha, beta_out = fused_gdn_alpha_beta(A_log, a, b, dt_bias)
+            torch.testing.assert_close(alpha, torch.exp(g[0]), rtol=0, atol=0)
+            torch.testing.assert_close(beta_out, beta[0], rtol=0, atol=0)
+
     def test_qk_norm_rows_match_per_head_programs(self):
         torch.manual_seed(0)
         num_q, num_kv, head_dim, rotary_dim = 24, 2, 256, 64
