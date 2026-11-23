@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
 )
 from sglang.srt.layers.attention.qsa.mqa import (
     HAS_TILELANG,
+    _use_cuda_decode,
     qsa_mqa_decode,
     qsa_mqa_prefill,
     qsa_mqa_prefill_relative,
@@ -59,6 +60,8 @@ _QSA_PREFILL_SELECT_MIN_ROWS = 8192
 
 
 _QSA_PREFILL_TOPK_MIN_SCORES = 1 << 23
+
+_QSA_DECODE_TOPK_MIN_ROWS = 256
 
 
 def _use_cuda_prefill_topk(
@@ -624,7 +627,16 @@ class QSAIndexer(MultiPlatformOp):
             rows_per_request=rows_per_request,
             num_query_heads=self.index_n_heads,
         )
-        if use_fast_topk:
+        if (
+            use_fast_topk
+            and envs.SGLANG_ENABLE_QSA_DECODE_TOPK_CUDA.get()
+            and logits.shape[0] >= _QSA_DECODE_TOPK_MIN_ROWS
+            and _use_cuda_decode(q, compressed_cache, self.index_n_heads)
+        ):
+            from sglang.kernels.ops.attention.qsa_index_score import qsa_decode_topk
+
+            block_indices = qsa_decode_topk(logits, compressed_lengths.to(torch.int32))
+        elif use_fast_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
             from sglang.kernels.ops.attention.fast_topk import fast_topk

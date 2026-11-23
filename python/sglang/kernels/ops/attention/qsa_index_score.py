@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 _WARPS_PER_CTA = 8
 _WARPS_PER_SM = 32
+_DECODE_TOPK = 512
 
 
 @cache_once
@@ -27,7 +28,10 @@ def _jit_qsa_index_score_module() -> Module:
         "qsa_index_score",
         *args,
         cuda_files=["attention/qsa_index_score.cuh"],
-        cuda_wrappers=[("decode", f"QsaIndexScoreDecode<{args}>::run")],
+        cuda_wrappers=[
+            ("decode", f"QsaIndexScoreDecode<{args}>::run"),
+            ("decode_topk", f"QsaDecodeTopk<{args}>::run"),
+        ],
     )
 
 
@@ -67,3 +71,14 @@ def qsa_index_score_decode(
         min_scored_len,
         _decode_splits(groups, q.device),
     )
+
+
+def qsa_decode_topk(logits: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
+    """Per row, the indices of the 512 largest ``logits[row, :lens[row]]``, ties
+    at the cut by the lower index, in unspecified order; rows with at most 512
+    entries get ``0..len-1`` then -1. Int32 [rows, 512]."""
+    out = torch.empty(
+        (logits.shape[0], _DECODE_TOPK), dtype=torch.int32, device=logits.device
+    )
+    _jit_qsa_index_score_module().decode_topk(logits, lens, out)
+    return out

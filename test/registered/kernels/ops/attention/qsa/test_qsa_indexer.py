@@ -724,6 +724,100 @@ def test_cuda_decode_scoring_equals_tilelang(rows_per_request, monkeypatch):
     assert len(cuda_calls) == 2
 
 
+def _exact_decode_topk(logits, lens, topk=512):
+    """Per row: every score above the topk-th largest, then the lowest indices among
+    ties at it, ordered by the fp32 bit pattern as fast_topk orders it."""
+    bits = logits.view(torch.int32).long()
+    keys = torch.where(bits < 0, (~bits) & 0xFFFFFFFF, (bits | 0x80000000) & 0xFFFFFFFF)
+    out = []
+    for row in range(logits.shape[0]):
+        n = int(lens[row])
+        if n <= topk:
+            out.append(None)
+            continue
+        order = torch.sort(keys[row, :n], descending=True, stable=True).indices[:topk]
+        out.append(torch.sort(order).values)
+    return out
+
+
+@pytest.mark.parametrize("rows_per_request", [1, 4])
+def test_cuda_decode_topk_is_exact_topk_of_cuda_scores(rows_per_request, monkeypatch):
+    """With SGLANG_ENABLE_QSA_DECODE_TOPK_CUDA the decode selection is the exact
+    top-512 of the CUDA scores with the lowest indices among ties at the cut: zero
+    queries (every score ties), duplicated keys, rows that fit k, and rows past the
+    sampled path's 2048-candidate limit; select_decode_tokens dispatches to it."""
+    from sglang.kernels.ops.attention import qsa_index_score
+    from sglang.kernels.ops.attention.qsa_index_score import qsa_decode_topk
+    from sglang.srt.layers.attention.qsa import mqa
+    from sglang.srt.layers.attention.qsa import qsa_indexer
+    from sglang.srt.utils.device import is_sm100_supported
+
+    if not is_sm100_supported():
+        pytest.skip("needs an SM100 GPU")
+    monkeypatch.setenv("SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_CUDA", "1")
+    monkeypatch.setattr(qsa_indexer, "_QSA_DECODE_TOPK_MIN_ROWS", 1)
+    topk_calls = []
+    monkeypatch.setattr(
+        qsa_index_score,
+        "qsa_decode_topk",
+        lambda *a: topk_calls.append(1) or qsa_decode_topk(*a),
+    )
+    device = torch.device("cuda")
+    torch.manual_seed(17)
+    requests, max_pages, page_size = 24, 2400, 16
+    max_model_len = max_pages * page_size
+    base = torch.randint(4 * 600, 4 * 26000, (requests,))
+    base[:6] = torch.tensor([300, 2048, 2051, 4 * 2048 + 5, 4 * 1000, 4 * 36000])
+    seq_lens = (base[:, None] + torch.arange(1, rows_per_request + 1)).reshape(-1)
+    lens = (seq_lens // RATIO).to(device=device, dtype=torch.int32)
+    rows = lens.numel()
+    q = torch.zeros(rows, 8, HEAD_DIM, device=device)
+    q[:, :NUM_Q_HEADS] = torch.randn(rows, NUM_Q_HEADS, HEAD_DIM, device=device)
+    q[4 * rows_per_request : 5 * rows_per_request] = 0
+    q = q.to(torch.float8_e4m3fn)
+    keys = torch.randn(4096, page_size, 1, HEAD_DIM, device=device)
+    keys[2048:] = keys[torch.randint(0, 7, (2048,))]
+    cache = keys.to(torch.float8_e4m3fn)
+    page_table = torch.randint(
+        0, 4096, (requests, max_pages), device=device, dtype=torch.int32
+    ).repeat_interleave(rows_per_request, dim=0)
+    page_table[-rows_per_request:] = torch.randint(2048, 4096, (max_pages,))
+    args = (q, cache, page_table, lens, max_model_len)
+    kwargs = dict(
+        min_scored_len=512,
+        rows_per_request=rows_per_request,
+        num_query_heads=NUM_Q_HEADS,
+    )
+    monkeypatch.setenv("SGLANG_ENABLE_QSA_DECODE_TOPK_CUDA", "1")
+    logits = mqa.qsa_mqa_decode(*args, **kwargs)
+    got = qsa_decode_topk(logits, lens)
+    want = _exact_decode_topk(logits, lens)
+    for row in range(rows):
+        n = int(lens[row])
+        if want[row] is None:
+            ref = torch.arange(512, device=device)
+            assert torch.equal(got[row], torch.where(ref < n, ref, -1).int())
+        else:
+            assert torch.equal(torch.sort(got[row].long()).values, want[row]), row
+    indexer = SimpleNamespace(
+        block_topk=512, index_n_heads=NUM_Q_HEADS, compress_ratio=RATIO, token_topk=2048
+    )
+    picked = QSAIndexer.select_decode_tokens(
+        indexer,
+        q,
+        cache,
+        page_table,
+        lens,
+        max_model_len,
+        seq_lens.to(device),
+        seq_lens.to(device),
+        defer_expansion=True,
+        rows_per_request=rows_per_request,
+    )
+    assert torch.equal(torch.sort(picked, dim=1).values, torch.sort(got, dim=1).values)
+    assert len(topk_calls) == 1
+
+
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_expand_block_indices_int_inputs(dtype):
     device = torch.device("cuda")

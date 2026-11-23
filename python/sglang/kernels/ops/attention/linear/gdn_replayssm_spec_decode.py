@@ -714,6 +714,7 @@ def gdn_replayssm_compact_commit_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
+    FOLD: tl.constexpr = True,
     # Element strides between the replay rows of each cursor: 1 when the
     # cursors are their own arrays, a whole entry when they sit in one.
     STRIDE_WP: tl.constexpr = 1,
@@ -733,7 +734,7 @@ def gdn_replayssm_compact_commit_kernel(
     if state_idx <= NULL_BLOCK_ID:
         return
     n_history = tl.load(write_pos + replay_idx * STRIDE_WP).to(tl.int32)
-    fold_active = tl.load(is_flush_flags + replay_idx * STRIDE_FL) != 0
+    fold_active = (tl.load(is_flush_flags + replay_idx * STRIDE_FL) != 0) & FOLD
     if HAS_TRACK:
         track_idx = tl.load(mamba_track_indices + i_n * stride_track).to(tl.int64)
         track_step = tl.load(mamba_steps_to_track + i_n * stride_steps).to(tl.int32)
@@ -988,6 +989,7 @@ def gdn_replayssm_compact_commit_tiled_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
+    FOLD: tl.constexpr = True,
     # Element strides between the replay rows of each cursor, as in the stock kernel.
     STRIDE_WP: tl.constexpr = 1,
     STRIDE_CB: tl.constexpr = 1,
@@ -1006,7 +1008,7 @@ def gdn_replayssm_compact_commit_tiled_kernel(
     if state_idx <= NULL_BLOCK_ID:
         return
     n_history = tl.load(write_pos + replay_idx * STRIDE_WP).to(tl.int32)
-    fold_active = tl.load(is_flush_flags + replay_idx * STRIDE_FL) != 0
+    fold_active = (tl.load(is_flush_flags + replay_idx * STRIDE_FL) != 0) & FOLD
     if HAS_TRACK:
         track_idx = tl.load(mamba_track_indices + i_n * stride_track).to(tl.int64)
         track_step = tl.load(mamba_steps_to_track + i_n * stride_steps).to(tl.int32)
@@ -1659,8 +1661,13 @@ def commit_gdn_replayssm_circular(
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
     null_block_id: int = -1,
+    fold_cuda: bool = False,
 ) -> None:
     """Materialize circular history only for capacity and track rows.
+
+    With ``fold_cuda`` (and a layout ``gdn_replayssm_fold_cuda_supported`` takes)
+    the capacity rows are folded by the CUDA kernel; the Triton kernel then runs
+    only for track rows, before it.
 
     ``write_pos`` must already include this step's accepted prefix. Capacity
     rows update their active checkpoint and reset the ring; track rows snapshot
@@ -1676,6 +1683,14 @@ def commit_gdn_replayssm_circular(
     k_residual_buf = k_residual_cache if has_residual else k_cache
     BV = min(triton.next_power_of_2(V), 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    if fold_cuda:
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_fold_cuda import (
+            gdn_replayssm_fold_cuda_supported,
+        )
+
+        fold_cuda = gdn_replayssm_fold_cuda_supported(
+            checkpoint_state, d_cache, k_cache, g_cache, d_residual_cache, k_residual_cache
+        )
     # The tiled commit takes the shapes it supports, given enough programs per SM.
     tiled = _use_tiled_commit(
         checkpoint_state, d_cache, k_cache, H, HV, V, K, B, has_track
@@ -1705,54 +1720,77 @@ def commit_gdn_replayssm_circular(
         grid = (triton.cdiv(V, BV), B, HV * num_layers)
         kernel = gdn_replayssm_compact_commit_kernel
         extra = {}
-    kernel[grid](
-        checkpoint_state,
-        d_cache,
-        k_cache,
-        g_cache,
-        d_residual_buf,
-        k_residual_buf,
-        state_batch_indices,
-        replay_indices,
-        write_pos,
-        cache_base,
-        is_flush,
-        accept_lens,
-        track_indices,
-        track_steps,
-        checkpoint_state.stride(1),
-        d_cache.stride(1),
-        k_cache.stride(1),
-        g_cache.stride(1),
-        d_residual_buf.stride(1),
-        k_residual_buf.stride(1),
-        checkpoint_state.stride(0),
-        d_cache.stride(0),
-        k_cache.stride(0),
-        g_cache.stride(0),
-        d_residual_buf.stride(0),
-        k_residual_buf.stride(0),
-        state_batch_indices.stride(0),
-        replay_indices.stride(0),
-        accept_lens.stride(0),
-        stride_track,
-        stride_steps,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BV=_TILED_COMMIT_BV if tiled else BV,
-        MAX_CACHE_LEN=max_cache_len,
-        NULL_BLOCK_ID=null_block_id,
-        HAS_TRACK=has_track,
-        HAS_RESIDUAL=has_residual,
-        num_warps=_TILED_COMMIT_WARPS if tiled else 4,
-        num_stages=1 if tiled else 2,
-        STRIDE_WP=write_pos.stride(0),
-        STRIDE_CB=cache_base.stride(0),
-        STRIDE_FL=is_flush.stride(0),
-        **extra,
-    )
+    if fold_cuda and not has_track:
+        grid = None
+    if grid is not None:
+        kernel[grid](
+            checkpoint_state,
+            d_cache,
+            k_cache,
+            g_cache,
+            d_residual_buf,
+            k_residual_buf,
+            state_batch_indices,
+            replay_indices,
+            write_pos,
+            cache_base,
+            is_flush,
+            accept_lens,
+            track_indices,
+            track_steps,
+            checkpoint_state.stride(1),
+            d_cache.stride(1),
+            k_cache.stride(1),
+            g_cache.stride(1),
+            d_residual_buf.stride(1),
+            k_residual_buf.stride(1),
+            checkpoint_state.stride(0),
+            d_cache.stride(0),
+            k_cache.stride(0),
+            g_cache.stride(0),
+            d_residual_buf.stride(0),
+            k_residual_buf.stride(0),
+            state_batch_indices.stride(0),
+            replay_indices.stride(0),
+            accept_lens.stride(0),
+            stride_track,
+            stride_steps,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            BV=_TILED_COMMIT_BV if tiled else BV,
+            MAX_CACHE_LEN=max_cache_len,
+            NULL_BLOCK_ID=null_block_id,
+            HAS_TRACK=has_track,
+            HAS_RESIDUAL=has_residual,
+            num_warps=_TILED_COMMIT_WARPS if tiled else 4,
+            num_stages=1 if tiled else 2,
+            STRIDE_WP=write_pos.stride(0),
+            STRIDE_CB=cache_base.stride(0),
+            STRIDE_FL=is_flush.stride(0),
+            FOLD=not fold_cuda,
+            **extra,
+        )
+    if fold_cuda:
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_fold_cuda import (
+            gdn_replayssm_fold_cuda,
+        )
+
+        gdn_replayssm_fold_cuda(
+            checkpoint_state,
+            d_cache,
+            d_residual_buf,
+            k_cache,
+            k_residual_buf,
+            g_cache,
+            state_batch_indices,
+            replay_indices,
+            write_pos,
+            cache_base,
+            is_flush,
+            null_block_id,
+        )
     block = triton.next_power_of_2(max(1, B))
     _finish_gdn_replayssm_circular_fold_kernel[(1,)](
         write_pos,
@@ -1788,6 +1826,7 @@ def commit_gdn_replayssm_after_verify(
     mamba_steps_to_track: torch.Tensor | None = None,
     src_indices_raw: torch.Tensor | None = None,
     null_block_id: int = -1,
+    fold_cuda: bool = False,
 ) -> None:
     """Commit one verify step of the compact GDN ring.
 
@@ -1834,6 +1873,7 @@ def commit_gdn_replayssm_after_verify(
         mamba_track_indices=mamba_track_indices,
         mamba_steps_to_track=mamba_steps_to_track,
         null_block_id=null_block_id,
+        fold_cuda=fold_cuda,
     )
     # Roll back the active conv state and snapshot its interval-crossing window:
     # one launch for every conv type and both row sets for small batches.

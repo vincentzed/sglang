@@ -281,6 +281,82 @@ def test_flush_rows_are_left_alone():
     _close(out, _triton(triton, 4), 1e-2)
 
 
+def _fold_fp64(case, rows):
+    """checkpoint * exp(G) + sum_i exp(G - G_i) (d_i hi + lo) (k_i hi + lo)^T over each
+    row's committed records, in fp64."""
+    out = {}
+    for row in rows:
+        slot, ring, n = STATE_ROWS[row], RING_ROWS[row], WRITE_POS[row]
+        base = int(case["cache_base"][ring])
+        phys = (base + torch.arange(n, device=DEVICE)) % RING
+        g = case["g_cache"][ring][:, phys].double()
+        total = g.sum(-1)
+        w = torch.exp(total[:, None] - g.cumsum(-1))
+        d = case["d_cache"][ring][:, phys].double()
+        d = d + case["d_residual_cache"][ring][:, phys].double()
+        k = case["k_cache"][ring][:, phys].double()
+        k = (k + case["k_residual_cache"][ring][:, phys].double()).repeat_interleave(
+            HV // H, dim=0
+        )
+        out[row] = case["checkpoint_state"][slot].double() * torch.exp(total)[
+            :, None, None
+        ] + torch.einsum("htv,htk->hvk", d * w[..., None], k)
+    return out
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
+def test_cuda_fold_matches_the_triton_commit(index_dtype):
+    """The CUDA commit fold writes the Triton commit's checkpoint up to a bf16 rounding
+    (and no further from fp64), leaves unflagged and padding rows alone, and resets the
+    same cursors."""
+    from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+        commit_gdn_replayssm_circular,
+    )
+
+    flagged = [1, 3, 4]
+    case = _case(5, index_dtype=index_dtype)
+    for row in flagged:
+        case["is_flush"][RING_ROWS[row]] = 1
+    exact = _fold_fp64(case, flagged)
+    results = {}
+    for fold_cuda in (False, True):
+        state = case["checkpoint_state"].clone()
+        cursors = [case[n].clone() for n in ("write_pos", "cache_base", "is_flush")]
+        commit_gdn_replayssm_circular(
+            checkpoint_state=state.unsqueeze(0),
+            d_cache=case["d_cache"].unsqueeze(0),
+            k_cache=case["k_cache"].unsqueeze(0),
+            g_cache=case["g_cache"].unsqueeze(0),
+            d_residual_cache=case["d_residual_cache"].unsqueeze(0),
+            k_residual_cache=case["k_residual_cache"].unsqueeze(0),
+            state_batch_indices=case["ssm_state_indices"],
+            replay_indices=case["replay_indices"],
+            write_pos=cursors[0],
+            cache_base=cursors[1],
+            is_flush=cursors[2],
+            accept_lens=torch.ones(len(STATE_ROWS), dtype=torch.int32, device=DEVICE),
+            null_block_id=-1,
+            fold_cuda=fold_cuda,
+        )
+        torch.cuda.synchronize()
+        results[fold_cuda] = (state, cursors)
+    (triton, triton_cursors), (cuda, cuda_cursors) = results[False], results[True]
+    for a, b in zip(triton_cursors, cuda_cursors):
+        assert torch.equal(a, b)
+    for row, slot in enumerate(STATE_ROWS):
+        if slot < 0:
+            continue
+        if row not in flagged:
+            assert torch.equal(cuda[slot], case["checkpoint_state"][slot])
+            continue
+        torch.testing.assert_close(
+            cuda[slot].float(), triton[slot].float(), rtol=2**-7, atol=1e-6
+        )
+        err_cuda = (cuda[slot].double() - exact[row]).abs().max().item()
+        err_triton = (triton[slot].double() - exact[row]).abs().max().item()
+        assert err_cuda <= 1.01 * err_triton + 1e-7, (err_cuda, err_triton)
+
+
 @pytest.mark.parametrize("seed", [0, 1])
 def test_matches_fp64_delta_rule(seed):
     case = _case(seed)
