@@ -261,6 +261,13 @@ struct TCGen05Common {
     desc.m_dim = M >> 4;
     return desc;
   }
+
+  /// kind::f16 instruction descriptor: f16 x f16, f32 accumulate. An MN-major operand is contiguous along M / N
+  /// (its SmemDesc then needs leading_byte_offset, the stride between swizzle atoms on that axis).
+  SGL_DEVICE static uint32_t make_instr_desc_f16(uint32_t m, uint32_t n, bool a_mn_major, bool b_mn_major) {
+    return (1u << 4) | (static_cast<uint32_t>(a_mn_major) << 15) | (static_cast<uint32_t>(b_mn_major) << 16) |
+           ((n >> 3) << 17) | ((m >> 4) << 24);
+  }
 };
 
 #undef SGL_TCGEN05_REGS_1
@@ -373,6 +380,36 @@ struct TCGen05 : TCGen05Common {
         "n"(kCtaGroup)
         : "memory");
   }
+  // ---- unscaled MMA (kind::f16) -------------------------------------------
+
+  /// D [+]= A x B with A and B (both f16, or both bf16) from smem; `idesc` from make_instr_desc_f16.
+  SGL_DEVICE static void
+  mma_f16_ss(uint32_t taddr_d, uint64_t adesc, uint64_t bdesc, uint32_t idesc, uint32_t accumulate) {
+    asm volatile(
+        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::%5.kind::f16 [%0], %1, %2, %3, p;\n\t}" ::"r"(taddr_d),
+        "l"(adesc),
+        "l"(bdesc),
+        "r"(idesc),
+        "r"(accumulate),
+        "n"(kCtaGroup)
+        : "memory");
+  }
+
+  /// The same with A (128 lanes x K / 2 columns, two f16 per 32-bit column, the lower k in the low half) from TMEM.
+  SGL_DEVICE static void
+  mma_f16_ts(uint32_t taddr_d, uint32_t taddr_a, uint64_t bdesc, uint32_t idesc, uint32_t accumulate) {
+    asm volatile(
+        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::%5.kind::f16 [%0], [%1], %2, %3, p;\n\t}" ::"r"(taddr_d),
+        "r"(taddr_a),
+        "l"(bdesc),
+        "r"(idesc),
+        "r"(accumulate),
+        "n"(kCtaGroup)
+        : "memory");
+  }
+
   // ---- unscaled MMA (kind::f8f6f4) ----------------------------------------
 
   /// D [+]= A x B with A and B from smem; `idesc` is an InstrDesc.

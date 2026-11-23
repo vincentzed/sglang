@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -19,6 +20,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
 )
 from sglang.srt.layers.attention.qsa.mqa import (
     HAS_TILELANG,
+    _use_cuda_decode,
     qsa_mqa_decode,
     qsa_mqa_prefill,
     qsa_mqa_prefill_relative,
@@ -553,7 +555,15 @@ class QSAIndexer(MultiPlatformOp):
             rows_per_request=rows_per_request,
             num_query_heads=self.index_n_heads,
         )
-        if use_fast_topk:
+        if (
+            use_fast_topk
+            and envs.SGLANG_ENABLE_QSA_DECODE_TOPK_CUDA.get()
+            and _use_cuda_decode(q, compressed_cache, self.index_n_heads)
+        ):
+            from sglang.kernels.ops.attention.qsa_index_score import qsa_decode_topk
+
+            block_indices = qsa_decode_topk(logits, compressed_lengths.to(torch.int32))
+        elif use_fast_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
             from sglang.kernels.ops.attention.fast_topk import fast_topk

@@ -818,21 +818,30 @@ def cuda_qsa_mqa_decode(
     ``tilelang_qsa_mqa_decode``. The ``rows_per_request`` consecutive rows of a
     request are scored against the pages of its last (longest) row."""
 
-    from sglang.kernels.ops.attention.qsa_index_score import qsa_index_score_decode
+    from sglang.kernels.ops.attention.qsa_index_score import (
+        qsa_index_score_decode,
+        qsa_index_score_decode_sm100,
+    )
 
     _validate_decode_inputs(q, k_cache, page_table, context_lens)
     logits = _decode_logits(q, max_model_len, min_scored_len)
     if not q.shape[0] or not max_model_len:
         return logits
     grouped = 1 <= rows_per_request <= 4 and q.shape[0] % rows_per_request == 0
-    qsa_index_score_decode(
+    group_rows = rows_per_request if grouped else 1
+    score = (
+        qsa_index_score_decode_sm100
+        if envs.SGLANG_ENABLE_QSA_INDEX_SCORE_DECODE_SM100.get()
+        else qsa_index_score_decode
+    )
+    score(
         q.contiguous(),
         k_cache.contiguous(),
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),
         context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
         logits,
         float(score_scale or math.sqrt(q.shape[-1])),
-        group_rows=rows_per_request if grouped else 1,
+        group_rows=group_rows,
         min_scored_len=min_scored_len,
     )
     return logits
