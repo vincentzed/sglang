@@ -132,13 +132,22 @@ def maybe_build_flashinfer_checkpoint_plan(
         raise ValueError("Tracked GDN state precedes the first FlashInfer checkpoint.")
     assert track_checkpoint_src.numel() == forward_metadata.track_ssm_h_dst.numel()
 
+    num_state_checkpoints = int(checkpoint_cu_starts[-1])
+    if envs.SGLANG_OPT_GDN_PREFILL_SPARSE_CHECKPOINTS.get():
+        rows = torch.full((num_state_checkpoints,), -1, dtype=torch.int32)
+        rows[track_checkpoint_src] = torch.arange(
+            track_checkpoint_src.numel(), dtype=torch.int32
+        )
+        forward_metadata.state_checkpoint_indices = rows.to(device, non_blocking=True)
+        track_checkpoint_src = torch.arange(track_checkpoint_src.numel())
+        num_state_checkpoints = track_checkpoint_src.numel()
     forward_metadata.track_ssm_h_src = track_checkpoint_src.to(
         device, non_blocking=True
     )
     forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.to(
         device, non_blocking=True
     )
-    forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
+    forward_metadata.num_state_checkpoints = num_state_checkpoints
     forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
 
 
@@ -647,6 +656,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=state_checkpoint_cu_starts,
             checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+            checkpoint_state_indices=kwargs.get("state_checkpoint_indices"),
         )
 
         # Write back state to pool
@@ -679,7 +689,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         checkpoint_cu_starts: Optional[torch.Tensor],
         checkpoint_every_n_tokens: int,
         use_cp: str | bool = "auto",
+        checkpoint_state_indices: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if checkpoint_state_indices is not None:
+            kwargs = {"checkpoint_state_indices": checkpoint_state_indices}
+        else:
+            kwargs = {}
         return self._prefill_fn(
             q=q,
             k=k,
@@ -697,6 +712,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             use_cp=use_cp,
+            **kwargs,
         )
 
     def prewarm_extend(
@@ -781,6 +797,23 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 **checkpoints,
                 checkpoint_every_n_tokens=every_n_tokens,
                 use_cp=False,
+            )
+            num_runs += 1
+        if envs.SGLANG_OPT_GDN_PREFILL_SPARSE_CHECKPOINTS.get() and (
+            checkpoint_every_n_tokens > 0
+        ):
+            checkpoints = modes[checkpoint_every_n_tokens]
+            self._run_prefill(
+                **inputs,
+                **checkpoints,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                use_cp=False,
+                checkpoint_state_indices=torch.full(
+                    (checkpoints["state_checkpoints"].shape[0],),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
             )
             num_runs += 1
 

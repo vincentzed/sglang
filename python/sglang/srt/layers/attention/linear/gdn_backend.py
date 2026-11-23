@@ -1735,6 +1735,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_checkpoint_every_n_tokens=(
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
+                state_checkpoint_indices=forward_metadata.state_checkpoint_indices,
                 a=a,
                 b=b,
                 A_log=layer.A_log,

@@ -1,4 +1,6 @@
+import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -18,9 +20,13 @@ from sglang.kernels.ops.mamba.gdn_prefill_conv import (
 from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 HEAD_DIM = 128
+
+
+def _is_sm100() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability()[0] == 10
 
 
 def _conv_reference(x, weight, states, starts, cache_indices, has_initial_state):
@@ -194,6 +200,95 @@ class TestGdnPrefillFused(unittest.TestCase):
                         bool(((out.float() - ref.float()).abs() <= ulp).all())
                     )
                 torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
+
+    @unittest.skipIf(not _is_sm100(), "FlashInfer's SM100 GDN prefill kernel")
+    def test_sparse_checkpoints_match_dense_checkpoints(self):
+        from sglang.srt.layers.attention.linear.kernels import gdn_flashinfer
+
+        torch.manual_seed(0)
+        lens, every = [1000, 300], 64
+        tokens, heads_qk, heads_v = sum(lens), 16, 48
+        q = F.normalize(
+            torch.randn(1, tokens, heads_qk, HEAD_DIM, device="cuda"), dim=-1
+        )
+        k = F.normalize(
+            torch.randn(1, tokens, heads_qk, HEAD_DIM, device="cuda"), dim=-1
+        )
+        q, k = q.bfloat16(), k.bfloat16()
+        v = (torch.randn(1, tokens, heads_v, HEAD_DIM, device="cuda") * 0.5).bfloat16()
+        g = -torch.rand(1, tokens, heads_v, device="cuda") * 0.1
+        beta = torch.rand(1, tokens, heads_v, device="cuda")
+        pool = (
+            torch.randn(4, heads_v, HEAD_DIM, HEAD_DIM, device="cuda") * 0.1
+        ).bfloat16()
+        cache_indices = torch.tensor([2, 3], device="cuda", dtype=torch.int32)
+        query_start_loc = torch.tensor(
+            [0, lens[0], tokens], device="cuda", dtype=torch.int32
+        )
+        counts = [n // every for n in lens]
+        cu_starts = torch.tensor([0, counts[0], sum(counts)], device="cuda")
+        tracked = [counts[0] - 3, counts[0] + 1]
+        rows = torch.full((sum(counts),), -1, device="cuda", dtype=torch.int32)
+        rows[tracked] = torch.arange(len(tracked), device="cuda", dtype=torch.int32)
+        kernel = gdn_flashinfer.FlashInferGDNKernel()
+        results = []
+        for indices, count in ((None, sum(counts)), (rows, len(tracked))):
+            states = pool.clone()
+            out, _, h = kernel.extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                state_checkpoint_cu_starts=cu_starts,
+                num_state_checkpoints=count,
+                state_checkpoint_every_n_tokens=every,
+                state_checkpoint_indices=indices,
+                qk_normalized=True,
+            )
+            results.append(
+                (out, states, h[0] if indices is not None else h[0][tracked])
+            )
+        for dense, sparse in zip(*results):
+            torch.testing.assert_close(sparse, dense, rtol=0, atol=0)
+
+    def test_sparse_checkpoint_plan_keeps_only_tracked_rows(self):
+        from sglang.srt.layers.attention.linear.kernels import gdn_flashinfer
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+
+        batch = SimpleNamespace(
+            extend_seq_lens_cpu=[1000, 300, 64],
+            mamba_prefill_track_mask_cpu=[True, False, True],
+            mamba_track_seqlens_cpu=[1490, 0, 64],
+            extend_prefix_lens_cpu=[500, 0, 0],
+        )
+        plans = []
+        for sparse in (False, True):
+            meta = ForwardMetadata(
+                query_start_loc=torch.zeros(4, dtype=torch.int32, device="cuda"),
+                mamba_cache_indices=torch.arange(3, dtype=torch.int32, device="cuda"),
+                track_ssm_h_src=torch.zeros(1, dtype=torch.int64, device="cuda"),
+                track_ssm_h_dst=torch.zeros(1, dtype=torch.int64, device="cuda"),
+            )
+            switch = {"SGLANG_OPT_GDN_PREFILL_SPARSE_CHECKPOINTS": str(int(sparse))}
+            with patch.dict(os.environ, switch), patch.object(
+                gdn_flashinfer, "mamba_cache_chunk_size", return_value=64
+            ):
+                gdn_flashinfer.maybe_build_flashinfer_checkpoint_plan(
+                    batch, meta, "cuda", use_host_metadata=True
+                )
+            plans.append(meta)
+        dense, sparse = plans
+        self.assertEqual(dense.num_state_checkpoints, 15 + 4 + 1)
+        self.assertEqual(sparse.num_state_checkpoints, 1)
+        self.assertEqual(dense.track_ssm_h_src.tolist(), [14])
+        self.assertEqual(sparse.track_ssm_h_src.tolist(), [0])
+        rows = sparse.state_checkpoint_indices.tolist()
+        self.assertEqual(rows[14], 0)
+        self.assertEqual(sum(r >= 0 for r in rows), 1)
 
 
 if __name__ == "__main__":
