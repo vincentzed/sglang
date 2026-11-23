@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -251,6 +252,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     # extend() gathers each request's state by pool index and scatters the
     # final state back the same way, so any slot pitch works.
     extend_honors_slot_pitch = True
+    _joint_qk_l2norm: bool = False
 
     def __init__(self):
         (
@@ -281,6 +283,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ] = {}
         self._verify_intermediate_buffers: dict[tuple, torch.Tensor] = {}
         self._alignment_fallback_warned = False
+        self._joint_qk_l2norm = envs.SGLANG_OPT_GDN_PREFILL_SPLIT_CONV.get()
         # FlashInfer writes through mutable state/workspace pointers, so misaligned
         # inputs must fall back to Triton rather than use temporary copies.
         from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
@@ -571,7 +574,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
 
-        q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(q[0], k[0], v[0])
+        q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(
+            q[0], k[0], v[0], joint_qk=self._joint_qk_l2norm
+        )
 
         output = kwargs.get("output")
         output_fi = None

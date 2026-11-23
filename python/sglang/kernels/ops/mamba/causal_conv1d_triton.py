@@ -20,6 +20,7 @@ PAD_SLOT_ID = -1
 # Tokens per program of _causal_conv1d_fwd_kernel; a block_table enumerates
 # (sequence, chunk) pairs in these units.
 CAUSAL_CONV1D_FWD_BLOCK_M = 8
+CAUSAL_CONV1D_FWD_BLOCK_N = 256
 
 
 @triton.jit(do_not_specialize=["num_cache_lines"])
@@ -67,6 +68,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     BLOCK_N: tl.constexpr,
     USE_BLOCK_TABLE: tl.constexpr = False,
     OUTPUT_SPLIT_SIZE: tl.constexpr = 0,
+    OUTPUT_SPLIT_TAIL: tl.constexpr = 0,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -401,7 +403,23 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             idx_feats < dim
         )  # token-index  # feature-index
         output_token = (sequence_start_index + token_offset + idx_token).to(tl.int64)
-        if OUTPUT_SPLIT_SIZE:
+        if OUTPUT_SPLIT_TAIL:
+            tl.static_assert(OUTPUT_SPLIT_SIZE % BLOCK_N == 0)
+            tl.static_assert((dim - OUTPUT_SPLIT_TAIL) % BLOCK_N == 0)
+            block_start = tl.program_id(2) * BLOCK_N
+            plane_start = (block_start // OUTPUT_SPLIT_SIZE) * OUTPUT_SPLIT_SIZE
+            plane_width = OUTPUT_SPLIT_SIZE
+            if block_start >= dim - OUTPUT_SPLIT_TAIL:
+                plane_start = dim - OUTPUT_SPLIT_TAIL
+                plane_width = OUTPUT_SPLIT_TAIL
+            o_ptrs = (
+                o_ptr
+                + plane_start.to(tl.int64) * total_tokens
+                + output_token * plane_width
+                + (block_start - plane_start)
+                + tl.arange(0, BLOCK_N)
+            )
+        elif OUTPUT_SPLIT_SIZE:
             # Store each channel group as a contiguous [tokens, channels] plane.
             # KDA can consume Q/K/V directly without three materialization copies.
             o_ptrs = (
@@ -432,6 +450,7 @@ def _causal_conv1d_fn_triton(
     validate_data=False,
     block_table: Optional[torch.Tensor] = None,
     output_split_size: int = 0,
+    output_split_tail: int = 0,
     **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
@@ -478,15 +497,22 @@ def _causal_conv1d_fn_triton(
 
     output_split_size: channel width of each independently contiguous output
         plane, or zero for the original layout. Must divide dim.
+    output_split_tail: with output_split_size, the width of one last, wider
+        plane (GDN: q | k of output_split_size channels, then v).
     out: same shape as `x`, or (dim // output_split_size, cu_seq_len,
-        output_split_size) when output_split_size is nonzero.
+        output_split_size) when output_split_size is nonzero, or with
+        output_split_tail a tuple of (cu_seq_len, width) planes.
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
-    if output_split_size:
+    if output_split_tail:
+        if output_split_size <= 0 or (dim - output_split_tail) % output_split_size:
+            raise ValueError("output_split_size must divide dim - output_split_tail")
+        out = torch.empty(dim * cu_seqlen, dtype=x.dtype, device=x.device)
+    elif output_split_size:
         if output_split_size < 0 or dim % output_split_size:
             raise ValueError("output_split_size must be positive and divide dim")
         out = torch.empty(
@@ -612,11 +638,21 @@ def _causal_conv1d_fn_triton(
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
         BLOCK_M=CAUSAL_CONV1D_FWD_BLOCK_M,
-        BLOCK_N=256,
+        BLOCK_N=CAUSAL_CONV1D_FWD_BLOCK_N,
         USE_BLOCK_TABLE=block_table is not None,
         OUTPUT_SPLIT_SIZE=output_split_size,
+        OUTPUT_SPLIT_TAIL=output_split_tail,
         num_stages=2,
     )
+    if output_split_tail:
+        widths = [output_split_size] * ((dim - output_split_tail) // output_split_size)
+        planes = out.split(
+            [width * cu_seqlen for width in (*widths, output_split_tail)]
+        )
+        return tuple(
+            plane.view(cu_seqlen, width)
+            for plane, width in zip(planes, (*widths, output_split_tail))
+        )
     return out
 
 
@@ -646,6 +682,7 @@ class CausalConv1dOp(BaseFusedOp):
         validate_data=False,
         block_table: Optional[torch.Tensor] = None,
         output_split_size: int = 0,
+        output_split_tail: int = 0,
         **kwargs,
     ) -> torch.Tensor:
         return _causal_conv1d_fn_triton(
@@ -662,6 +699,7 @@ class CausalConv1dOp(BaseFusedOp):
             validate_data=validate_data,
             block_table=block_table,
             output_split_size=output_split_size,
+            output_split_tail=output_split_tail,
             **kwargs,
         )
 
@@ -683,6 +721,7 @@ def causal_conv1d_fn(
     validate_data=False,
     block_table: Optional[torch.Tensor] = None,
     output_split_size: int = 0,
+    output_split_tail: int = 0,
     **kwargs,
 ) -> torch.Tensor:
     return _CAUSAL_CONV1D_OP(
@@ -699,6 +738,7 @@ def causal_conv1d_fn(
         validate_data=validate_data,
         block_table=block_table,
         output_split_size=output_split_size,
+        output_split_tail=output_split_tail,
         **kwargs,
     )
 

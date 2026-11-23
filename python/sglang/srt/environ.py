@@ -2029,6 +2029,12 @@ class Envs:
     # GDN ReplaySSM spec-verify with a bf16 checkpoint and the compact bf16 ring:
     # run the verify in the CUDA tensor-core kernel instead of the Triton kernel.
     SGLANG_ENABLE_GDN_REPLAYSSM_VERIFY_CUDA = EnvBool(False)
+    # GDN prefill: the causal conv writes contiguous q, k and v planes (no copy
+    # before the delta rule) and q | k are l2-normalized in one launch.
+    SGLANG_OPT_GDN_PREFILL_SPLIT_CONV = EnvBool(False)
+    # Gated RMSNorm (the GDN output norm): 16 rows per block on 4 warps for
+    # launches with many rows per SM (a prefill) instead of 4 rows on 1 warp.
+    SGLANG_OPT_GATED_NORM_WIDE_ROWS = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers

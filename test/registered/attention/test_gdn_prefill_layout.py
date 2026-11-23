@@ -1,8 +1,10 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.attention.fla import layernorm_gated
 from sglang.kernels.ops.attention.fla.l2norm import (
     gdn_prefill_qkv_prepare_fwd,
     l2norm_fwd,
@@ -88,6 +90,74 @@ class TestGdnPrefillLayout(unittest.TestCase):
                     actual[:valid_tokens], expected[:valid_tokens], rtol=0, atol=0
                 )
                 torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
+
+    @unittest.skipIf(not is_cuda(), "the split conv is CUDA-only")
+    def test_split_prefill_conv_matches_rectangular_output_and_cache(self):
+        torch.manual_seed(0)
+        seq_lens = [65, 1, 7, 300]
+        q_dim, v_dim, width = 2 * self.HEAD_DIM, 4 * self.HEAD_DIM, 4
+        dim, batch_size = 2 * q_dim + v_dim, len(seq_lens)
+        lengths = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
+        starts = torch.cat([lengths.new_zeros(1), lengths.cumsum(0)]).int()
+        qkv = torch.randn(
+            sum(seq_lens), dim + v_dim, device="cuda", dtype=torch.bfloat16
+        )[:, :dim]
+        cache_indices = torch.tensor([3, 1, 4, 2], device="cuda", dtype=torch.int32)
+        states = torch.randn(
+            batch_size + 2, dim, width - 1, device="cuda", dtype=qkv.dtype
+        )
+        expected_states = states.clone()
+        layer = SimpleNamespace(
+            conv_weights=torch.randn(dim, width, device="cuda", dtype=qkv.dtype),
+            bias=None,
+            activation="silu",
+            q_dim=q_dim,
+            v_dim=v_dim,
+        )
+        batch = SimpleNamespace(
+            extend_seq_lens_cpu=seq_lens,
+            extend_prefix_lens=torch.tensor([0, 5, 9, 0], device="cuda"),
+        )
+        backend = object.__new__(GDNAttnBackend)
+        backend.forward_metadata = ForwardMetadata(
+            query_start_loc=starts, mamba_cache_indices=cache_indices
+        )
+        expected = backend._convolve_prefill(
+            layer, batch, qkv, expected_states, cache_indices
+        ).split([q_dim, q_dim, v_dim], dim=-1)
+        planes = backend._convolve_prefill(
+            layer, batch, qkv, states, cache_indices, split_qkv=True
+        )
+        for plane, reference in zip(planes, expected):
+            self.assertTrue(plane.is_contiguous())
+            torch.testing.assert_close(plane, reference, rtol=0, atol=0)
+        torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
+
+        q, k, v = (plane.view(sum(seq_lens), -1, self.HEAD_DIM) for plane in planes)
+        q_out, k_out, v_out = gdn_prefill_qkv_prepare_fwd(q, k, v, joint_qk=True)
+        self.assertEqual(v_out.data_ptr(), v.data_ptr())
+        torch.testing.assert_close(q_out, l2norm_fwd(q), rtol=0, atol=0)
+        torch.testing.assert_close(k_out, l2norm_fwd(k), rtol=0, atol=0)
+
+    def test_wide_row_blocks_match_default_gated_norm(self):
+        device = torch.device("cuda")
+        sm_count = layernorm_gated._get_sm_count(device)
+        rows = 4 * layernorm_gated.WIDE_ROWS_PER_BLOCK * sm_count + 5
+        torch.manual_seed(0)
+        x = torch.randn(rows, self.HEAD_DIM, dtype=torch.bfloat16, device=device)
+        z = torch.randn_like(x)
+        weight = torch.randn(self.HEAD_DIM, dtype=x.dtype, device=device)
+
+        def run():
+            return rms_norm_gated(x=x, weight=weight, bias=None, z=z, is_rms_norm=True)
+
+        expected = run()
+        with patch.object(layernorm_gated, "_wide_rows", True):
+            self.assertEqual(
+                layernorm_gated.calc_rows_per_block(rows, device),
+                layernorm_gated.WIDE_ROWS_PER_BLOCK,
+            )
+            torch.testing.assert_close(run(), expected, rtol=0, atol=0)
 
     def _projection_views(self, dtype):
         qkv_dim = (
