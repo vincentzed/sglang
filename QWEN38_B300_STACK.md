@@ -15,6 +15,7 @@ Speculative acceptance is pinned at 2.32 in both engines (benchmark rule), so th
 | TokenSpeed 0.1.1.post20261117 (its recipe) | 108 | 318,463 / 317,617 | 318,040 |
 | TokenSpeed | 128 | 278,755 | |
 | SGLang, this branch | 124 | 395,685 / 395,141 / 389,827 | 393,551 (123.7% of TokenSpeed) |
+| SGLang, this branch | 108 | 378,939 | 119.2% of TokenSpeed at the same concurrency |
 | SGLang main, published recipe (600 s) | 108 | 170,086 | |
 
 124 users is the knee for this stack (136 was lower on earlier trees); TokenSpeed's best is 108.
