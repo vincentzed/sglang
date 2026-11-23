@@ -458,6 +458,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
 
+        draft_logits_processor = getattr(
+            self.draft_runner.model, "logits_processor", None
+        )
+        if (
+            envs.SGLANG_ONLINE_MXFP8_DRAFT_LM_HEAD.get()
+            and draft_logits_processor is not None
+        ):
+            draft_logits_processor.mxfp8_lm_head = True
+
     def _resolve_shared_embed_and_head(self):
         target_runner = self.target_worker.model_runner
         return resolve_draft_embed_and_head(

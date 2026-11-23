@@ -1393,6 +1393,10 @@ class Envs:
     # since the block-scale MoE kernel lacks SwiGLU-OAI
     SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
+    SGLANG_ONLINE_MXFP8_GDN_PROJ = EnvBool(False)
+    SGLANG_ONLINE_MXFP8_QSA_PROJ = EnvBool(False)
+    SGLANG_ONLINE_MXFP8_LM_HEAD = EnvBool(False)
+    SGLANG_ONLINE_MXFP8_DRAFT_LM_HEAD = EnvBool(False)
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 
     # ===================================================================
